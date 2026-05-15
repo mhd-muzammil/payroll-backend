@@ -6,7 +6,7 @@ from django.views.decorators.http import require_http_methods
 
 @require_http_methods(["GET", "HEAD"])
 def app_head(request):
-    return HttpResponse(status=204)
+    return HttpResponse("ok\n", content_type="text/plain")
 
 
 def health_check(request):
