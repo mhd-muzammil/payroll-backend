@@ -35,3 +35,9 @@ The blueprint sets:
 SQLite on Render should run with one service instance only. Do not scale this service horizontally while SQLite is the database.
 
 Migrations run in `start.sh`, not `build.sh`, because Render persistent disks are available at runtime, not during the build command.
+
+`build.sh` uses a temporary build-only `SECRET_KEY` if Render does not expose your runtime secret during the build phase. You still must set a real `SECRET_KEY` in Render for runtime.
+
+If Render still selects the wrong Python version, set this environment variable in Render:
+
+`PYTHON_VERSION=3.11.13`
