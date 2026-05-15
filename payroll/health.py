@@ -1,6 +1,12 @@
 from django.db import connections
 from django.db.utils import OperationalError
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
+from django.views.decorators.http import require_http_methods
+
+
+@require_http_methods(["GET", "HEAD"])
+def app_head(request):
+    return HttpResponse(status=204)
 
 
 def health_check(request):
