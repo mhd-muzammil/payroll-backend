@@ -41,3 +41,5 @@ Migrations run in `start.sh`, not `build.sh`, because Render persistent disks ar
 If Render still selects the wrong Python version, set this environment variable in Render:
 
 `PYTHON_VERSION=3.11.13`
+
+When creating the service manually in the Render dashboard, `render.yaml` does not automatically create generated env vars for that existing manual service. Add `SECRET_KEY` yourself under Environment Variables.
