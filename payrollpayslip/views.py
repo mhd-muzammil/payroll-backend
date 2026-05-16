@@ -267,7 +267,7 @@ class PayslipViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def dashboard_summary(self, request):
         """Aggregates complete enterprise metrics to power the Corporate Dashboard view."""
-        from django.db.models import Sum, Avg
+        from django.db.models import Sum, Avg, Count
         from django.utils import timezone
         import calendar
         from employees.models import Employee
@@ -304,9 +304,50 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 return f"₹{(fval/1000.0):.1f}K"
             return f"₹{int(fval):,}"
             
-        total_disburse_raw = active_emps.aggregate(s=Sum('salary'))['s'] or 0
-        
         now = timezone.now()
+
+        # Last 8 calendar months, driven by generated payslip records.
+        trend_months = []
+        cursor_year = now.year
+        cursor_month = now.month
+        for _ in range(8):
+            trend_months.append((cursor_year, cursor_month))
+            cursor_month -= 1
+            if cursor_month == 0:
+                cursor_month = 12
+                cursor_year -= 1
+        trend_months.reverse()
+
+        payroll_trend = []
+        if Payslip.objects.exists():
+            for year, month in trend_months:
+                month_slips = Payslip.objects.filter(year=year, month=month)
+                totals = month_slips.aggregate(
+                    payroll=Sum('net_salary'),
+                    incentive=Sum('earned_incentive'),
+                    other=Sum('earned_other_earnings'),
+                )
+                payroll_trend.append({
+                    "m": calendar.month_abbr[month],
+                    "period": f"{calendar.month_abbr[month]} {year}",
+                    "payroll": float(totals["payroll"] or 0),
+                    "bonus": float((totals["incentive"] or 0) + (totals["other"] or 0)),
+                })
+
+        department_rows = active_emps.values('department').annotate(
+            count=Count('id')
+        ).order_by('-count', 'department')
+        department_split = []
+        for row in department_rows:
+            count = row['count']
+            department_split.append({
+                "name": row['department'] or "Unassigned",
+                "count": count,
+                "value": round((count / total_employees) * 100, 1) if total_employees else 0,
+            })
+
+        total_disburse_raw = active_emps.aggregate(s=Sum('salary'))['s'] or 0
+
         _, last_day = calendar.monthrange(now.year, now.month)
         cycle_date = timezone.datetime(now.year, now.month, last_day)
         days_remaining = (cycle_date.date() - now.date()).days
@@ -320,6 +361,8 @@ class PayslipViewSet(viewsets.ModelViewSet):
             "pendingApprovals": f"{pending_approvals}",
             
             "recentTransactions": recent_txns,
+            "payrollTrend": payroll_trend,
+            "departmentSplit": department_split,
             
             "upcoming": {
                 "totalToDisburse": f"₹{int(total_disburse_raw):,}",
