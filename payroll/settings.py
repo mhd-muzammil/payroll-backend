@@ -57,7 +57,11 @@ if not SECRET_KEY:
     else:
         raise RuntimeError("SECRET_KEY must be set when DEBUG=False")
 
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
+ALLOWED_HOSTS = [
+    "payrollback.systimus.in",
+    "127.0.0.1",
+    "localhost",
+]
 render_external_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 if render_external_hostname:
     ALLOWED_HOSTS.append(render_external_hostname)
