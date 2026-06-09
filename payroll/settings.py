@@ -43,8 +43,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 AUTH_USER_MODEL = "authentication.User"
 
+# Platform detection (Render.com sets RENDER=true automatically)
 IS_RENDER = env_bool("RENDER", False)
-DEBUG = env_bool("DEBUG", default=not IS_RENDER)
+# Default to False (secure) unless explicitly enabled via DEBUG=1
+# On any production platform (Dokploy, Render, etc.) DEBUG should not be set,
+# so the app is secure-by-default.
+DEBUG = env_bool("DEBUG", default=False)
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
