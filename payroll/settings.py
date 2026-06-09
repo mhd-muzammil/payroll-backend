@@ -3,11 +3,6 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlparse
 
-# ── Temporary startup diagnostics (remove after verifying Dokploy) ──
-print("DEBUG_ENV =", os.environ.get("DEBUG"))
-print("ALLOWED_HOSTS_ENV =", os.environ.get("ALLOWED_HOSTS"))
-print("DATABASE_URL_ENV =", os.environ.get("DATABASE_URL"))
-
 
 def env_bool(name, default=False):
     value = os.environ.get(name)
