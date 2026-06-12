@@ -18,6 +18,7 @@ class UserManagementSerializer(serializers.ModelSerializer):
             "is_staff",
             "phone_number",
             "password",
+            "plain_password",
             "date_joined",
         )
         read_only_fields = ("date_joined", "is_staff")
@@ -32,8 +33,10 @@ class UserManagementSerializer(serializers.ModelSerializer):
         user = User(**validated_data)
         if password:
             user.set_password(password)
+            user.plain_password = password
         else:
             user.set_unusable_password()
+            user.plain_password = ""
         user.is_staff = user.role in ["admin", "superadmin"] or user.is_superuser
         user.save()
         return user
@@ -44,6 +47,7 @@ class UserManagementSerializer(serializers.ModelSerializer):
             setattr(instance, key, value)
         if password:
             instance.set_password(password)
+            instance.plain_password = password
         instance.is_staff = instance.role in ["admin", "superadmin"] or instance.is_superuser
         instance.save()
         return instance
