@@ -315,6 +315,30 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         try:
             with transaction.atomic():
+                # Pre-fetch employees and user information to avoid repeated queries
+                all_employees = list(Employee.objects.all().select_related("user"))
+                emp_by_id = {e.id: e for e in all_employees}
+                emp_by_name = {e.employee_name.lower().strip(): e for e in all_employees}
+
+                # Pre-fetch existing usernames to check uniqueness locally
+                existing_usernames = set(User.objects.values_list("username", flat=True))
+
+                # Pre-fetch existing attendance records within the imported date range
+                all_dates = list(date_cols.values())
+                attendance_map = {}
+                if all_dates:
+                    min_date = min(all_dates)
+                    max_date = max(all_dates)
+                    existing_attendance = Attendance.objects.filter(
+                        intime__date__range=(min_date, max_date)
+                    )
+                    for att in existing_attendance:
+                        if att.employee_id and att.intime:
+                            attendance_map[(att.employee_id, att.intime.date())] = att
+
+                records_to_create = []
+                records_to_update = []
+
                 for emp_key, emp_info in employee_data.items():
                     code = emp_info["code"]
                     name = emp_info["name"]
@@ -324,21 +348,23 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     if code:
                         try:
                             emp_id = int(code)
-                            employee = Employee.objects.filter(id=emp_id).first()
+                            employee = emp_by_id.get(emp_id)
                         except ValueError:
                             pass
                     
                     if not employee and name:
-                        employee = Employee.objects.filter(employee_name__iexact=name).first()
+                        employee = emp_by_name.get(name.lower().strip())
 
                     if not employee:
                         # 1. Create User account first
                         username = f"{name.lower().replace(' ', '')}_{code}" if code else name.lower().replace(' ', '')
                         base_username = username
                         counter = 1
-                        while User.objects.filter(username=username).exists():
+                        while username in existing_usernames:
                             username = f"{base_username}_{counter}"
                             counter += 1
+
+                        existing_usernames.add(username)
 
                         import secrets
                         clean_first_name = re.sub(r'[^a-zA-Z]', '', name.split()[0]).capitalize() if name else "User"
@@ -367,11 +393,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         if code:
                             try:
                                 emp_id = int(code)
-                                if not Employee.objects.filter(id=emp_id).exists():
+                                if emp_id not in emp_by_id:
                                     create_kwargs["id"] = emp_id
                             except ValueError:
                                 pass
                         employee = Employee.objects.create(**create_kwargs)
+                        emp_by_id[employee.id] = employee
+                        emp_by_name[employee.employee_name.lower().strip()] = employee
                         employees_created += 1
                     else:
                         # If employee exists but doesn't have a linked user account, create and link one
@@ -379,9 +407,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             username = f"{name.lower().replace(' ', '')}_{code}" if code else name.lower().replace(' ', '')
                             base_username = username
                             counter = 1
-                            while User.objects.filter(username=username).exists():
+                            while username in existing_usernames:
                                 username = f"{base_username}_{counter}"
                                 counter += 1
+
+                            existing_usernames.add(username)
 
                             import secrets
                             clean_first_name = re.sub(r'[^a-zA-Z]', '', name.split()[0]).capitalize() if name else "User"
@@ -432,14 +462,24 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             "status": status
                         }
 
-                        existing = Attendance.objects.filter(employee=employee, intime__date=date_obj).first()
+                        existing = attendance_map.get((employee.id, date_obj))
                         if existing:
                             for k, v in attendance_fields.items():
                                 setattr(existing, k, v)
-                            existing.save()
+                            records_to_update.append(existing)
                         else:
-                            Attendance.objects.create(**attendance_fields)
+                            records_to_create.append(Attendance(**attendance_fields))
                         records_saved += 1
+
+                # Execute bulk operations
+                if records_to_create:
+                    Attendance.objects.bulk_create(records_to_create)
+                if records_to_update:
+                    Attendance.objects.bulk_update(
+                        records_to_update,
+                        fields=["employee_name", "role", "department", "salary", "intime", "outtime", "status"]
+                    )
+
         except Exception as e:
             return Response({"detail": f"Database transaction failed: {str(e)}"}, status=400)
 
