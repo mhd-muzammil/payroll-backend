@@ -21,7 +21,7 @@ class Attendance(models.Model):
     role = models.CharField(max_length=100)
     department = models.CharField(max_length=100)
     salary = models.DecimalField(max_digits=10, decimal_places=2)
-    intime = models.DateTimeField(null=True, blank=True)
+    intime = models.DateTimeField(null=True, blank=True, db_index=True)
     outtime = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES)
 

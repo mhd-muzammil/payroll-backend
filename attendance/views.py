@@ -42,8 +42,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         try:
             wb = openpyxl.load_workbook(file_obj, data_only=True)
             sheet = wb.active
+            sheet_values = list(sheet.iter_rows(values_only=True))
         except Exception as e:
             return Response({"detail": f"Failed to parse Excel file: {str(e)}"}, status=400)
+
+        num_rows = len(sheet_values)
+        num_cols = len(sheet_values[0]) if num_rows > 0 else 0
 
         def normalize_val(val):
             if val is None:
@@ -53,9 +57,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         # 1. Scan first 5 rows to locate "Year" or "Month"
         year = None
         month = None
-        for r in range(1, 6):
-            for c in range(1, sheet.max_column + 1):
-                val = sheet.cell(row=r, column=c).value
+        for r in range(1, min(6, num_rows + 1)):
+            for c in range(1, num_cols + 1):
+                val = sheet_values[r-1][c-1]
                 val_norm = normalize_val(val)
                 if "year" in val_norm:
                     if ":" in val_norm:
@@ -63,8 +67,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             year = int(val_norm.split(":")[1].strip())
                         except ValueError:
                             pass
-                    if not year:
-                        right_val = sheet.cell(row=r, column=c+1).value
+                    if not year and c < num_cols:
+                        right_val = sheet_values[r-1][c]
                         if right_val:
                             try:
                                 year = int(str(right_val).strip())
@@ -76,8 +80,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             month = int(val_norm.split(":")[1].strip())
                         except ValueError:
                             pass
-                    if not month:
-                        right_val = sheet.cell(row=r, column=c+1).value
+                    if not month and c < num_cols:
+                        right_val = sheet_values[r-1][c]
                         if right_val:
                             try:
                                 month = int(str(right_val).strip())
@@ -164,11 +168,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         emp_name_col_idx = None
 
         # Scan rows from 1 to 20 to find the header row containing both employee code and name
-        for r in range(1, 21):
+        for r in range(1, min(21, num_rows + 1)):
             temp_code_col = None
             temp_name_col = None
-            for c in range(1, sheet.max_column + 1):
-                val = sheet.cell(row=r, column=c).value
+            for c in range(1, num_cols + 1):
+                val = sheet_values[r-1][c-1]
                 val_norm = normalize_val(val)
                 
                 is_code_match = ("emp" in val_norm and "code" in val_norm) or (val_norm == "code") or ("employee" in val_norm and "code" in val_norm)
@@ -187,9 +191,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         if not header_row_idx:
             # Fallback: find them independently
-            for r in range(1, 21):
-                for c in range(1, sheet.max_column + 1):
-                    val = sheet.cell(row=r, column=c).value
+            for r in range(1, min(21, num_rows + 1)):
+                for c in range(1, num_cols + 1):
+                    val = sheet_values[r-1][c-1]
                     val_norm = normalize_val(val)
                     if (not emp_code_col_idx) and (("emp" in val_norm and "code" in val_norm) or (val_norm == "code") or ("employee" in val_norm and "code" in val_norm)):
                         emp_code_col_idx = c
@@ -202,16 +206,16 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         if not header_row_idx or not emp_name_col_idx or not emp_code_col_idx:
             # Print debug info to console for troubleshooting
             print("--- Excel Import Error: Could not identify header row ---")
-            for r in range(1, min(15, sheet.max_row + 1)):
-                row_vals = [sheet.cell(row=r, column=c).value for c in range(1, min(10, sheet.max_column + 1))]
+            for r in range(1, min(15, num_rows + 1)):
+                row_vals = [sheet_values[r-1][c-1] for c in range(1, min(10, num_cols + 1))]
                 print(f"Row {r}: {row_vals}")
             return Response({"detail": "Could not identify header row with 'Emp Code' and 'Employee Name'."}, status=400)
 
         # 3. Find type/status column index
         type_col_idx = None
-        for r in range(header_row_idx + 1, min(header_row_idx + 12, sheet.max_row + 1)):
-            for c in range(1, sheet.max_column + 1):
-                val = sheet.cell(row=r, column=c).value
+        for r in range(header_row_idx + 1, min(header_row_idx + 12, num_rows + 1)):
+            for c in range(1, num_cols + 1):
+                val = sheet_values[r-1][c-1]
                 val_norm = normalize_val(val)
                 if val_norm in ["in time", "out time", "actual hrs", "present day", "present days"]:
                     type_col_idx = c
@@ -227,12 +231,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         dates_on_header_row = 0
         dates_on_below_row = 0
         
-        for c in range(1, sheet.max_column + 1):
+        for c in range(1, num_cols + 1):
             if c in [emp_code_col_idx, emp_name_col_idx, type_col_idx]:
                 continue
             
-            val_header = sheet.cell(row=header_row_idx, column=c).value
-            val_below = sheet.cell(row=header_row_idx + 1, column=c).value if header_row_idx + 1 <= sheet.max_row else None
+            val_header = sheet_values[header_row_idx - 1][c - 1]
+            val_below = sheet_values[header_row_idx][c - 1] if header_row_idx < num_rows else None
             
             parsed_header = parse_header_date(val_header, year)
             parsed_below = parse_header_date(val_below, year)
@@ -250,8 +254,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             # Print debug info to console for troubleshooting
             print("--- Excel Import Error: No valid date columns found ---")
             print(f"Header Row Index: {header_row_idx}")
-            for r in range(1, min(15, sheet.max_row + 1)):
-                row_vals = [sheet.cell(row=r, column=c).value for c in range(1, min(10, sheet.max_column + 1))]
+            for r in range(1, min(15, num_rows + 1)):
+                row_vals = [sheet_values[r-1][c-1] for c in range(1, min(10, num_cols + 1))]
                 print(f"Row {r}: {row_vals}")
             return Response({"detail": "No valid date columns found in the header row."}, status=400)
 
@@ -267,9 +271,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         current_emp_code = None
         current_emp_name = None
 
-        for r in range(start_data_row, sheet.max_row + 1):
-            emp_code_val = sheet.cell(row=r, column=emp_code_col_idx).value
-            emp_name_val = sheet.cell(row=r, column=emp_name_col_idx).value
+        for r in range(start_data_row, num_rows + 1):
+            emp_code_val = sheet_values[r-1][emp_code_col_idx - 1]
+            emp_name_val = sheet_values[r-1][emp_name_col_idx - 1]
 
             if emp_code_val is not None:
                 current_emp_code = str(emp_code_val).strip()
@@ -281,7 +285,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             if not current_emp_name:
                 continue
 
-            row_type = normalize_val(sheet.cell(row=r, column=type_col_idx).value)
+            row_type = normalize_val(sheet_values[r-1][type_col_idx - 1])
             if not row_type:
                 continue
 
@@ -298,7 +302,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 if date_obj not in dates_dict:
                     dates_dict[date_obj] = {"in": None, "out": None, "present": 0.0}
 
-                cell_val = sheet.cell(row=r, column=c).value
+                cell_val = sheet_values[r-1][c - 1]
                 if "in time" in row_type:
                     dates_dict[date_obj]["in"] = cell_val
                 elif "out time" in row_type:
@@ -329,8 +333,10 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 if all_dates:
                     min_date = min(all_dates)
                     max_date = max(all_dates)
+                    start_datetime = make_aware(datetime.combine(min_date, time.min))
+                    end_datetime = make_aware(datetime.combine(max_date, time.max))
                     existing_attendance = Attendance.objects.filter(
-                        intime__date__range=(min_date, max_date)
+                        intime__range=(start_datetime, end_datetime)
                     )
                     for att in existing_attendance:
                         if att.employee_id and att.intime:
