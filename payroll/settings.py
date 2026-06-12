@@ -1,6 +1,7 @@
 import os
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlparse
 
 
 def env_bool(name, default=False):
@@ -16,13 +17,38 @@ def env_list(name, default=None):
         return list(default or [])
     return [item.strip() for item in value.split(",") if item.strip()]
 
+
+def database_config_from_url(database_url):
+    parsed = urlparse(database_url)
+    if parsed.scheme not in {"postgres", "postgresql"}:
+        raise RuntimeError("DATABASE_URL must use the postgres or postgresql scheme")
+    if not parsed.hostname or not parsed.path.lstrip("/"):
+        raise RuntimeError("DATABASE_URL must include a hostname and database name")
+
+    options = dict(parse_qsl(parsed.query, keep_blank_values=False))
+    return {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": unquote(parsed.path.lstrip("/")),
+        "USER": unquote(parsed.username or ""),
+        "PASSWORD": unquote(parsed.password or ""),
+        "HOST": parsed.hostname,
+        "PORT": parsed.port or 5432,
+        "CONN_MAX_AGE": int(os.environ.get("DB_CONN_MAX_AGE", "60")),
+        "CONN_HEALTH_CHECKS": True,
+        "OPTIONS": options,
+    }
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 AUTH_USER_MODEL = "authentication.User"
 
+# Platform detection (Render.com sets RENDER=true automatically)
 IS_RENDER = env_bool("RENDER", False)
-DEBUG = env_bool("DEBUG", default=not IS_RENDER)
+# Default to False (secure) unless explicitly enabled via DEBUG=1
+# On any production platform (Dokploy, Render, etc.) DEBUG should not be set,
+# so the app is secure-by-default.
+DEBUG = env_bool("DEBUG", default=False)
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
@@ -31,7 +57,11 @@ if not SECRET_KEY:
     else:
         raise RuntimeError("SECRET_KEY must be set when DEBUG=False")
 
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
+ALLOWED_HOSTS = [
+    "payrollback.systimus.in",
+    "127.0.0.1",
+    "localhost",
+]
 render_external_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 if render_external_hostname:
     ALLOWED_HOSTS.append(render_external_hostname)
@@ -87,18 +117,17 @@ TEMPLATES = [
 WSGI_APPLICATION = 'payroll.wsgi.application'
 
 
-sqlite_path = os.environ.get("SQLITE_PATH")
-if sqlite_path:
-    sqlite_path = Path(sqlite_path)
+database_url = os.environ.get("DATABASE_URL")
+if database_url:
+    DATABASES = {"default": database_config_from_url(database_url)}
 else:
-    sqlite_path = BASE_DIR / "db.sqlite3"
-
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": sqlite_path,
+    sqlite_path = Path(os.environ.get("SQLITE_PATH", BASE_DIR / "db.sqlite3"))
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": sqlite_path,
+        }
     }
-}
 
 
 # Password validation
@@ -137,7 +166,6 @@ USE_TZ = True
 
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 STORAGES = {
     "default": {
@@ -169,9 +197,28 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": False,
 }
 
-CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", ["http://localhost:5173"])
+CORS_ALLOWED_ORIGINS = env_list(
+    "CORS_ALLOWED_ORIGINS",
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+)
+CORS_ALLOWED_ORIGIN_REGEXES = env_list(
+    "CORS_ALLOWED_ORIGIN_REGEXES",
+    [
+        r"^http://localhost:\d+$",
+        r"^http://127\.0\.0\.1:\d+$",
+    ],
+)
 CORS_ALLOW_CREDENTIALS = True
-CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS")
+CSRF_TRUSTED_ORIGINS = env_list(
+    "CSRF_TRUSTED_ORIGINS",
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+)
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_SSL_REDIRECT = env_bool("SECURE_SSL_REDIRECT", default=not DEBUG)
@@ -187,13 +234,19 @@ X_FRAME_OPTIONS = "DENY"
 # Media files (Uploaded documents)
 MEDIA_URL = "/media/"
 MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", BASE_DIR / "media"))
+MAX_UPLOAD_SIZE_MB = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "10"))
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get("DATA_UPLOAD_MAX_MEMORY_SIZE", str((MAX_UPLOAD_SIZE_MB + 2) * 1024 * 1024))
+)
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get("FILE_UPLOAD_MAX_MEMORY_SIZE", str(2 * 1024 * 1024)))
 
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
         "simple": {
-            "format": "%(levelname)s %(asctime)s %(name)s %(message)s",
+            "format": "%(asctime)s level=%(levelname)s logger=%(name)s message=%(message)s",
+            "style": "%",
         },
     },
     "handlers": {
@@ -205,6 +258,18 @@ LOGGING = {
     "root": {
         "handlers": ["console"],
         "level": os.environ.get("DJANGO_LOG_LEVEL", "INFO"),
+    },
+    "loggers": {
+        "django.request": {
+            "handlers": ["console"],
+            "level": os.environ.get("DJANGO_LOG_LEVEL", "INFO"),
+            "propagate": False,
+        },
+        "django.security": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
     },
 }
 

@@ -1,11 +1,13 @@
-﻿asgiref==3.11.1
+asgiref==3.11.1
 Django==5.2.14
 django-cors-headers==4.9.0
 django-filter==25.2
 djangorestframework==3.17.1
 djangorestframework_simplejwt==5.5.1
 gunicorn==23.0.0
+psycopg[binary]==3.3.4
 PyJWT==2.12.1
 sqlparse==0.5.5
 tzdata==2026.2
 whitenoise[brotli]==6.11.0
+python-dotenv==1.1.1

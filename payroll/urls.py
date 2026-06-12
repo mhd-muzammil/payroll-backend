@@ -16,12 +16,11 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path,include
-from django.conf import settings
-from django.conf.urls.static import static
-from payroll.health import app_head, health_check
+from payroll.health import app_head, health_check, live_check
 
 urlpatterns = [
     path('app.head', app_head, name='app_head'),
+    path('livez/', live_check, name='live_check'),
     path('healthz/', health_check, name='health_check'),
     path('admin/', admin.site.urls),
     path("api-auth/", include("rest_framework.urls")),
@@ -31,7 +30,4 @@ urlpatterns = [
     path('api/', include('onboarding.urls')),
     path("api/auth/", include("authentication.urls")),
 ]
-
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 
