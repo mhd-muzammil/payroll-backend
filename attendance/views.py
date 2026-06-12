@@ -42,7 +42,22 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         try:
             wb = openpyxl.load_workbook(file_obj, data_only=True)
             sheet = wb.active
-            sheet_values = list(sheet.iter_rows(values_only=True))
+            
+            # Efficiently read rows up to 100 consecutive completely empty rows to prevent reading millions of empty rows
+            sheet_values = []
+            empty_streak = 0
+            for row in sheet.iter_rows(values_only=True):
+                if all(cell is None or str(cell).strip() == "" for cell in row):
+                    empty_streak += 1
+                    if empty_streak > 100:
+                        break
+                else:
+                    if empty_streak > 0:
+                        num_cells = len(row)
+                        for _ in range(empty_streak):
+                            sheet_values.append((None,) * num_cells)
+                        empty_streak = 0
+                    sheet_values.append(row)
         except Exception as e:
             return Response({"detail": f"Failed to parse Excel file: {str(e)}"}, status=400)
 
@@ -275,12 +290,22 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             emp_code_val = sheet_values[r-1][emp_code_col_idx - 1]
             emp_name_val = sheet_values[r-1][emp_name_col_idx - 1]
 
-            if emp_code_val is not None:
-                current_emp_code = str(emp_code_val).strip()
-                if current_emp_code.endswith(".0"):
+            if emp_code_val is not None or emp_name_val is not None:
+                current_emp_code = str(emp_code_val).strip() if emp_code_val is not None else None
+                if current_emp_code and current_emp_code.endswith(".0"):
                     current_emp_code = current_emp_code[:-2]
-            if emp_name_val is not None:
-                current_emp_name = str(emp_name_val).strip()
+                current_emp_name = str(emp_name_val).strip() if emp_name_val is not None else None
+
+                # Look up existing employee name if only code is provided
+                if not current_emp_name and current_emp_code:
+                    try:
+                        emp_id = int(current_emp_code)
+                        # Quick lookup from database
+                        emp_obj = Employee.objects.filter(id=emp_id).first()
+                        if emp_obj:
+                            current_emp_name = emp_obj.employee_name
+                    except ValueError:
+                        pass
 
             if not current_emp_name:
                 continue
@@ -381,10 +406,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             email=f"{username}@company.com",
                             first_name=name,
                             role='employee',
+                            password=temp_pwd,
                             plain_password=temp_pwd
                         )
-                        user_obj.set_password(temp_pwd)
-                        user_obj.save()
 
                         # 2. Create Employee profile linked to the User
                         create_kwargs = {
@@ -428,10 +452,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                                 email=f"{username}@company.com",
                                 first_name=name,
                                 role='employee',
+                                password=temp_pwd,
                                 plain_password=temp_pwd
                             )
-                            user_obj.set_password(temp_pwd)
-                            user_obj.save()
 
                             employee.user = user_obj
                             employee.save()
