@@ -518,6 +518,16 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "records_saved": records_saved
         }, status=200)
 
+    @action(detail=False, methods=["delete"])
+    def delete_all(self, request):
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role not in ["superadmin", "admin"]:
+            return Response({"detail": "Permission denied."}, status=403)
+        
+        count, _ = Attendance.objects.all().delete()
+        return Response({"detail": f"Successfully deleted {count} attendance records."}, status=200)
+
     def get_queryset(self):
         user = self.request.user
         queryset = Attendance.objects.select_related("employee").all().order_by("-id")
