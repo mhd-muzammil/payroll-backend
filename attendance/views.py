@@ -42,72 +42,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         try:
             wb = openpyxl.load_workbook(file_obj, data_only=True)
-            sheet = wb.active
-            
-            # Efficiently read rows up to 100 consecutive completely empty rows to prevent reading millions of empty rows
-            sheet_values = []
-            empty_streak = 0
-            for row in sheet.iter_rows(values_only=True):
-                if all(cell is None or str(cell).strip() == "" for cell in row):
-                    empty_streak += 1
-                    if empty_streak > 100:
-                        break
-                else:
-                    if empty_streak > 0:
-                        num_cells = len(row)
-                        for _ in range(empty_streak):
-                            sheet_values.append((None,) * num_cells)
-                        empty_streak = 0
-                    sheet_values.append(row)
         except Exception as e:
             return Response({"detail": f"Failed to parse Excel file: {str(e)}"}, status=400)
-
-        num_rows = len(sheet_values)
-        num_cols = len(sheet_values[0]) if num_rows > 0 else 0
 
         def normalize_val(val):
             if val is None:
                 return ""
             return " ".join(str(val).split()).strip().lower()
-
-        # 1. Scan first 5 rows to locate "Year" or "Month"
-        year = None
-        month = None
-        for r in range(1, min(6, num_rows + 1)):
-            for c in range(1, num_cols + 1):
-                val = sheet_values[r-1][c-1]
-                val_norm = normalize_val(val)
-                if "year" in val_norm:
-                    if ":" in val_norm:
-                        try:
-                            year = int(val_norm.split(":")[1].strip())
-                        except ValueError:
-                            pass
-                    if not year and c < num_cols:
-                        right_val = sheet_values[r-1][c]
-                        if right_val:
-                            try:
-                                year = int(str(right_val).strip())
-                            except ValueError:
-                                pass
-                if "month" in val_norm:
-                    if ":" in val_norm:
-                        try:
-                            month = int(val_norm.split(":")[1].strip())
-                        except ValueError:
-                            pass
-                    if not month and c < num_cols:
-                        right_val = sheet_values[r-1][c]
-                        if right_val:
-                            try:
-                                month = int(str(right_val).strip())
-                            except ValueError:
-                                pass
-
-        if not year:
-            year = datetime.now().year
-        if not month:
-            month = datetime.now().month
 
         # Helper to parse dates in header
         def parse_header_date(val, default_year):
@@ -178,203 +119,312 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 
             return None
 
-        # 2. Find header row containing Employee Code and Name
-        header_row_idx = None
-        emp_code_col_idx = None
-        emp_name_col_idx = None
-        branch_col_idx = None
+        # Scan the first sheet to locate global "Year" or "Month" default
+        default_year = datetime.now().year
+        default_month = datetime.now().month
+        if wb.worksheets:
+            first_sheet = wb.worksheets[0]
+            first_sheet_rows = []
+            for row in first_sheet.iter_rows(values_only=True):
+                if len(first_sheet_rows) >= 6:
+                    break
+                first_sheet_rows.append(row)
+            num_r = len(first_sheet_rows)
+            num_c = len(first_sheet_rows[0]) if num_r > 0 else 0
+            for r in range(1, min(6, num_r + 1)):
+                for c in range(1, num_c + 1):
+                    val = first_sheet_rows[r-1][c-1]
+                    val_norm = normalize_val(val)
+                    if "year" in val_norm:
+                        if ":" in val_norm:
+                            try:
+                                default_year = int(val_norm.split(":")[1].strip())
+                            except ValueError:
+                                pass
+                        if default_year == datetime.now().year and c < num_c:
+                            right_val = first_sheet_rows[r-1][c]
+                            if right_val:
+                                try:
+                                    default_year = int(str(right_val).strip())
+                                except ValueError:
+                                    pass
+                    if "month" in val_norm:
+                        if ":" in val_norm:
+                            try:
+                                default_month = int(val_norm.split(":")[1].strip())
+                            except ValueError:
+                                pass
+                        if default_month == datetime.now().month and c < num_c:
+                            right_val = first_sheet_rows[r-1][c]
+                            if right_val:
+                                try:
+                                    default_month = int(str(right_val).strip())
+                                except ValueError:
+                                    pass
 
-        # Scan rows from 1 to 20 to find the header row containing both employee code and name
-        for r in range(1, min(21, num_rows + 1)):
-            temp_code_col = None
-            temp_name_col = None
-            temp_branch_col = None
-            for c in range(1, num_cols + 1):
-                val = sheet_values[r-1][c-1]
-                val_norm = normalize_val(val)
-                
-                is_code_match = ("emp" in val_norm and "code" in val_norm) or (val_norm == "code") or ("employee" in val_norm and "code" in val_norm)
-                is_name_match = ("employee" in val_norm and "name" in val_norm) or ("emp" in val_norm and "name" in val_norm) or (val_norm == "name")
-                is_branch_match = ("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm)
-                
-                if is_code_match:
-                    temp_code_col = c
-                elif is_name_match:
-                    temp_name_col = c
-                elif is_branch_match:
-                    temp_branch_col = c
-            
-            if temp_code_col and temp_name_col:
-                header_row_idx = r
-                emp_code_col_idx = temp_code_col
-                emp_name_col_idx = temp_name_col
-                branch_col_idx = temp_branch_col
-                break
+        employee_data = {}
 
-        if not header_row_idx:
-            # Fallback: find them independently
-            for r in range(1, min(21, num_rows + 1)):
+        for sheet in wb.worksheets:
+            # Determine branch name from sheet title
+            sheet_title_norm = " ".join(sheet.title.split()).strip().lower()
+            sheet_branch = None
+            if "chennai" in sheet_title_norm:
+                sheet_branch = "Chennai"
+            elif "vellore" in sheet_title_norm:
+                sheet_branch = "Vellore"
+            elif "salem" in sheet_title_norm:
+                sheet_branch = "Salem"
+            elif "kanchipuram" in sheet_title_norm or "kanchi" in sheet_title_norm:
+                sheet_branch = "Kanchipuram"
+            elif "hosur" in sheet_title_norm:
+                sheet_branch = "Hosur"
+
+            # Efficiently read rows up to 100 consecutive completely empty rows
+            sheet_values = []
+            empty_streak = 0
+            for row in sheet.iter_rows(values_only=True):
+                if all(cell is None or str(cell).strip() == "" for cell in row):
+                    empty_streak += 1
+                    if empty_streak > 100:
+                        break
+                else:
+                    if empty_streak > 0:
+                        num_cells = len(row)
+                        for _ in range(empty_streak):
+                            sheet_values.append((None,) * num_cells)
+                        empty_streak = 0
+                    sheet_values.append(row)
+
+            if not sheet_values:
+                continue
+
+            num_rows = len(sheet_values)
+            num_cols = len(sheet_values[0]) if num_rows > 0 else 0
+
+            # Scan first 5 rows of this sheet to locate sheet-specific "Year" or "Month"
+            sheet_year = None
+            sheet_month = None
+            for r in range(1, min(6, num_rows + 1)):
                 for c in range(1, num_cols + 1):
                     val = sheet_values[r-1][c-1]
                     val_norm = normalize_val(val)
-                    if (not emp_code_col_idx) and (("emp" in val_norm and "code" in val_norm) or (val_norm == "code") or ("employee" in val_norm and "code" in val_norm)):
-                        emp_code_col_idx = c
-                        header_row_idx = r
-                    elif (not emp_name_col_idx) and (("employee" in val_norm and "name" in val_norm) or ("emp" in val_norm and "name" in val_norm) or (val_norm == "name")):
-                        emp_name_col_idx = c
-                        if not header_row_idx:
-                            header_row_idx = r
-                    elif (not branch_col_idx) and (("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm)):
-                        branch_col_idx = c
+                    if "year" in val_norm:
+                        if ":" in val_norm:
+                            try:
+                                sheet_year = int(val_norm.split(":")[1].strip())
+                            except ValueError:
+                                pass
+                        if not sheet_year and c < num_cols:
+                            right_val = sheet_values[r-1][c]
+                            if right_val:
+                                try:
+                                    sheet_year = int(str(right_val).strip())
+                                except ValueError:
+                                    pass
+                    if "month" in val_norm:
+                        if ":" in val_norm:
+                            try:
+                                sheet_month = int(val_norm.split(":")[1].strip())
+                            except ValueError:
+                                pass
+                        if not sheet_month and c < num_cols:
+                            right_val = sheet_values[r-1][c]
+                            if right_val:
+                                try:
+                                    sheet_month = int(str(right_val).strip())
+                                except ValueError:
+                                    pass
 
-        # If we found header row but not branch_col_idx, look for it in the header row specifically
-        if header_row_idx and not branch_col_idx:
-            for c in range(1, num_cols + 1):
-                val = sheet_values[header_row_idx-1][c-1]
-                val_norm = normalize_val(val)
-                if ("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm):
-                    branch_col_idx = c
-                    break
+            if not sheet_year:
+                sheet_year = default_year
+            if not sheet_month:
+                sheet_month = default_month
 
-        if not header_row_idx or not emp_name_col_idx or not emp_code_col_idx:
-            # Print debug info to console for troubleshooting
-            print("--- Excel Import Error: Could not identify header row ---")
-            for r in range(1, min(15, num_rows + 1)):
-                row_vals = [sheet_values[r-1][c-1] for c in range(1, min(10, num_cols + 1))]
-                print(f"Row {r}: {row_vals}")
-            return Response({"detail": "Could not identify header row with 'Emp Code' and 'Employee Name'."}, status=400)
+            # Find header row containing Employee Code and Name
+            header_row_idx = None
+            emp_code_col_idx = None
+            emp_name_col_idx = None
+            branch_col_idx = None
 
-        # 3. Find type/status column index
-        type_col_idx = None
-        for r in range(header_row_idx + 1, min(header_row_idx + 12, num_rows + 1)):
-            for c in range(1, num_cols + 1):
-                if c == branch_col_idx:
-                    continue
-                val = sheet_values[r-1][c-1]
-                val_norm = normalize_val(val)
-                if val_norm in ["in time", "out time", "actual hrs", "present day", "present days"]:
-                    type_col_idx = c
-                    break
-            if type_col_idx:
-                break
-
-        if not type_col_idx:
-            type_col_idx = emp_name_col_idx + 1
-
-        # 4. Map date columns and determine header bounds
-        date_cols = {}
-        dates_on_header_row = 0
-        dates_on_below_row = 0
-        
-        for c in range(1, num_cols + 1):
-            if c in [emp_code_col_idx, emp_name_col_idx, type_col_idx, branch_col_idx]:
-                continue
-            
-            val_header = sheet_values[header_row_idx - 1][c - 1]
-            val_below = sheet_values[header_row_idx][c - 1] if header_row_idx < num_rows else None
-            
-            parsed_header = parse_header_date(val_header, year)
-            parsed_below = parse_header_date(val_below, year)
-            
-            if parsed_header:
-                dates_on_header_row += 1
-            if parsed_below:
-                dates_on_below_row += 1
+            for r in range(1, min(21, num_rows + 1)):
+                temp_code_col = None
+                temp_name_col = None
+                temp_branch_col = None
+                for c in range(1, num_cols + 1):
+                    val = sheet_values[r-1][c-1]
+                    val_norm = normalize_val(val)
+                    
+                    is_code_match = ("emp" in val_norm and "code" in val_norm) or (val_norm == "code") or ("employee" in val_norm and "code" in val_norm)
+                    is_name_match = ("employee" in val_norm and "name" in val_norm) or ("emp" in val_norm and "name" in val_norm) or (val_norm == "name")
+                    is_branch_match = ("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm)
+                    
+                    if is_code_match:
+                        temp_code_col = c
+                    elif is_name_match:
+                        temp_name_col = c
+                    elif is_branch_match:
+                        temp_branch_col = c
                 
-            parsed_date = parsed_header or parsed_below
-            if parsed_date:
-                date_cols[c] = parsed_date
+                if temp_code_col and temp_name_col:
+                    header_row_idx = r
+                    emp_code_col_idx = temp_code_col
+                    emp_name_col_idx = temp_name_col
+                    branch_col_idx = temp_branch_col
+                    break
 
-        if not date_cols:
-            # Print debug info to console for troubleshooting
-            print("--- Excel Import Error: No valid date columns found ---")
-            print(f"Header Row Index: {header_row_idx}")
-            for r in range(1, min(15, num_rows + 1)):
-                row_vals = [sheet_values[r-1][c-1] for c in range(1, min(10, num_cols + 1))]
-                print(f"Row {r}: {row_vals}")
-            return Response({"detail": "No valid date columns found in the header row."}, status=400)
+            if not header_row_idx:
+                # Fallback: find them independently
+                for r in range(1, min(21, num_rows + 1)):
+                    for c in range(1, num_cols + 1):
+                        val = sheet_values[r-1][c-1]
+                        val_norm = normalize_val(val)
+                        if (not emp_code_col_idx) and (("emp" in val_norm and "code" in val_norm) or (val_norm == "code") or ("employee" in val_norm and "code" in val_norm)):
+                            emp_code_col_idx = c
+                            header_row_idx = r
+                        elif (not emp_name_col_idx) and (("employee" in val_norm and "name" in val_norm) or ("emp" in val_norm and "name" in val_norm) or (val_norm == "name")):
+                            emp_name_col_idx = c
+                            if not header_row_idx:
+                                header_row_idx = r
+                        elif (not branch_col_idx) and (("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm)):
+                            branch_col_idx = c
 
-        # If more dates were parsed from the row below the main header row,
-        # the header block extends to header_row_idx + 1.
-        if dates_on_below_row > dates_on_header_row:
-            start_data_row = header_row_idx + 2
-        else:
-            start_data_row = header_row_idx + 1
+            if header_row_idx and not branch_col_idx:
+                for c in range(1, num_cols + 1):
+                    val = sheet_values[header_row_idx-1][c-1]
+                    val_norm = normalize_val(val)
+                    if ("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm):
+                        branch_col_idx = c
+                        break
 
-        # 5. Parse employee rows
-        employee_data = {}
-        current_emp_code = None
-        current_emp_name = None
-
-        for r in range(start_data_row, num_rows + 1):
-            emp_code_val = sheet_values[r-1][emp_code_col_idx - 1]
-            emp_name_val = sheet_values[r-1][emp_name_col_idx - 1]
-            branch_val = sheet_values[r-1][branch_col_idx - 1] if branch_col_idx else None
-
-            if emp_code_val is not None or emp_name_val is not None:
-                current_emp_code = str(emp_code_val).strip() if emp_code_val is not None else None
-                if current_emp_code and current_emp_code.endswith(".0"):
-                    current_emp_code = current_emp_code[:-2]
-                current_emp_name = str(emp_name_val).strip() if emp_name_val is not None else None
-
-                # Look up existing employee name if only code is provided
-                if not current_emp_name and current_emp_code:
-                    try:
-                        emp_id = int(current_emp_code)
-                        # Quick lookup from database
-                        emp_obj = Employee.objects.filter(id=emp_id).first()
-                        if emp_obj:
-                            current_emp_name = emp_obj.employee_name
-                    except ValueError:
-                        pass
-
-            if not current_emp_name:
+            if not header_row_idx or not emp_name_col_idx or not emp_code_col_idx:
+                print(f"--- Excel Import: Could not identify header row in sheet '{sheet.title}', skipping ---")
                 continue
 
-            row_type = normalize_val(sheet_values[r-1][type_col_idx - 1])
-            if not row_type:
+            # Find type/status column index
+            type_col_idx = None
+            for r in range(header_row_idx + 1, min(header_row_idx + 12, num_rows + 1)):
+                for c in range(1, num_cols + 1):
+                    if c == branch_col_idx:
+                        continue
+                    val = sheet_values[r-1][c-1]
+                    val_norm = normalize_val(val)
+                    if val_norm in ["in time", "out time", "actual hrs", "present day", "present days"]:
+                        type_col_idx = c
+                        break
+                if type_col_idx:
+                    break
+
+            if not type_col_idx:
+                type_col_idx = emp_name_col_idx + 1
+
+            # Map date columns and determine header bounds
+            date_cols = {}
+            dates_on_header_row = 0
+            dates_on_below_row = 0
+            
+            for c in range(1, num_cols + 1):
+                if c in [emp_code_col_idx, emp_name_col_idx, type_col_idx, branch_col_idx]:
+                    continue
+                
+                val_header = sheet_values[header_row_idx - 1][c - 1]
+                val_below = sheet_values[header_row_idx][c - 1] if header_row_idx < num_rows else None
+                
+                parsed_header = parse_header_date(val_header, sheet_year)
+                parsed_below = parse_header_date(val_below, sheet_year)
+                
+                if parsed_header:
+                    dates_on_header_row += 1
+                if parsed_below:
+                    dates_on_below_row += 1
+                    
+                parsed_date = parsed_header or parsed_below
+                if parsed_date:
+                    date_cols[c] = parsed_date
+
+            if not date_cols:
+                print(f"--- Excel Import: No valid date columns found in sheet '{sheet.title}', skipping ---")
                 continue
 
-            branch_norm = None
-            if branch_val is not None:
-                bv_clean = " ".join(str(branch_val).split()).strip().lower()
-                if "chennai" in bv_clean:
-                    branch_norm = "Chennai"
-                elif "vellore" in bv_clean:
-                    branch_norm = "Vellore"
-                elif "salem" in bv_clean:
-                    branch_norm = "Salem"
-                elif "kanchipuram" in bv_clean or "kanchi" in bv_clean:
-                    branch_norm = "Kanchipuram"
-                elif "hosur" in bv_clean:
-                    branch_norm = "Hosur"
+            if dates_on_below_row > dates_on_header_row:
+                start_data_row = header_row_idx + 2
+            else:
+                start_data_row = header_row_idx + 1
 
-            emp_key = current_emp_code or current_emp_name
-            if emp_key not in employee_data:
-                employee_data[emp_key] = {
-                    "code": current_emp_code,
-                    "name": current_emp_name,
-                    "branch": branch_norm,
-                    "dates": {}
-                }
-            elif branch_norm:
-                employee_data[emp_key]["branch"] = branch_norm
+            # Parse employee rows
+            current_emp_code = None
+            current_emp_name = None
 
-            dates_dict = employee_data[emp_key]["dates"]
-            for c, date_obj in date_cols.items():
-                if date_obj not in dates_dict:
-                    dates_dict[date_obj] = {"in": None, "out": None, "present": 0.0}
+            for r in range(start_data_row, num_rows + 1):
+                emp_code_val = sheet_values[r-1][emp_code_col_idx - 1]
+                emp_name_val = sheet_values[r-1][emp_name_col_idx - 1]
+                branch_val = sheet_values[r-1][branch_col_idx - 1] if branch_col_idx else None
 
-                cell_val = sheet_values[r-1][c - 1]
-                if "in time" in row_type:
-                    dates_dict[date_obj]["in"] = cell_val
-                elif "out time" in row_type:
-                    dates_dict[date_obj]["out"] = cell_val
-                elif "present" in row_type:
-                    try:
-                        dates_dict[date_obj]["present"] = float(cell_val) if cell_val is not None else 0.0
-                    except ValueError:
-                        dates_dict[date_obj]["present"] = 0.0
+                if emp_code_val is not None or emp_name_val is not None:
+                    current_emp_code = str(emp_code_val).strip() if emp_code_val is not None else None
+                    if current_emp_code and current_emp_code.endswith(".0"):
+                        current_emp_code = current_emp_code[:-2]
+                    current_emp_name = str(emp_name_val).strip() if emp_name_val is not None else None
+
+                    # Look up existing employee name if only code is provided
+                    if not current_emp_name and current_emp_code:
+                        try:
+                            emp_id = int(current_emp_code)
+                            emp_obj = Employee.objects.filter(id=emp_id).first()
+                            if emp_obj:
+                                current_emp_name = emp_obj.employee_name
+                        except ValueError:
+                            pass
+
+                if not current_emp_name:
+                    continue
+
+                row_type = normalize_val(sheet_values[r-1][type_col_idx - 1])
+                if not row_type:
+                    continue
+
+                branch_norm = None
+                if branch_val is not None:
+                    bv_clean = " ".join(str(branch_val).split()).strip().lower()
+                    if "chennai" in bv_clean:
+                        branch_norm = "Chennai"
+                    elif "vellore" in bv_clean:
+                        branch_norm = "Vellore"
+                    elif "salem" in bv_clean:
+                        branch_norm = "Salem"
+                    elif "kanchipuram" in bv_clean or "kanchi" in bv_clean:
+                        branch_norm = "Kanchipuram"
+                    elif "hosur" in bv_clean:
+                        branch_norm = "Hosur"
+
+                if not branch_norm:
+                    branch_norm = sheet_branch
+
+                emp_key = current_emp_code or current_emp_name
+                if emp_key not in employee_data:
+                    employee_data[emp_key] = {
+                        "code": current_emp_code,
+                        "name": current_emp_name,
+                        "branch": branch_norm,
+                        "dates": {}
+                    }
+                elif branch_norm:
+                    employee_data[emp_key]["branch"] = branch_norm
+
+                dates_dict = employee_data[emp_key]["dates"]
+                for c, date_obj in date_cols.items():
+                    if date_obj not in dates_dict:
+                        dates_dict[date_obj] = {"in": None, "out": None, "present": 0.0}
+
+                    cell_val = sheet_values[r-1][c - 1]
+                    if "in time" in row_type:
+                        dates_dict[date_obj]["in"] = cell_val
+                    elif "out time" in row_type:
+                        dates_dict[date_obj]["out"] = cell_val
+                    elif "present" in row_type:
+                        try:
+                            dates_dict[date_obj]["present"] = float(cell_val) if cell_val is not None else 0.0
+                        except ValueError:
+                            dates_dict[date_obj]["present"] = 0.0
 
         # 6. Database Transaction for bulk creation/updates
         employees_created = 0
@@ -391,7 +441,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 existing_usernames = set(User.objects.values_list("username", flat=True))
 
                 # Pre-fetch existing attendance records within the imported date range
-                all_dates = list(date_cols.values())
+                all_dates = []
+                for emp_info in employee_data.values():
+                    all_dates.extend(list(emp_info["dates"].keys()))
+                all_dates = list(set(all_dates))
+
                 attendance_map = {}
                 if all_dates:
                     min_date = min(all_dates)

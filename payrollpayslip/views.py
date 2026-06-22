@@ -292,20 +292,31 @@ class PayslipViewSet(viewsets.ModelViewSet):
         from employees.models import Employee
         from onboarding.models import Onboarding
         
+        branch = request.query_params.get('branch')
+        
         active_emps = Employee.objects.filter(status='active')
+        if branch:
+            active_emps = active_emps.filter(branch__iexact=branch)
+            
         total_employees = active_emps.count()
         
         # Avg Salary of active employees
         avg_salary_raw = active_emps.aggregate(a=Avg('salary'))['a'] or 0
         
         # Overall Lifetime Payroll distributed
-        total_payroll_raw = Payslip.objects.aggregate(s=Sum('net_salary'))['s'] or 0
+        payslips = Payslip.objects.all()
+        if branch:
+            payslips = payslips.filter(employee__branch__iexact=branch)
+        total_payroll_raw = payslips.aggregate(s=Sum('net_salary'))['s'] or 0
         
         # Pending onboarding processes
-        pending_approvals = Onboarding.objects.exclude(status='Completed').count()
+        pending_onboards = Onboarding.objects.exclude(status='Completed')
+        if branch:
+            pending_onboards = pending_onboards.filter(work_location__icontains=branch)
+        pending_approvals = pending_onboards.count()
         
         # Recent Payslips (last 5)
-        recent_slips = Payslip.objects.select_related('employee').order_by('-id')[:5]
+        recent_slips = payslips.select_related('employee').order_by('-id')[:5]
         recent_txns = []
         for s in recent_slips:
             recent_txns.append({
@@ -341,6 +352,8 @@ class PayslipViewSet(viewsets.ModelViewSet):
         if Payslip.objects.exists():
             for year, month in trend_months:
                 month_slips = Payslip.objects.filter(year=year, month=month)
+                if branch:
+                    month_slips = month_slips.filter(employee__branch__iexact=branch)
                 totals = month_slips.aggregate(
                     payroll=Sum('net_salary'),
                     incentive=Sum('earned_incentive'),
