@@ -5,6 +5,7 @@ from datetime import datetime, time, date as dt_date
 from django.db import transaction
 from django.utils import timezone
 from django.utils.timezone import make_aware
+from django.utils.dateparse import parse_date
 from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
@@ -576,7 +577,41 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         queryset = Attendance.objects.select_related("employee").all().order_by("-id")
         role = "superadmin" if user.is_superuser else user.role
         if role == "employee":
-            return queryset.filter(employee__user=user)
+            queryset = queryset.filter(employee__user=user)
+
+        # Optional, non-breaking filters on `intime`. When none are supplied the
+        # full list is returned exactly as before. The frontend opts in to a
+        # smaller payload by sending any of these query params. Malformed values
+        # are ignored rather than 500-ing.
+        params = self.request.query_params
+
+        # ?month=YYYY-MM  -> single calendar month
+        month = params.get("month")
+        if month:
+            parts = month.split("-")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                queryset = queryset.filter(
+                    intime__year=int(parts[0]), intime__month=int(parts[1])
+                )
+
+        # ?start_date=YYYY-MM-DD and/or ?end_date=YYYY-MM-DD  -> inclusive range
+        start_date = parse_date(params.get("start_date") or "")
+        if start_date:
+            queryset = queryset.filter(intime__date__gte=start_date)
+        end_date = parse_date(params.get("end_date") or "")
+        if end_date:
+            queryset = queryset.filter(intime__date__lte=end_date)
+
+        # ?employee=<id>
+        employee_id = params.get("employee")
+        if employee_id and employee_id.isdigit():
+            queryset = queryset.filter(employee_id=int(employee_id))
+
+        # ?status=Present
+        status = params.get("status")
+        if status:
+            queryset = queryset.filter(status=status)
+
         return queryset
 
     @action(detail=False, methods=["post"])
