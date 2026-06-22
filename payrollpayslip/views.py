@@ -40,8 +40,28 @@ class PayslipViewSet(viewsets.ModelViewSet):
         except ValueError:
             return Response({"error": "Invalid month or year format."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 1. Get Total Days in current month
-        _, total_days = calendar.monthrange(year, month)
+        # 1. Get previous month/year to calculate days from previous month's 25th to current month's 24th
+        if month == 1:
+            prev_month = 12
+            prev_year = year - 1
+        else:
+            prev_month = month - 1
+            prev_year = year
+
+        import datetime
+        from django.utils.timezone import make_aware
+
+        # Start date: 25th of previous month
+        # End date: 24th of current month
+        start_date = datetime.date(prev_year, prev_month, 25)
+        end_date = datetime.date(year, month, 24)
+
+        # Total days in this calculation period (inclusive) is equal to total days in previous month
+        total_days = (end_date - start_date).days + 1
+
+        # Timezone-aware datetimes for range queries
+        start_datetime = make_aware(datetime.datetime.combine(start_date, datetime.time.min))
+        end_datetime = make_aware(datetime.datetime.combine(end_date, datetime.time.max))
         
         active_employees = Employee.objects.filter(status='active')
         created_count = 0
@@ -52,11 +72,10 @@ class PayslipViewSet(viewsets.ModelViewSet):
             return Decimal(val).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
         for emp in active_employees:
-            # 2. Calculate LOP days based on Attendance Table
+            # 2. Calculate LOP days based on Attendance Table within the range
             lop_days = Decimal(Attendance.objects.filter(
                 employee=emp,
-                intime__year=year,
-                intime__month=month,
+                intime__range=(start_datetime, end_datetime),
                 status='Absent'
             ).count())
 
@@ -348,8 +367,21 @@ class PayslipViewSet(viewsets.ModelViewSet):
 
         total_disburse_raw = active_emps.aggregate(s=Sum('salary'))['s'] or 0
 
-        _, last_day = calendar.monthrange(now.year, now.month)
-        cycle_date = timezone.datetime(now.year, now.month, last_day)
+        # Determine upcoming cycle ending on the 24th
+        if now.day >= 25:
+            # Current date is on or after 25th, upcoming payout cycle ends on 24th of next month
+            if now.month == 12:
+                cycle_year = now.year + 1
+                cycle_month = 1
+            else:
+                cycle_year = now.year
+                cycle_month = now.month + 1
+        else:
+            # Current date is before 25th, upcoming payout cycle ends on 24th of current month
+            cycle_year = now.year
+            cycle_month = now.month
+
+        cycle_date = timezone.datetime(cycle_year, cycle_month, 24)
         days_remaining = (cycle_date.date() - now.date()).days
         if days_remaining < 0:
             days_remaining = 0

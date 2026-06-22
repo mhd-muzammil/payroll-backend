@@ -6,11 +6,17 @@ from employees.models import Employee
 
 class AttendanceSerializer(serializers.ModelSerializer):
     employee_id = serializers.IntegerField(source="employee.id", read_only=True)
+    branch = serializers.SerializerMethodField()
 
     class Meta:
         model = Attendance
         fields = '__all__'
         read_only_fields = ("employee",)
+
+    def get_branch(self, obj):
+        if obj.employee:
+            return obj.employee.branch
+        return "Chennai"
 
     def _get_employee_for_user(self, user):
         try:

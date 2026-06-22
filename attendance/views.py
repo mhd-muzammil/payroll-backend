@@ -181,27 +181,33 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         header_row_idx = None
         emp_code_col_idx = None
         emp_name_col_idx = None
+        branch_col_idx = None
 
         # Scan rows from 1 to 20 to find the header row containing both employee code and name
         for r in range(1, min(21, num_rows + 1)):
             temp_code_col = None
             temp_name_col = None
+            temp_branch_col = None
             for c in range(1, num_cols + 1):
                 val = sheet_values[r-1][c-1]
                 val_norm = normalize_val(val)
                 
                 is_code_match = ("emp" in val_norm and "code" in val_norm) or (val_norm == "code") or ("employee" in val_norm and "code" in val_norm)
                 is_name_match = ("employee" in val_norm and "name" in val_norm) or ("emp" in val_norm and "name" in val_norm) or (val_norm == "name")
+                is_branch_match = ("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm)
                 
                 if is_code_match:
                     temp_code_col = c
                 elif is_name_match:
                     temp_name_col = c
+                elif is_branch_match:
+                    temp_branch_col = c
             
             if temp_code_col and temp_name_col:
                 header_row_idx = r
                 emp_code_col_idx = temp_code_col
                 emp_name_col_idx = temp_name_col
+                branch_col_idx = temp_branch_col
                 break
 
         if not header_row_idx:
@@ -217,6 +223,17 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         emp_name_col_idx = c
                         if not header_row_idx:
                             header_row_idx = r
+                    elif (not branch_col_idx) and (("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm)):
+                        branch_col_idx = c
+
+        # If we found header row but not branch_col_idx, look for it in the header row specifically
+        if header_row_idx and not branch_col_idx:
+            for c in range(1, num_cols + 1):
+                val = sheet_values[header_row_idx-1][c-1]
+                val_norm = normalize_val(val)
+                if ("branch" in val_norm) or ("region" in val_norm) or ("location" in val_norm) or ("city" in val_norm) or ("zone" in val_norm):
+                    branch_col_idx = c
+                    break
 
         if not header_row_idx or not emp_name_col_idx or not emp_code_col_idx:
             # Print debug info to console for troubleshooting
@@ -230,6 +247,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         type_col_idx = None
         for r in range(header_row_idx + 1, min(header_row_idx + 12, num_rows + 1)):
             for c in range(1, num_cols + 1):
+                if c == branch_col_idx:
+                    continue
                 val = sheet_values[r-1][c-1]
                 val_norm = normalize_val(val)
                 if val_norm in ["in time", "out time", "actual hrs", "present day", "present days"]:
@@ -247,7 +266,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         dates_on_below_row = 0
         
         for c in range(1, num_cols + 1):
-            if c in [emp_code_col_idx, emp_name_col_idx, type_col_idx]:
+            if c in [emp_code_col_idx, emp_name_col_idx, type_col_idx, branch_col_idx]:
                 continue
             
             val_header = sheet_values[header_row_idx - 1][c - 1]
@@ -289,6 +308,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         for r in range(start_data_row, num_rows + 1):
             emp_code_val = sheet_values[r-1][emp_code_col_idx - 1]
             emp_name_val = sheet_values[r-1][emp_name_col_idx - 1]
+            branch_val = sheet_values[r-1][branch_col_idx - 1] if branch_col_idx else None
 
             if emp_code_val is not None or emp_name_val is not None:
                 current_emp_code = str(emp_code_val).strip() if emp_code_val is not None else None
@@ -314,13 +334,30 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             if not row_type:
                 continue
 
+            branch_norm = None
+            if branch_val is not None:
+                bv_clean = " ".join(str(branch_val).split()).strip().lower()
+                if "chennai" in bv_clean:
+                    branch_norm = "Chennai"
+                elif "vellore" in bv_clean:
+                    branch_norm = "Vellore"
+                elif "salem" in bv_clean:
+                    branch_norm = "Salem"
+                elif "kanchipuram" in bv_clean or "kanchi" in bv_clean:
+                    branch_norm = "Kanchipuram"
+                elif "hosur" in bv_clean:
+                    branch_norm = "Hosur"
+
             emp_key = current_emp_code or current_emp_name
             if emp_key not in employee_data:
                 employee_data[emp_key] = {
                     "code": current_emp_code,
                     "name": current_emp_name,
+                    "branch": branch_norm,
                     "dates": {}
                 }
+            elif branch_norm:
+                employee_data[emp_key]["branch"] = branch_norm
 
             dates_dict = employee_data[emp_key]["dates"]
             for c, date_obj in date_cols.items():
@@ -373,6 +410,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 for emp_key, emp_info in employee_data.items():
                     code = emp_info["code"]
                     name = emp_info["name"]
+                    branch_val = emp_info.get("branch") or "Chennai"
                     dates = emp_info["dates"]
 
                     employee = None
@@ -417,7 +455,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             "role": "Staff",
                             "department": "General",
                             "salary": 0.00,
-                            "branch": "Chennai",
+                            "branch": branch_val,
                             "status": "active"
                         }
                         if code:
@@ -432,6 +470,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         emp_by_name[employee.employee_name.lower().strip()] = employee
                         employees_created += 1
                     else:
+                        # Update branch if specified in Excel and differs from employee's current branch
+                        if emp_info.get("branch") and employee.branch != emp_info["branch"]:
+                            employee.branch = emp_info["branch"]
+                            employee.save(update_fields=["branch"])
+
                         # If employee exists but doesn't have a linked user account, create and link one
                         if not employee.user:
                             username = f"{name.lower().replace(' ', '')}_{code}" if code else name.lower().replace(' ', '')
