@@ -232,8 +232,13 @@ class PayslipViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def cycles_summary(self, request):
         """Aggregates monthly payslip records to provide enterprise-wide Payroll status cycles."""
+        branch = request.query_params.get('branch')
+        qs = Payslip.objects.all()
+        if branch:
+            qs = qs.filter(employee__branch=branch)
+
         from django.db.models import Count, Sum
-        summary = Payslip.objects.values('year', 'month').annotate(
+        summary = qs.values('year', 'month').annotate(
             employees_count=Count('id'),
             total_gross=Sum('gross_earnings'),
             total_net=Sum('net_salary')
@@ -256,14 +261,19 @@ class PayslipViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def company_stats(self, request):
         """Calculates high-level corporate KPIs based on true computed data."""
+        branch = request.query_params.get('branch')
+        qs = Payslip.objects.all()
+        if branch:
+            qs = qs.filter(employee__branch=branch)
+
         from django.db.models import Sum
         from django.utils import timezone
         now = timezone.now()
         
-        this_month_slips = Payslip.objects.filter(month=now.month, year=now.year)
+        this_month_slips = qs.filter(month=now.month, year=now.year)
         total_this_month = this_month_slips.aggregate(s=Sum('net_salary'))['s'] or 0
         
-        ytd_slips = Payslip.objects.filter(year=now.year)
+        ytd_slips = qs.filter(year=now.year)
         total_ytd = ytd_slips.aggregate(s=Sum('net_salary'))['s'] or 0
         
         processed_pct = "100%" if total_this_month > 0 else "0%"

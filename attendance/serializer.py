@@ -99,11 +99,17 @@ class AttendanceSerializer(serializers.ModelSerializer):
 
 class LeaveRequestSerializer(serializers.ModelSerializer):
     employee_name = serializers.CharField(source="employee.employee_name", read_only=True)
+    branch = serializers.SerializerMethodField()
 
     class Meta:
         model = LeaveRequest
         fields = "__all__"
         read_only_fields = ("employee", "status", "applied_on")
+
+    def get_branch(self, obj):
+        if obj.employee:
+            return obj.employee.branch
+        return "Chennai"
 
     def validate(self, attrs):
         request = self.context.get("request")
