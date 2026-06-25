@@ -51,14 +51,35 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             return " ".join(str(val).split()).strip().lower()
 
         # Helper to parse dates in header
-        def parse_header_date(val, default_year):
+        def parse_header_date(val, default_year, default_month):
             if not val:
                 return None
             if isinstance(val, (datetime, dt_date)):
-                if hasattr(val, 'date'):
-                    return val.date()
-                return val
+                d = val.date() if hasattr(val, 'date') else val
+                if d.year in [1899, 1900]:
+                    day_val = d.day
+                    if d.year == 1899 and d.month == 12 and d.day == 31:
+                        day_val = 1
+                    try:
+                        return dt_date(default_year, default_month, day_val)
+                    except ValueError:
+                        pass
+                return d
+            if isinstance(val, (int, float)):
+                try:
+                    day_val = int(val)
+                    if 1 <= day_val <= 31:
+                        return dt_date(default_year, default_month, day_val)
+                except (ValueError, TypeError):
+                    pass
             val_str = normalize_val(val)
+            if val_str.isdigit():
+                try:
+                    day_val = int(val_str)
+                    if 1 <= day_val <= 31:
+                        return dt_date(default_year, default_month, day_val)
+                except ValueError:
+                    pass
             # Try to search for DD-MMM pattern anywhere in the normalized string
             # e.g. "25-mar", "25-march", "wed 25-mar"
             match = re.search(r'\b(\d{1,2})[-/]([A-Za-z]+)\b', val_str)
@@ -329,8 +350,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 val_header = sheet_values[header_row_idx - 1][c - 1]
                 val_below = sheet_values[header_row_idx][c - 1] if header_row_idx < num_rows else None
                 
-                parsed_header = parse_header_date(val_header, sheet_year)
-                parsed_below = parse_header_date(val_below, sheet_year)
+                parsed_header = parse_header_date(val_header, sheet_year, sheet_month)
+                parsed_below = parse_header_date(val_below, sheet_year, sheet_month)
                 
                 if parsed_header:
                     dates_on_header_row += 1

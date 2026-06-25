@@ -4,6 +4,7 @@ from .models import User
 
 class UserManagementSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=False)
+    branch = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -20,8 +21,13 @@ class UserManagementSerializer(serializers.ModelSerializer):
             "password",
             "plain_password",
             "date_joined",
+            "branch",
         )
         read_only_fields = ("date_joined", "is_staff")
+
+    def get_branch(self, obj):
+        employee_profile = getattr(obj, "employee_profile", None)
+        return employee_profile.branch if employee_profile else None
 
     def validate_phone_number(self, value):
         if not value:
