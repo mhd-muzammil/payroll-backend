@@ -56,3 +56,53 @@ class Employee(models.Model):
 
     def __str__(self):
         return self.employee_name
+
+
+class Task(models.Model):
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('in_progress', 'In Progress'),
+        ('completed', 'Completed'),
+    )
+    PRIORITY_CHOICES = (
+        ('low', 'Low'),
+        ('medium', 'Medium'),
+        ('high', 'High'),
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField()
+    assigned_to = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='tasks')
+    assigned_by = models.ForeignKey('authentication.User', on_delete=models.SET_NULL, null=True, blank=True, related_name='assigned_tasks')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='medium')
+    due_date = models.DateField()
+    employee_notes = models.TextField(blank=True, default='')
+    checklist = models.JSONField(default=list, blank=True)
+    activity_log = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.title} - {self.assigned_to.employee_name}"
+
+
+class Performance(models.Model):
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='performances')
+    reviewer = models.ForeignKey('authentication.User', on_delete=models.SET_NULL, null=True, blank=True, related_name='submitted_reviews')
+    review_period = models.CharField(max_length=100)
+    work_quality = models.IntegerField(default=5)
+    attendance = models.IntegerField(default=5)
+    communication = models.IntegerField(default=5)
+    dependability = models.IntegerField(default=5)
+    overall_score = models.DecimalField(max_digits=3, decimal_places=2, default=5.0)
+    comments = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        total = int(self.work_quality) + int(self.attendance) + int(self.communication) + int(self.dependability)
+        self.overall_score = round(total / 4.0, 2)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.employee.employee_name} - {self.review_period}"
