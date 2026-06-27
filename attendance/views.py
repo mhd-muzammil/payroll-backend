@@ -1,7 +1,7 @@
 import math
 import openpyxl
 import re
-from datetime import datetime, time, date as dt_date
+from datetime import datetime, time, date as dt_date, timedelta
 from django.db import transaction
 from django.utils import timezone
 from django.utils.timezone import make_aware
@@ -137,8 +137,17 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 return time(hour, minute, second)
             except ValueError:
                 pass
-                
+
             return None
+
+        # Map a weekday label cell ("sat", "Sun", "MON", "fri.") to a Python
+        # weekday number (Mon=0 .. Sun=6), or None if it isn't a weekday label.
+        WEEKDAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+        def weekday_label(val):
+            if not isinstance(val, str):
+                return None
+            key = re.sub(r'[^a-z]', '', val.strip().lower())[:3]
+            return WEEKDAY_NAMES.get(key)
 
         # Scan the first sheet to locate global "Year" or "Month" default
         default_year = datetime.now().year
@@ -199,6 +208,17 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 sheet_branch = "Kanchipuram"
             elif "hosur" in sheet_title_norm:
                 sheet_branch = "Hosur"
+
+            # Only branch sheets carry per-person attendance. Other tabs in these
+            # workbooks are non-attendance and MUST NOT be imported:
+            #   - "MASTER": a blank salary/roster template (no codes or names).
+            #   - "House Keeping": a per-branch roll-up whose "names" are branch
+            #     names ("Chennai", "Vellore", ...), not people.
+            # Importing them would invent bogus employees, so skip any sheet whose
+            # title doesn't map to a known branch.
+            if sheet_branch is None:
+                print(f"--- Excel Import: Skipping non-branch sheet '{sheet.title}' ---")
+                continue
 
             # Efficiently read rows up to 100 consecutive completely empty rows
             sheet_values = []
@@ -371,6 +391,89 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             else:
                 start_data_row = header_row_idx + 1
 
+            # --- Correct date columns using the weekday-label row as ground truth ---
+            # Two real-world defects in these biometric exports are repaired here:
+            #  (a) Wrong YEAR: cells stamped e.g. 2025 whose weekday labels only fit
+            #      2026 (a year/month-boundary glitch). Fixed PER COLUMN by snapping
+            #      the date's year to the one near the sheet's year whose weekday
+            #      matches that column's label.
+            #  (b) Garbage columns: trailing "=prev+1" formulas that collapsed to
+            #      1899/1900 epoch dates (which parse_header_date then remaps onto a
+            #      bogus day of the sheet's month, colliding with real days). A
+            #      column whose label CANNOT be satisfied by any nearby year is
+            #      treated as broken and rebuilt from the running daily sequence
+            #      (previous trustworthy day + 1) — its own date and stale label are
+            #      both ignored.
+            ordered_cols = sorted(date_cols.keys())
+            date_value_row = header_row_idx + 1 if start_data_row == header_row_idx + 2 else header_row_idx
+
+            best_label_row = None
+            best_label_count = 0
+            for cand_row in (header_row_idx, header_row_idx - 1, header_row_idx + 1):
+                if cand_row < 1 or cand_row > num_rows or cand_row == date_value_row:
+                    continue
+                cnt = sum(1 for c in ordered_cols if weekday_label(sheet_values[cand_row - 1][c - 1]) is not None)
+                if cnt > best_label_count:
+                    best_label_count = cnt
+                    best_label_row = cand_row
+
+            if best_label_row and best_label_count >= max(3, len(ordered_cols) // 2):
+                labels = {c: weekday_label(sheet_values[best_label_row - 1][c - 1]) for c in ordered_cols}
+                year_window = sorted({sheet_year, sheet_year - 1, sheet_year + 1},
+                                     key=lambda y: abs(y - sheet_year))
+                corrections = 0
+                broken = set()
+
+                # (a) Snap each labelled column's year to match its weekday label.
+                #     Columns whose label no nearby year can satisfy are BROKEN.
+                for c in ordered_cols:
+                    lbl = labels.get(c)
+                    if lbl is None:
+                        continue
+                    d = date_cols[c]
+                    if d.weekday() == lbl:
+                        continue
+                    snapped = None
+                    for y in year_window:
+                        try:
+                            cand = d.replace(year=y)
+                        except ValueError:
+                            continue
+                        if cand.weekday() == lbl:
+                            snapped = cand
+                            break
+                    if snapped is not None:
+                        date_cols[c] = snapped
+                        corrections += 1
+                    else:
+                        broken.add(c)
+
+                # (b) Rebuild broken columns as a running daily sequence: forward
+                #     from the previous trustworthy day, then a backward pass for any
+                #     leading broken columns that had no good day to their left.
+                fixed = set()
+                last_good = None
+                for c in ordered_cols:
+                    if c not in broken:
+                        last_good = date_cols[c]
+                    elif last_good is not None:
+                        last_good = last_good + timedelta(days=1)
+                        date_cols[c] = last_good
+                        fixed.add(c)
+                        corrections += 1
+                next_good = None
+                for c in reversed(ordered_cols):
+                    if c not in broken or c in fixed:
+                        next_good = date_cols[c]
+                    elif next_good is not None:
+                        next_good = next_good - timedelta(days=1)
+                        date_cols[c] = next_good
+                        corrections += 1
+
+                if corrections:
+                    print(f"--- Excel Import: '{sheet.title}': corrected {corrections} date column(s) via "
+                          f"weekday labels ({date_cols[ordered_cols[0]]} .. {date_cols[ordered_cols[-1]]}) ---")
+
             # Parse employee rows
             current_emp_code = None
             current_emp_name = None
@@ -386,15 +489,15 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         current_emp_code = current_emp_code[:-2]
                     current_emp_name = str(emp_name_val).strip() if emp_name_val is not None else None
 
-                    # Look up existing employee name if only code is provided
+                    # Look up an existing employee's name when a row carries only a
+                    # code. Match on the emp_code field within this sheet's branch
+                    # (NOT on Employee.id — the code is not the primary key).
                     if not current_emp_name and current_emp_code:
-                        try:
-                            emp_id = int(current_emp_code)
-                            emp_obj = Employee.objects.filter(id=emp_id).first()
-                            if emp_obj:
-                                current_emp_name = emp_obj.employee_name
-                        except ValueError:
-                            pass
+                        emp_obj = Employee.objects.filter(
+                            emp_code=str(current_emp_code), branch=sheet_branch
+                        ).first()
+                        if emp_obj:
+                            current_emp_name = emp_obj.employee_name
 
                 if not current_emp_name:
                     continue
@@ -420,7 +523,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 if not branch_norm:
                     branch_norm = sheet_branch
 
-                emp_key = current_emp_code or current_emp_name
+                # Key by (branch, code) — codes are per-sheet row numbers, NOT
+                # globally unique, so "1" is a different person in every branch.
+                # Fall back to (branch, name) when a row has no code.
+                emp_key = (branch_norm, current_emp_code) if current_emp_code \
+                    else (branch_norm, current_emp_name.lower())
                 if emp_key not in employee_data:
                     employee_data[emp_key] = {
                         "code": current_emp_code,
@@ -455,8 +562,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             with transaction.atomic():
                 # Pre-fetch employees and user information to avoid repeated queries
                 all_employees = list(Employee.objects.all().select_related("user"))
-                emp_by_id = {e.id: e for e in all_employees}
-                emp_by_name = {e.employee_name.lower().strip(): e for e in all_employees}
+                # Branch-scoped lookups: the sheet's identity is (branch, code) with
+                # a (branch, name) fallback. NEVER match the per-sheet code against
+                # Employee.id — those codes are not the DB primary keys.
+                emp_by_branch_name = {(e.branch.lower().strip(), e.employee_name.lower().strip()): e
+                                      for e in all_employees}
+                emp_by_branch_code = {(e.branch.lower().strip(), str(e.emp_code)): e
+                                      for e in all_employees if e.emp_code}
 
                 # Pre-fetch existing usernames to check uniqueness locally
                 existing_usernames = set(User.objects.values_list("username", flat=True))
@@ -478,7 +590,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     )
                     for att in existing_attendance:
                         if att.employee_id and att.intime:
-                            attendance_map[(att.employee_id, att.intime.date())] = att
+                            # Key on the LOCAL (IST) date. Absent records are stored
+                            # at local midnight, which is the previous day in UTC, so
+                            # att.intime.date() (UTC) would be off by one and cause
+                            # duplicate rows on re-import. localtime() realigns it
+                            # with the date_obj used when records are created below.
+                            local_date = timezone.localtime(att.intime).date()
+                            attendance_map[(att.employee_id, local_date)] = att
 
                 records_to_create = []
                 records_to_update = []
@@ -490,15 +608,17 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     dates = emp_info["dates"]
 
                     employee = None
+                    bkey = branch_val.lower().strip()
+                    # 1) (branch, emp_code) — durable identity once first imported.
                     if code:
-                        try:
-                            emp_id = int(code)
-                            employee = emp_by_id.get(emp_id)
-                        except ValueError:
-                            pass
-                    
+                        employee = emp_by_branch_code.get((bkey, str(code)))
+                    # 2) (branch, name) — first import, or rows that have no code.
+                    #    Matching is ALWAYS scoped to the branch: the same name can
+                    #    belong to different people in different branches (e.g.
+                    #    "PERUMAL" exists in both Salem and Kanchipuram), so a global
+                    #    name match would wrongly merge them.
                     if not employee and name:
-                        employee = emp_by_name.get(name.lower().strip())
+                        employee = emp_by_branch_name.get((bkey, name.lower().strip()))
 
                     if not employee:
                         # 1. Create User account first
@@ -532,24 +652,29 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             "department": "General",
                             "salary": 0.00,
                             "branch": branch_val,
-                            "status": "active"
+                            "status": "active",
+                            # Persist the per-branch code (do NOT use it as the PK).
+                            "emp_code": str(code) if code else None,
                         }
-                        if code:
-                            try:
-                                emp_id = int(code)
-                                if emp_id not in emp_by_id:
-                                    create_kwargs["id"] = emp_id
-                            except ValueError:
-                                pass
                         employee = Employee.objects.create(**create_kwargs)
-                        emp_by_id[employee.id] = employee
-                        emp_by_name[employee.employee_name.lower().strip()] = employee
+                        emp_by_branch_name[(employee.branch.lower().strip(),
+                                            employee.employee_name.lower().strip())] = employee
+                        if employee.emp_code:
+                            emp_by_branch_code[(employee.branch.lower().strip(),
+                                                str(employee.emp_code))] = employee
                         employees_created += 1
                     else:
                         # Update branch if specified in Excel and differs from employee's current branch
                         if emp_info.get("branch") and employee.branch != emp_info["branch"]:
                             employee.branch = emp_info["branch"]
                             employee.save(update_fields=["branch"])
+
+                        # Backfill the per-branch code on an employee matched by name,
+                        # so subsequent imports match it by (branch, code) directly.
+                        if code and not employee.emp_code:
+                            employee.emp_code = str(code)
+                            employee.save(update_fields=["emp_code"])
+                            emp_by_branch_code[(employee.branch.lower().strip(), str(code))] = employee
 
                         # If employee exists but doesn't have a linked user account, create and link one
                         if not employee.user:

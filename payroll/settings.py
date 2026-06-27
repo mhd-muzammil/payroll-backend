@@ -126,6 +126,21 @@ else:
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": sqlite_path,
+            # SQLite dev-only tuning. Without this, the default 5s lock timeout
+            # and rollback-journal mode make readers and the writer block each
+            # other, so a large write (e.g. the attendance import) racing the
+            # frontend's polling fails with "database is locked". WAL lets reads
+            # and the single writer proceed concurrently; the longer busy timeout
+            # lets a write wait instead of erroring. Prod uses Postgres (above)
+            # and is unaffected.
+            "OPTIONS": {
+                "timeout": 30,
+                "init_command": (
+                    "PRAGMA journal_mode=WAL;"
+                    "PRAGMA synchronous=NORMAL;"
+                    "PRAGMA busy_timeout=30000;"
+                ),
+            },
         }
     }
 
