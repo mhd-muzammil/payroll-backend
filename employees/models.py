@@ -18,6 +18,11 @@ class Employee(models.Model):
     )
     employee_name = models.CharField(max_length=100)
     branch = models.CharField(max_length=100, choices=BRANCH_CHOICES, default='Chennai')
+    # Per-branch code as entered by HR in the attendance sheet (e.g. "1", "2", ...).
+    # NOT globally unique — the same code maps to different people in different
+    # branches — so it is only meaningful together with `branch`. Nullable/blank so
+    # existing rows and non-imported employees are unaffected.
+    emp_code = models.CharField(max_length=50, null=True, blank=True)
     email = models.EmailField(unique=True, max_length=100, null=True, blank=True)
     phone = models.CharField(max_length=20, unique=True, null=True, blank=True)
     role = models.CharField(max_length=100)
