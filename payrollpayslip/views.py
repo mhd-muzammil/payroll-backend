@@ -11,6 +11,7 @@ from .models import Payslip, BranchFinancial
 from .serializer import PayslipSerializer, BranchFinancialSerializer
 from employees.models import Employee, Performance
 from attendance.models import Attendance
+from authentication.models import get_allowed_branches
 
 class PayslipViewSet(viewsets.ModelViewSet):
     queryset = Payslip.objects.all()
@@ -23,6 +24,10 @@ class PayslipViewSet(viewsets.ModelViewSet):
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
             return queryset.filter(employee__user=user)
+        
+        branches = get_allowed_branches(user, "payslips")
+        if "All" not in branches:
+            queryset = queryset.filter(employee__branch__in=branches)
         return queryset
 
     @action(detail=False, methods=['post'])
@@ -65,6 +70,9 @@ class PayslipViewSet(viewsets.ModelViewSet):
         end_datetime = make_aware(datetime.datetime.combine(end_date, datetime.time.max))
         
         active_employees = Employee.objects.filter(status='active')
+        branches = get_allowed_branches(request.user, "payroll")
+        if "All" not in branches:
+            active_employees = active_employees.filter(branch__in=branches)
         created_count = 0
         updated_count = 0
 
@@ -586,6 +594,9 @@ class PayslipViewSet(viewsets.ModelViewSet):
             return Response({"error": "Invalid month or year."}, status=status.HTTP_400_BAD_REQUEST)
 
         branches = ["Chennai", "Vellore", "Salem", "Kanchipuram", "Hosur"]
+        allowed_branches = get_allowed_branches(request.user, "reports")
+        if "All" not in allowed_branches:
+            branches = [b for b in branches if b in allowed_branches]
         data = []
 
         from django.db.models import Sum
@@ -638,6 +649,10 @@ class BranchFinancialViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+        user = self.request.user
+        branches = get_allowed_branches(user, "payroll")
+        if "All" not in branches:
+            queryset = queryset.filter(branch__in=branches)
         month = self.request.query_params.get("month")
         year = self.request.query_params.get("year")
         if month:

@@ -6,6 +6,7 @@ from .models import Employee, Task, Performance
 from .serializer import EmployeeSerializer, SimpleEmployeeSerializer
 from .task_serializer import TaskSerializer
 from .performance_serializer import PerformanceSerializer
+from authentication.models import get_allowed_branches
 
 class EmployeeViewSet(viewsets.ModelViewSet):
     queryset = Employee.objects.all()
@@ -27,6 +28,10 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             if self.action == 'list':
                 return queryset
             return queryset.filter(user=user)
+        
+        branches = get_allowed_branches(user, "employees")
+        if "All" not in branches:
+            queryset = queryset.filter(branch__in=branches)
         return queryset
 
 
@@ -41,6 +46,10 @@ class TaskViewSet(viewsets.ModelViewSet):
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
             return queryset.filter(Q(assigned_to__user=user) | Q(assigned_by=user))
+        
+        branches = get_allowed_branches(user, "tasks")
+        if "All" not in branches:
+            queryset = queryset.filter(assigned_to__branch__in=branches)
         return queryset
 
     def perform_create(self, serializer):
@@ -80,6 +89,10 @@ class PerformanceViewSet(viewsets.ModelViewSet):
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
             return queryset.filter(employee__user=user)
+        
+        branches = get_allowed_branches(user, "performance")
+        if "All" not in branches:
+            queryset = queryset.filter(employee__branch__in=branches)
         return queryset
 
     def perform_create(self, serializer):

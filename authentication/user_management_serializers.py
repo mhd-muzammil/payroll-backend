@@ -22,6 +22,8 @@ class UserManagementSerializer(serializers.ModelSerializer):
             "plain_password",
             "date_joined",
             "branch",
+            "assigned_branch",
+            "allowed_sections",
         )
         read_only_fields = ("date_joined", "is_staff")
 

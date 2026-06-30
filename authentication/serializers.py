@@ -11,6 +11,8 @@ class RoleTokenObtainPairSerializer(TokenObtainPairSerializer):
         token["first_name"] = user.first_name
         token["last_name"] = user.last_name
         token["username"] = user.username
+        token["allowed_sections"] = user.allowed_sections
+        token["assigned_branch"] = user.assigned_branch
         employee_profile = getattr(user, "employee_profile", None)
         token["employee_id"] = employee_profile.id if employee_profile else None
         return token
@@ -32,6 +34,8 @@ class UserSerializer(serializers.ModelSerializer):
             "is_active",
             "date_joined",
             "password",
+            "allowed_sections",
+            "assigned_branch",
         ]
         read_only_fields = ["date_joined"]
 

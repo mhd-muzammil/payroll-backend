@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from .models import Attendance, LeaveRequest
 from .serializer import AttendanceSerializer, LeaveRequestSerializer
 from employees.models import Employee
-from authentication.models import User
+from authentication.models import User, get_allowed_branches
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     # approximate radius of earth in km
@@ -778,6 +778,10 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         role = "superadmin" if user.is_superuser else user.role
         if role == "employee":
             queryset = queryset.filter(employee__user=user)
+        else:
+            branches = get_allowed_branches(user, "attendance")
+            if "All" not in branches:
+                queryset = queryset.filter(employee__branch__in=branches)
 
         # Optional, non-breaking filters on `intime`. When none are supplied the
         # full list is returned exactly as before. The frontend opts in to a
@@ -920,6 +924,9 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         role = "superadmin" if user.is_superuser else user.role
         if role == "employee":
             return queryset.filter(employee__user=user)
+        branches = get_allowed_branches(user, "leaves")
+        if "All" not in branches:
+            queryset = queryset.filter(employee__branch__in=branches)
         return queryset
 
     def perform_create(self, serializer):
@@ -934,7 +941,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
     def approve(self, request, pk=None):
         user = request.user
         role = "superadmin" if user.is_superuser else user.role
-        if role not in ["superadmin", "admin"]:
+        if role not in ["superadmin", "admin", "hr"]:
             return Response({"detail": "Permission denied."}, status=403)
         leave = self.get_object()
         leave.status = "Approved"
@@ -945,7 +952,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
     def reject(self, request, pk=None):
         user = request.user
         role = "superadmin" if user.is_superuser else user.role
-        if role not in ["superadmin", "admin"]:
+        if role not in ["superadmin", "admin", "hr"]:
             return Response({"detail": "Permission denied."}, status=403)
         leave = self.get_object()
         leave.status = "Rejected"
