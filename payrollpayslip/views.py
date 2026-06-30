@@ -1,3 +1,4 @@
+from django.db.models import Q
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -6,9 +7,9 @@ from django.utils import timezone
 from decimal import Decimal, ROUND_HALF_UP
 import calendar
 
-from .models import Payslip
-from .serializer import PayslipSerializer
-from employees.models import Employee
+from .models import Payslip, BranchFinancial
+from .serializer import PayslipSerializer, BranchFinancialSerializer
+from employees.models import Employee, Performance
 from attendance.models import Attendance
 
 class PayslipViewSet(viewsets.ModelViewSet):
@@ -124,7 +125,34 @@ class PayslipViewSet(viewsets.ModelViewSet):
             earned_conveyance = q(gross_conveyance * multiplier)
             earned_child_edu = q(gross_child_edu * multiplier)
             earned_personal = q(gross_personal * multiplier)
-            earned_incentive = q(gross_incentive * multiplier)
+            
+            # Dynamic incentive policy:
+            # 1. Perfect Attendance Bonus: ₹1000 if 0 LOP days
+            # 2. Performance Review Bonus: ₹2000 if rating >= 4.5, ₹1000 if rating >= 4.0
+            dynamic_incentive = Decimal('0.00')
+            if lop_days == 0:
+                dynamic_incentive += Decimal('1000.00')
+            
+            month_name = calendar.month_name[month]
+            period_format_1 = f"{month_name} {year}"
+            period_format_2 = f"{month}/{year}"
+            period_format_3 = f"{month:02d}/{year}"
+            
+            perf = Performance.objects.filter(
+                Q(review_period__iexact=period_format_1) | 
+                Q(review_period__iexact=period_format_2) |
+                Q(review_period__iexact=period_format_3),
+                employee=emp
+            ).first()
+            
+            if perf:
+                perf_score = perf.overall_score
+                if perf_score >= Decimal('4.50'):
+                    dynamic_incentive += Decimal('2000.00')
+                elif perf_score >= Decimal('4.00'):
+                    dynamic_incentive += Decimal('1000.00')
+            
+            earned_incentive = q(gross_incentive * multiplier) + dynamic_incentive
             earned_other_earnings = q(gross_other_earnings * multiplier)
             
             # Calculate Earned Gross Sum
@@ -427,3 +455,77 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 "avgPayout": fmt_dashboard(avg_salary_raw)
             }
         }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'])
+    def pl_summary(self, request):
+        """Calculates branch-wise revenue, payroll costs, operational costs and P&L results."""
+        now = timezone.now()
+        month = request.query_params.get('month', now.month)
+        year = request.query_params.get('year', now.year)
+
+        try:
+            month = int(month)
+            year = int(year)
+        except ValueError:
+            return Response({"error": "Invalid month or year."}, status=status.HTTP_400_BAD_REQUEST)
+
+        branches = ["Chennai", "Vellore", "Salem", "Kanchipuram", "Hosur"]
+        data = []
+
+        from django.db.models import Sum
+        
+        for br in branches:
+            # 1. Fetch financials
+            fin = BranchFinancial.objects.filter(branch=br, month=month, year=year).first()
+            revenue = fin.revenue if fin else Decimal('0.00')
+            other_expenses = fin.other_expenses if fin else Decimal('0.00')
+
+            # 2. Calculate payroll cost
+            branch_slips = Payslip.objects.filter(employee__branch=br, month=month, year=year)
+            sums = branch_slips.aggregate(
+                net=Sum('net_salary'),
+                epf=Sum('employer_epf'),
+                esi=Sum('employer_esi'),
+                ins=Sum('employer_insurance'),
+                petrol=Sum('petrol_allowance')
+            )
+            net_sum = sums['net'] or Decimal('0.00')
+            epf_sum = sums['epf'] or Decimal('0.00')
+            esi_sum = sums['esi'] or Decimal('0.00')
+            ins_sum = sums['ins'] or Decimal('0.00')
+            petrol_sum = sums['petrol'] or Decimal('0.00')
+
+            payroll_cost = net_sum + epf_sum + esi_sum + ins_sum + petrol_sum
+            total_expenses = payroll_cost + other_expenses
+            net_profit_loss = revenue - total_expenses
+            
+            margin = float((net_profit_loss / revenue) * 100) if revenue > Decimal('0.00') else 0.0
+
+            data.append({
+                "branch": br,
+                "revenue": float(revenue),
+                "other_expenses": float(other_expenses),
+                "payroll_cost": float(payroll_cost),
+                "total_expenses": float(total_expenses),
+                "net_profit_loss": float(net_profit_loss),
+                "margin": round(margin, 2),
+                "id": fin.id if fin else None
+            })
+
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class BranchFinancialViewSet(viewsets.ModelViewSet):
+    queryset = BranchFinancial.objects.all()
+    serializer_class = BranchFinancialSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        month = self.request.query_params.get("month")
+        year = self.request.query_params.get("year")
+        if month:
+            queryset = queryset.filter(month=month)
+        if year:
+            queryset = queryset.filter(year=year)
+        return queryset

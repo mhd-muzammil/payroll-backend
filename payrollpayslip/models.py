@@ -65,3 +65,27 @@ class Payslip(models.Model):
 
     def __str__(self):
         return f"Payslip - {self.employee.employee_name} ({self.month}/{self.year})"
+
+
+class BranchFinancial(models.Model):
+    BRANCH_CHOICES = (
+        ('Chennai', 'Chennai'),
+        ('Vellore', 'Vellore'),
+        ('Salem', 'Salem'),
+        ('Kanchipuram', 'Kanchipuram'),
+        ('Hosur', 'Hosur')
+    )
+    branch = models.CharField(max_length=100, choices=BRANCH_CHOICES)
+    month = models.IntegerField()
+    year = models.IntegerField()
+    revenue = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    other_expenses = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('branch', 'month', 'year')
+        ordering = ['-year', '-month', 'branch']
+
+    def __str__(self):
+        return f"{self.branch} Financials - {self.month}/{self.year}"
