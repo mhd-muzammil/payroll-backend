@@ -56,3 +56,49 @@ class Onboarding(models.Model):
 
     def __str__(self):
         return f"{self.employee_name} ({self.status})"
+
+
+class Candidate(models.Model):
+    SEGMENT_CHOICES = (
+        ('Combo', 'Combo'),
+        ('PC', 'PC'),
+        ('Print', 'Print'),
+        ('CCTV', 'CCTV'),
+        ('Networking', 'Networking'),
+    )
+    
+    ACTION_CHOICES = (
+        ('RNR', 'RNR'),
+        ('In Progress', 'In Progress'),
+        ('Offer Shared', 'Offer Shared'),
+        ('Waiting For Acceptance', 'Waiting For Acceptance'),
+        ('Waiting For Joining Date', 'Waiting For Joining Date'),
+        ('Salary Discussion', 'Salary Discussion'),
+        ('Rejected', 'Rejected'),
+        ('Decline', 'Decline'),
+    )
+
+    name = models.CharField(max_length=255)
+    phone_number = models.CharField(max_length=20)
+    qualification = models.CharField(max_length=100, blank=True, null=True)
+    permanent_address = models.CharField(max_length=255, blank=True, null=True)
+    present_address = models.CharField(max_length=255, blank=True, null=True)
+    years_of_experience = models.DecimalField(max_digits=4, decimal_places=1, default=0.0)
+    segment = models.CharField(max_length=50, choices=SEGMENT_CHOICES, default='Combo')
+    previous_company = models.CharField(max_length=255, blank=True, null=True)
+    last_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    expecting_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    remarks = models.TextField(blank=True, null=True)
+    action = models.CharField(max_length=50, choices=ACTION_CHOICES, default='In Progress')
+    
+    # Proof Uploads
+    salary_slip = models.FileField(upload_to='hiring/salary_slips/', blank=True, null=True)
+    offer_letter = models.FileField(upload_to='hiring/offer_letters/', blank=True, null=True)
+    bank_statement = models.FileField(upload_to='hiring/bank_statements/', blank=True, null=True)
+    resume = models.FileField(upload_to='hiring/resumes/', blank=True, null=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.name} - {self.segment} ({self.action})"

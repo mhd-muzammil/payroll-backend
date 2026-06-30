@@ -6,8 +6,8 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 
-from .models import Onboarding
-from .serializers import DOCUMENT_FIELDS, OnboardingSerializer
+from .models import Onboarding, Candidate
+from .serializers import DOCUMENT_FIELDS, OnboardingSerializer, CandidateSerializer
 
 class OnboardingViewSet(viewsets.ModelViewSet):
     queryset = Onboarding.objects.all().order_by('-created_at')
@@ -47,3 +47,9 @@ class OnboardingViewSet(viewsets.ModelViewSet):
         response["X-Content-Type-Options"] = "nosniff"
         response["Content-Security-Policy"] = "default-src 'none'; sandbox"
         return response
+
+
+class CandidateViewSet(viewsets.ModelViewSet):
+    queryset = Candidate.objects.all().order_by('-created_at')
+    serializer_class = CandidateSerializer
+    permission_classes = [IsAuthenticated]

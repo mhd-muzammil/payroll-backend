@@ -5,7 +5,7 @@ from django.conf import settings
 from django.urls import reverse
 from rest_framework import serializers
 
-from .models import Onboarding
+from .models import Onboarding, Candidate
 
 
 DOCUMENT_FIELDS = (
@@ -124,4 +124,15 @@ class OnboardingSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Onboarding
+        fields = '__all__'
+
+
+class CandidateSerializer(serializers.ModelSerializer):
+    salary_slip = serializers.FileField(required=False, allow_null=True, validators=[validate_employee_document])
+    offer_letter = serializers.FileField(required=False, allow_null=True, validators=[validate_employee_document])
+    bank_statement = serializers.FileField(required=False, allow_null=True, validators=[validate_employee_document])
+    resume = serializers.FileField(required=False, allow_null=True, validators=[validate_employee_document])
+
+    class Meta:
+        model = Candidate
         fields = '__all__'

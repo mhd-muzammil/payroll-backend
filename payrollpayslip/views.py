@@ -456,6 +456,122 @@ class PayslipViewSet(viewsets.ModelViewSet):
             }
         }, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=['post'])
+    def email_payslip(self, request, pk=None):
+        """Sends the payslip details as a formatted HTML email to the employee."""
+        from django.core.mail import EmailMultiAlternatives
+        from django.utils.html import strip_tags
+        
+        payslip = self.get_object()
+        emp = payslip.employee
+        
+        if not emp.email:
+            return Response({"error": "Employee does not have a registered email address."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        month_name = calendar.month_name[payslip.month]
+        period_str = f"{month_name} {payslip.year}"
+        
+        subject = f"Salary Payslip for {period_str} - Renderways Technology"
+        
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; color: #333333; line-height: 1.6; margin: 0; padding: 20px; background-color: #f3f4f6;">
+            <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-top: 6px solid #4f46e5;">
+                <div style="text-align: center; margin-bottom: 25px;">
+                    <h2 style="margin: 0; color: #4f46e5;">RENDERWAYS TECHNOLOGY</h2>
+                    <p style="margin: 5px 0 0 0; color: #6b7280; font-size: 14px; font-weight: bold; letter-spacing: 0.5px;">SALARY PAYSLIP ADVICE</p>
+                </div>
+                
+                <p>Dear <strong>{emp.employee_name}</strong>,</p>
+                <p>Your payslip for the month of <strong>{period_str}</strong> has been generated. Please find the details of your earnings and deductions below:</p>
+                
+                <table style="width: 100%; border-collapse: collapse; margin: 20px 0; border: 1px solid #e5e7eb;">
+                    <tr style="background-color: #f9fafb; font-weight: bold; border-bottom: 2px solid #e5e7eb;">
+                        <th style="padding: 10px; text-align: left; font-size: 13px;">Salary Detail Component</th>
+                        <th style="padding: 10px; text-align: right; font-size: 13px;">Amount (₹)</th>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Basic Salary</td>
+                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace;">{float(payslip.earned_basic):,.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">House Rent Allowance (HRA)</td>
+                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace;">{float(payslip.earned_hra):,.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Incentives & Performance Bonus</td>
+                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace;">{float(payslip.earned_incentive):,.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Conveyance / Other Allowances</td>
+                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace;">{float(payslip.earned_conveyance + payslip.earned_child_edu + payslip.earned_personal + payslip.earned_other_earnings):,.2f}</td>
+                    </tr>
+                    <tr style="background-color: #f9fafb; font-weight: bold;">
+                        <td style="padding: 10px; border-bottom: 2px solid #e5e7eb; color: #4f46e5;">Gross Earnings (A)</td>
+                        <td style="padding: 10px; text-align: right; border-bottom: 2px solid #e5e7eb; font-family: monospace; color: #4f46e5;">{float(payslip.gross_earnings):,.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; color: #dc2626;">Total Deductions (EPF, ESI, TDS) (B)</td>
+                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace; color: #dc2626;">{float(payslip.total_deductions):,.2f}</td>
+                    </tr>
+                    <tr style="background-color: #f0fdf4; font-weight: bold; border-top: 2px solid #bbf7d0;">
+                        <td style="padding: 12px; font-size: 15px; color: #166534;">NET TAKE HOME SALARY</td>
+                        <td style="padding: 12px; text-align: right; font-size: 16px; font-family: monospace; color: #166534;">₹{float(payslip.net_salary):,.2f}</td>
+                    </tr>
+                </table>
+                
+                <div style="background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px; border-radius: 4px; margin-top: 20px; font-size: 12px; color: #78350f;">
+                    <strong>Note:</strong> This is an automatically generated salary slip email notification advice. If you have any queries regarding your payout or deductions, please contact the HR department.
+                </div>
+                
+                <div style="margin-top: 30px; border-top: 1px solid #e5e7eb; padding-top: 15px; text-align: center; font-size: 12px; color: #9ca3af;">
+                    &copy; {payslip.year} Renderways Technology Pvt Ltd. All rights reserved.
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        text_content = strip_tags(html_content)
+        
+        try:
+            from django.conf import settings
+            from django.core.mail import get_connection
+            
+            # Use console backend if SMTP credentials are not filled out in .env
+            if not settings.EMAIL_HOST_USER or not settings.EMAIL_HOST_PASSWORD:
+                connection = get_connection(backend='django.core.mail.backends.console.EmailBackend')
+                from_email = 'payroll@renderways.com'
+            else:
+                connection = get_connection(
+                    backend='django.core.mail.backends.smtp.EmailBackend',
+                    host=settings.EMAIL_HOST,
+                    port=settings.EMAIL_PORT,
+                    username=settings.EMAIL_HOST_USER,
+                    password=settings.EMAIL_HOST_PASSWORD,
+                    use_tls=settings.EMAIL_USE_TLS,
+                    use_ssl=settings.EMAIL_USE_SSL,
+                )
+                from_email = settings.EMAIL_HOST_USER
+                
+            email = EmailMultiAlternatives(
+                subject=subject,
+                body=text_content,
+                from_email=from_email,
+                to=[emp.email],
+                connection=connection
+            )
+            email.attach_alternative(html_content, "text/html")
+            email.send()
+            
+            msg = f"Payslip successfully emailed to {emp.email}"
+            if not settings.EMAIL_HOST_USER or not settings.EMAIL_HOST_PASSWORD:
+                msg += " (Printed to backend console - SMTP credentials not set in .env)"
+                
+            return Response({"success": msg}, status=status.HTTP_200_OK)
+        except Exception as err:
+            return Response({"error": f"Failed to send email: {str(err)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @action(detail=False, methods=['get'])
     def pl_summary(self, request):
         """Calculates branch-wise revenue, payroll costs, operational costs and P&L results."""
