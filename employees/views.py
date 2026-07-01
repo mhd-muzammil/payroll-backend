@@ -49,7 +49,9 @@ class TaskViewSet(viewsets.ModelViewSet):
             return queryset.filter(Q(assigned_to__user=user) | Q(assigned_by=user))
         
         branches = get_allowed_branches(user, "tasks")
-        if "All" not in branches:
+        if "Own" in branches:
+            queryset = queryset.filter(Q(assigned_to__user=user) | Q(assigned_by=user))
+        elif "All" not in branches:
             queryset = queryset.filter(assigned_to__branch__in=branches)
         return queryset
 

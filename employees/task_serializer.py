@@ -21,6 +21,7 @@ class TaskSerializer(serializers.ModelSerializer):
             'employee_notes',
             'checklist',
             'activity_log',
+            'attachments',
             'created_at',
             'updated_at'
         ]
