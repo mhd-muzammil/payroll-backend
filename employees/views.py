@@ -2,10 +2,11 @@ from django.db.models import Q
 from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
-from .models import Employee, Task, Performance
+from .models import Employee, Task, Performance, Asset
 from .serializer import EmployeeSerializer, SimpleEmployeeSerializer
 from .task_serializer import TaskSerializer
 from .performance_serializer import PerformanceSerializer
+from .asset_serializer import AssetSerializer
 from authentication.models import get_allowed_branches
 
 class EmployeeViewSet(viewsets.ModelViewSet):
@@ -114,5 +115,44 @@ class PerformanceViewSet(viewsets.ModelViewSet):
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
             raise PermissionDenied("Employees cannot delete performance reviews.")
+        return super().destroy(request, *args, **kwargs)
+
+
+class AssetViewSet(viewsets.ModelViewSet):
+    queryset = Asset.objects.all()
+    serializer_class = AssetSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Asset.objects.all().order_by("-id")
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role == "employee":
+            return queryset.filter(assigned_to__user=user)
+        
+        branches = get_allowed_branches(user, "assets")
+        if "All" not in branches:
+            queryset = queryset.filter(assigned_to__branch__in=branches)
+        return queryset
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role == "employee":
+            raise PermissionDenied("Employees cannot create assets.")
+        serializer.save()
+
+    def update(self, request, *args, **kwargs):
+        user = self.request.user
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role == "employee":
+            raise PermissionDenied("Employees cannot edit assets.")
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        user = self.request.user
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role == "employee":
+            raise PermissionDenied("Employees cannot delete assets.")
         return super().destroy(request, *args, **kwargs)
 

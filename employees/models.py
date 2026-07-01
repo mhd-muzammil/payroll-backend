@@ -110,4 +110,26 @@ class Performance(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.employee.employee_name} - {self.review_period}"
+        return f"{self.employee.employee_name} - {self.review_period}"
+
+
+class Asset(models.Model):
+    STATUS_CHOICES = (
+        ('available', 'Available'),
+        ('assigned', 'Assigned'),
+        ('repair', 'Under Repair'),
+        ('retired', 'Retired'),
+    )
+    asset_name = models.CharField(max_length=255)
+    asset_type = models.CharField(max_length=100)
+    serial_number = models.CharField(max_length=255, null=True, blank=True)
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='available')
+    assigned_to = models.ForeignKey(Employee, on_delete=models.SET_NULL, null=True, blank=True, related_name='assets')
+    purchase_date = models.DateField(null=True, blank=True)
+    cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    notes = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.asset_name} ({self.serial_number or 'No Serial'})"

@@ -12,7 +12,8 @@ def default_sections():
         "payroll": ["All"],
         "payslips": ["All"],
         "leaves": ["All"],
-        "performance": ["All"]
+        "performance": ["All"],
+        "assets": ["All"]
     }
 
 
