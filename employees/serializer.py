@@ -15,7 +15,11 @@ class EmployeeSerializer(serializers.ModelSerializer):
         if not hasattr(self, '_onboarding_cache'):
             self._onboarding_cache = {}
         if obj.id not in self._onboarding_cache:
-            onboarding = Onboarding.objects.filter(employee_id=str(obj.id)).first()
+            onboarding = None
+            if obj.emp_code:
+                onboarding = Onboarding.objects.filter(employee_id=obj.emp_code).first()
+            if not onboarding:
+                onboarding = Onboarding.objects.filter(employee_id=str(obj.id)).first()
             if not onboarding and obj.email:
                 onboarding = Onboarding.objects.filter(email_id=obj.email).first()
             if not onboarding:
