@@ -1,3 +1,4 @@
+import logging
 import math
 import openpyxl
 import re
@@ -14,6 +15,8 @@ from .models import Attendance, LeaveRequest
 from .serializer import AttendanceSerializer, LeaveRequestSerializer
 from employees.models import Employee
 from authentication.models import User, get_allowed_branches
+
+logger = logging.getLogger(__name__)
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     # approximate radius of earth in km
@@ -217,7 +220,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             # Importing them would invent bogus employees, so skip any sheet whose
             # title doesn't map to a known branch.
             if sheet_branch is None:
-                print(f"--- Excel Import: Skipping non-branch sheet '{sheet.title}' ---")
+                logger.info("Excel import: skipping non-branch sheet '%s'", sheet.title)
                 continue
 
             # Efficiently read rows up to 100 consecutive completely empty rows
@@ -338,7 +341,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         break
 
             if not header_row_idx or not emp_name_col_idx or not emp_code_col_idx:
-                print(f"--- Excel Import: Could not identify header row in sheet '{sheet.title}', skipping ---")
+                logger.warning("Excel import: could not identify header row in sheet '%s', skipping", sheet.title)
                 continue
 
             # Find type/status column index
@@ -383,7 +386,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     date_cols[c] = parsed_date
 
             if not date_cols:
-                print(f"--- Excel Import: No valid date columns found in sheet '{sheet.title}', skipping ---")
+                logger.warning("Excel import: no valid date columns found in sheet '%s', skipping", sheet.title)
                 continue
 
             if dates_on_below_row > dates_on_header_row:
@@ -471,19 +474,55 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         corrections += 1
 
                 if corrections:
-                    print(f"--- Excel Import: '{sheet.title}': corrected {corrections} date column(s) via "
-                          f"weekday labels ({date_cols[ordered_cols[0]]} .. {date_cols[ordered_cols[-1]]}) ---")
+                    logger.info("Excel import '%s': corrected %d date column(s) via weekday labels (%s .. %s)",
+                                sheet.title, corrections, date_cols[ordered_cols[0]], date_cols[ordered_cols[-1]])
+
+            # (c) Final contiguity pass. The date columns sit left-to-right in
+            # calendar order, one per day, so each should be exactly one day
+            # after the previous. A stale "next cycle" block left stamped with
+            # last year's dates (whose weekday coincidentally matches, so the
+            # weekday snap above leaves it alone) shows up here as a backward
+            # jump or a multi-day gap. Rebuild any such column from the running
+            # sequence (previous day + 1) so the whole row is one continuous
+            # range and can't leak junk records into a different month/year.
+            ordered_cols = sorted(date_cols.keys())
+            if len(ordered_cols) >= 2:
+                contiguity_fixes = 0
+                prev_date = None
+                for c in ordered_cols:
+                    d = date_cols[c]
+                    if prev_date is not None:
+                        delta = (d - prev_date).days
+                        if delta < 1 or delta > 2:
+                            d = prev_date + timedelta(days=1)
+                            date_cols[c] = d
+                            contiguity_fixes += 1
+                    prev_date = date_cols[c]
+                if contiguity_fixes:
+                    logger.info("Excel import '%s': rebuilt %d non-contiguous date column(s) (%s .. %s)",
+                                sheet.title, contiguity_fixes, date_cols[ordered_cols[0]], date_cols[ordered_cols[-1]])
 
             # Parse employee rows
             current_emp_code = None
             current_emp_name = None
+            current_emp_hidden = False
 
             for r in range(start_data_row, num_rows + 1):
                 emp_code_val = sheet_values[r-1][emp_code_col_idx - 1]
                 emp_name_val = sheet_values[r-1][emp_name_col_idx - 1]
                 branch_val = sheet_values[r-1][branch_col_idx - 1] if branch_col_idx else None
 
-                if emp_code_val is not None or emp_name_val is not None:
+                row_has_identity = emp_code_val is not None or emp_name_val is not None
+                if row_has_identity:
+                    # A new employee block starts on the row carrying the name/code
+                    # (the "In Time" row). HR marks people who have LEFT by HIDING
+                    # their rows in Excel — they're invisible in the sheet but still
+                    # physically present, and openpyxl reads them. Skip a hidden
+                    # block entirely so ex-employees are never imported. The flag
+                    # persists across the block's other rows (Out/Actual/Present),
+                    # which don't re-trigger this detection.
+                    current_emp_hidden = bool(sheet.row_dimensions[r].hidden)
+
                     current_emp_code = str(emp_code_val).strip() if emp_code_val is not None else None
                     if current_emp_code and current_emp_code.endswith(".0"):
                         current_emp_code = current_emp_code[:-2]
@@ -492,17 +531,31 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                     # Look up an existing employee's name when a row carries only a
                     # code. Match on the emp_code field within this sheet's branch
                     # (NOT on Employee.id — the code is not the primary key).
-                    if not current_emp_name and current_emp_code:
+                    if not current_emp_hidden and not current_emp_name and current_emp_code:
                         emp_obj = Employee.objects.filter(
                             emp_code=str(current_emp_code), branch=sheet_branch
                         ).first()
                         if emp_obj:
                             current_emp_name = emp_obj.employee_name
 
-                if not current_emp_name:
+                if current_emp_hidden or not current_emp_name:
                     continue
 
                 row_type = normalize_val(sheet_values[r-1][type_col_idx - 1])
+
+                # These sheets pre-print the 4-row type template (In/Out/Actual/
+                # Present) far below the last real employee, as empty slots for
+                # future hires. Every real employee block STARTS on an "In Time"
+                # row that carries the name/code; an "In Time" row with no identity
+                # of its own is therefore one of those blank template rows. Without
+                # this guard those trailing rows stay attributed to the LAST real
+                # employee and overwrite their captured punches with blanks — which
+                # is exactly why the last person per sheet (e.g. Agalia in Vellore)
+                # came out all-Absent. Detach from the previous employee here.
+                if "in time" in row_type and not row_has_identity:
+                    current_emp_name = None
+                    continue
+
                 if not row_type:
                     continue
 
@@ -523,11 +576,17 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 if not branch_norm:
                     branch_norm = sheet_branch
 
-                # Key by (branch, code) — codes are per-sheet row numbers, NOT
-                # globally unique, so "1" is a different person in every branch.
-                # Fall back to (branch, name) when a row has no code.
-                emp_key = (branch_norm, current_emp_code) if current_emp_code \
-                    else (branch_norm, current_emp_name.lower())
+                # Identity key: (branch, NAME). The emp_code column in these
+                # sheets is NOT unique — different people reuse the same code
+                # (e.g. in Chennai both THAMARAIKKANNAN and SRI RAM N M are "2",
+                # AKAASH and CHEZHIYEAN both "8"). Keying on code therefore MERGES
+                # two distinct people into one row and cross-assigns their
+                # attendance. Names ARE distinct within a branch, so the name is
+                # the reliable identity; the code is retained only as metadata.
+                # (current_emp_name is guaranteed non-empty here — rows without a
+                # resolvable name are skipped above.)
+                name_key = " ".join(current_emp_name.split()).lower()
+                emp_key = (branch_norm, name_key)
                 if emp_key not in employee_data:
                     employee_data[emp_key] = {
                         "code": current_emp_code,
@@ -544,15 +603,20 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         dates_dict[date_obj] = {"in": None, "out": None, "present": 0.0}
 
                     cell_val = sheet_values[r-1][c - 1]
+                    # Never let a blank cell erase a value already captured for
+                    # this date (defends against duplicate/stray rows for a person).
                     if "in time" in row_type:
-                        dates_dict[date_obj]["in"] = cell_val
+                        if cell_val is not None:
+                            dates_dict[date_obj]["in"] = cell_val
                     elif "out time" in row_type:
-                        dates_dict[date_obj]["out"] = cell_val
+                        if cell_val is not None:
+                            dates_dict[date_obj]["out"] = cell_val
                     elif "present" in row_type:
-                        try:
-                            dates_dict[date_obj]["present"] = float(cell_val) if cell_val is not None else 0.0
-                        except ValueError:
-                            dates_dict[date_obj]["present"] = 0.0
+                        if cell_val is not None:
+                            try:
+                                dates_dict[date_obj]["present"] = float(cell_val)
+                            except ValueError:
+                                dates_dict[date_obj]["present"] = 0.0
 
         # 6. Database Transaction for bulk creation/updates
         employees_created = 0
@@ -562,13 +626,15 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             with transaction.atomic():
                 # Pre-fetch employees and user information to avoid repeated queries
                 all_employees = list(Employee.objects.all().select_related("user"))
-                # Branch-scoped lookups: the sheet's identity is (branch, code) with
-                # a (branch, name) fallback. NEVER match the per-sheet code against
-                # Employee.id — those codes are not the DB primary keys.
-                emp_by_branch_name = {(e.branch.lower().strip(), e.employee_name.lower().strip()): e
+                # Branch-scoped lookup. Identity is (branch, NAME): names are
+                # distinct within a branch while emp_code is not (people reuse
+                # codes), so the name is authoritative. Names are normalized by
+                # collapsing internal whitespace + lowercasing so " SRI  RAM "
+                # matches "SRI RAM".
+                def norm_name(s):
+                    return " ".join(str(s or "").split()).lower()
+                emp_by_branch_name = {(e.branch.lower().strip(), norm_name(e.employee_name)): e
                                       for e in all_employees}
-                emp_by_branch_code = {(e.branch.lower().strip(), str(e.emp_code)): e
-                                      for e in all_employees if e.emp_code}
 
                 # Pre-fetch existing usernames to check uniqueness locally
                 existing_usernames = set(User.objects.values_list("username", flat=True))
@@ -600,6 +666,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
                 records_to_create = []
                 records_to_update = []
+                # Records created THIS run, keyed by (employee_id, date). Prevents
+                # duplicate rows when two sheet identities resolve to one employee
+                # in the same import (attendance_map only holds pre-existing rows,
+                # so without this a second identity wouldn't see the first's
+                # just-created row and would insert a duplicate for that date).
+                pending_map = {}
+                updated_ids = set()
 
                 for emp_key, emp_info in employee_data.items():
                     code = emp_info["code"]
@@ -609,16 +682,18 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
                     employee = None
                     bkey = branch_val.lower().strip()
-                    # 1) (branch, emp_code) — durable identity once first imported.
-                    if code:
-                        employee = emp_by_branch_code.get((bkey, str(code)))
-                    # 2) (branch, name) — first import, or rows that have no code.
-                    #    Matching is ALWAYS scoped to the branch: the same name can
-                    #    belong to different people in different branches (e.g.
-                    #    "PERUMAL" exists in both Salem and Kanchipuram), so a global
-                    #    name match would wrongly merge them.
-                    if not employee and name:
-                        employee = emp_by_branch_name.get((bkey, name.lower().strip()))
+                    # Match ONLY by (branch, NAME) — the authoritative identity,
+                    # scoped to the branch so the same name in two branches
+                    # (e.g. "PERUMAL" in both Salem and Kanchipuram) stays two
+                    # people. emp_code is deliberately NOT used for matching:
+                    # codes collide across people (a visible new joiner reuses a
+                    # departed employee's code), so any code-based match
+                    # cross-assigns one person's attendance to another
+                    # (e.g. Vijayanand's punches landing on SRINI). An unmatched
+                    # name creates a fresh employee below rather than borrowing a
+                    # colliding code.
+                    if name:
+                        employee = emp_by_branch_name.get((bkey, norm_name(name)))
 
                     if not employee:
                         # 1. Create User account first
@@ -658,10 +733,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         }
                         employee = Employee.objects.create(**create_kwargs)
                         emp_by_branch_name[(employee.branch.lower().strip(),
-                                            employee.employee_name.lower().strip())] = employee
-                        if employee.emp_code:
-                            emp_by_branch_code[(employee.branch.lower().strip(),
-                                                str(employee.emp_code))] = employee
+                                            norm_name(employee.employee_name))] = employee
                         employees_created += 1
                     else:
                         # Update branch if specified in Excel and differs from employee's current branch
@@ -669,12 +741,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             employee.branch = emp_info["branch"]
                             employee.save(update_fields=["branch"])
 
-                        # Backfill the per-branch code on an employee matched by name,
-                        # so subsequent imports match it by (branch, code) directly.
+                        # Store the sheet's code as reference metadata on a
+                        # name-matched employee (NOT used for matching — codes
+                        # collide across people).
                         if code and not employee.emp_code:
                             employee.emp_code = str(code)
                             employee.save(update_fields=["emp_code"])
-                            emp_by_branch_code[(employee.branch.lower().strip(), str(code))] = employee
 
                         # If employee exists but doesn't have a linked user account, create and link one
                         if not employee.user:
@@ -712,13 +784,28 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         in_time = parse_excel_time(in_val)
                         out_time = parse_excel_time(out_val)
 
-                        if in_time is not None or present_val > 0.0:
+                        # Sunday is the weekly off. Classification order:
+                        #  1. A real biometric punch (in_time) always wins -> Present,
+                        #     even on a Sunday (someone who actually worked the off-day).
+                        #  2. No punch on a Sunday -> Leave (weekly off), regardless of
+                        #     any payroll "present day" flag.
+                        #  3. No punch on a weekday but flagged present in payroll ->
+                        #     Present (paid, placeholder 9:00 in-time, no out).
+                        #  4. Otherwise -> Absent.
+                        is_sunday = date_obj.weekday() == 6
+
+                        if in_time is not None:
                             status = "Present"
-                            in_time_actual = in_time or time(9, 0)
-                            out_time_actual = out_time or time(18, 0)
-                            
-                            in_datetime = make_aware(datetime.combine(date_obj, in_time_actual))
-                            out_datetime = make_aware(datetime.combine(date_obj, out_time_actual)) if out_time else None
+                            in_datetime = make_aware(datetime.combine(date_obj, in_time))
+                            out_datetime = make_aware(datetime.combine(date_obj, out_time)) if out_time else None
+                        elif is_sunday:
+                            status = "Leave"
+                            in_datetime = make_aware(datetime.combine(date_obj, time.min))
+                            out_datetime = None
+                        elif present_val > 0.0:
+                            status = "Present"
+                            in_datetime = make_aware(datetime.combine(date_obj, time(9, 0)))
+                            out_datetime = None
                         else:
                             status = "Absent"
                             in_datetime = make_aware(datetime.combine(date_obj, time.min))
@@ -735,13 +822,20 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                             "status": status
                         }
 
-                        existing = attendance_map.get((employee.id, date_obj))
+                        key = (employee.id, date_obj)
+                        existing = attendance_map.get(key) or pending_map.get(key)
                         if existing:
                             for k, v in attendance_fields.items():
                                 setattr(existing, k, v)
-                            records_to_update.append(existing)
+                            # Only queue DB rows for update; a pending create object
+                            # is mutated in place and stays in records_to_create.
+                            if existing.pk and id(existing) not in updated_ids:
+                                records_to_update.append(existing)
+                                updated_ids.add(id(existing))
                         else:
-                            records_to_create.append(Attendance(**attendance_fields))
+                            obj = Attendance(**attendance_fields)
+                            records_to_create.append(obj)
+                            pending_map[key] = obj
                         records_saved += 1
 
                 # Execute bulk operations
