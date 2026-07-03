@@ -23,22 +23,31 @@ class PayslipViewSet(viewsets.ModelViewSet):
         queryset = Payslip.objects.all().order_by("-year", "-month", "-id")
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
-            return queryset.filter(employee__user=user)
+            queryset = queryset.filter(employee__user=user)
+        else:
+            branches = get_allowed_branches(user, "payslips")
+            if "All" not in branches:
+                queryset = queryset.filter(employee__branch__in=branches)
         
-        branches = get_allowed_branches(user, "payslips")
-        if "All" not in branches:
-            queryset = queryset.filter(employee__branch__in=branches)
+        month = self.request.query_params.get('month')
+        year = self.request.query_params.get('year')
+        if month:
+            queryset = queryset.filter(month=month)
+        if year:
+            queryset = queryset.filter(year=year)
+            
         return queryset
 
     @action(detail=False, methods=['post'])
     def generate_all(self, request):
         """
-        Bulk generates/calculates detailed payslips based on pro-rated Indian salary structures
-        as provided by user guidelines.
+        Generates/calculates detailed payslips based on pro-rated Indian salary structures.
+        Supports bulk generation or single employee generation when employee_id is specified.
         """
         now = timezone.now()
         month = request.data.get('month', now.month)
         year = request.data.get('year', now.year)
+        employee_id = request.data.get('employee_id')
 
         try:
             month = int(month)
@@ -69,10 +78,22 @@ class PayslipViewSet(viewsets.ModelViewSet):
         start_datetime = make_aware(datetime.datetime.combine(start_date, datetime.time.min))
         end_datetime = make_aware(datetime.datetime.combine(end_date, datetime.time.max))
         
-        active_employees = Employee.objects.filter(status='active')
+        if employee_id:
+            try:
+                active_employees = Employee.objects.filter(id=int(employee_id))
+                if not active_employees.exists():
+                    return Response({"error": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+            except ValueError:
+                return Response({"error": "Invalid employee ID format."}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            active_employees = Employee.objects.filter(status='active')
+            
         branches = get_allowed_branches(request.user, "payroll")
         if "All" not in branches:
             active_employees = active_employees.filter(branch__in=branches)
+            if employee_id and not active_employees.exists():
+                return Response({"error": "You do not have permission to run payroll for this employee's branch."}, status=status.HTTP_403_FORBIDDEN)
+                
         created_count = 0
         updated_count = 0
 
@@ -259,8 +280,11 @@ class PayslipViewSet(viewsets.ModelViewSet):
             else:
                 updated_count += 1
 
+        emp_name = active_employees.first().employee_name if (employee_id and active_employees.exists()) else None
+        msg_detail = f"Processed slip for {emp_name} for {month}/{year}." if emp_name else f"Processed slips for {month}/{year} with pro-rated structural logic."
+
         return Response({
-            "message": f"Processed slips for {month}/{year} with pro-rated structural logic.",
+            "message": msg_detail,
             "created": created_count,
             "updated": updated_count
         }, status=status.HTTP_200_OK)
