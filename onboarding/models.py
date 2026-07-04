@@ -102,3 +102,76 @@ class Candidate(models.Model):
 
     def __str__(self):
         return f"{self.name} - {self.segment} ({self.action})"
+
+
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+@receiver(post_save, sender=Onboarding)
+def sync_onboarding_to_employee(sender, instance, created, **kwargs):
+    """Automatically connects or creates corresponding Employee record upon Onboarding save."""
+    from employees.models import Employee
+    from decimal import Decimal
+    from django.db import IntegrityError
+
+    valid_branches = ['Chennai', 'Vellore', 'Salem', 'Kanchipuram', 'Hosur']
+    branch_name = 'Chennai'
+    if instance.work_location:
+        loc = instance.work_location.strip()
+        matched = next((b for b in valid_branches if b.lower() == loc.lower()), None)
+        if matched:
+            branch_name = matched
+
+    # Try to find existing employee by email, emp_code, phone, or name
+    emp = None
+    if instance.email_id and instance.email_id.strip():
+        emp = Employee.objects.filter(email__iexact=instance.email_id.strip()).first()
+    if not emp and instance.employee_id and instance.employee_id.strip():
+        emp = Employee.objects.filter(emp_code=instance.employee_id.strip()).first()
+    if not emp and instance.mobile_number and instance.mobile_number.strip():
+        emp = Employee.objects.filter(phone=instance.mobile_number.strip()).first()
+    if not emp and instance.employee_name and instance.employee_name.strip():
+        emp = Employee.objects.filter(employee_name__iexact=instance.employee_name.strip()).first()
+
+    if emp:
+        # Connect & update existing Employee
+        emp.employee_name = instance.employee_name or emp.employee_name
+        if instance.employee_id and instance.employee_id.strip():
+            emp.emp_code = instance.employee_id.strip()
+        if instance.email_id and instance.email_id.strip():
+            emp.email = instance.email_id.strip()
+        if instance.mobile_number and instance.mobile_number.strip():
+            emp.phone = instance.mobile_number.strip()
+        if instance.department and instance.department.strip():
+            emp.department = instance.department.strip()
+        if instance.designation and instance.designation.strip():
+            emp.role = instance.designation.strip()
+        if branch_name:
+            emp.branch = branch_name
+        emp.status = 'active'
+        try:
+            emp.save()
+        except IntegrityError:
+            pass
+    else:
+        # Create new Employee
+        try:
+            Employee.objects.create(
+                employee_name=instance.employee_name.strip() if instance.employee_name else "New Employee",
+                emp_code=instance.employee_id.strip() if instance.employee_id else None,
+                email=instance.email_id.strip() if instance.email_id else None,
+                phone=instance.mobile_number.strip() if instance.mobile_number else None,
+                department=instance.department.strip() if instance.department else 'General',
+                role=instance.designation.strip() if instance.designation else 'Staff',
+                branch=branch_name,
+                salary=Decimal('0.00'),
+                status='active'
+            )
+        except IntegrityError:
+            existing = Employee.objects.filter(employee_name__iexact=instance.employee_name.strip()).first()
+            if existing:
+                existing.status = 'active'
+                try:
+                    existing.save()
+                except Exception:
+                    pass

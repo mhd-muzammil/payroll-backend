@@ -380,6 +380,7 @@ class PayslipViewSet(viewsets.ModelViewSet):
             "totalDeductionsRaw": float(total_deductions),
             "totalDeductionsFmt": f"₹{int(total_deductions):,}",
             "slipsCount": slips_count,
+            "notGeneratedCount": max(0, total_active_employees - slips_count),
             "paidCount": paid_count,
             "paidAmountRaw": float(paid_amount),
             "paidAmountFmt": f"₹{int(paid_amount):,}",
