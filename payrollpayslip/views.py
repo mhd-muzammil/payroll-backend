@@ -143,49 +143,40 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 gross_personal = gross_salary - gross_basic - gross_hra - gross_conveyance - gross_child_edu
                 if gross_personal < 0:
                     gross_personal = Decimal(0)
-                gross_incentive = Decimal('0.00')
-                gross_other_earnings = Decimal('0.00')
+                gross_incentive = emp.incentive
+                gross_other_earnings = emp.other_earnings
                 # Re-adjust gross total
-                gross_salary = gross_basic + gross_hra + gross_conveyance + gross_child_edu + gross_personal
+                gross_salary = gross_basic + gross_hra + gross_conveyance + gross_child_edu + gross_personal + gross_incentive + gross_other_earnings
 
-            # 4. Earned Components (Pro-rated based on paid_days / total_days)
-            earned_basic = q(gross_basic * multiplier)
-            earned_hra = q(gross_hra * multiplier)
-            earned_conveyance = q(gross_conveyance * multiplier)
-            earned_child_edu = q(gross_child_edu * multiplier)
-            earned_personal = q(gross_personal * multiplier)
-            
-            # Dynamic incentive policy:
-            # 1. Perfect Attendance Bonus: ₹1000 if 0 LOP days
-            # 2. Performance Review Bonus: ₹2000 if rating >= 4.5, ₹1000 if rating >= 4.0
-            dynamic_incentive = Decimal('0.00')
-            if lop_days == 0:
-                dynamic_incentive += Decimal('1000.00')
-            
-            month_name = calendar.month_name[month]
-            period_format_1 = f"{month_name} {year}"
-            period_format_2 = f"{month}/{year}"
-            period_format_3 = f"{month:02d}/{year}"
-            
-            perf = Performance.objects.filter(
-                Q(review_period__iexact=period_format_1) | 
-                Q(review_period__iexact=period_format_2) |
-                Q(review_period__iexact=period_format_3),
-                employee=emp
-            ).first()
-            
-            if perf:
-                perf_score = perf.overall_score
-                if perf_score >= Decimal('4.50'):
-                    dynamic_incentive += Decimal('2000.00')
-                elif perf_score >= Decimal('4.00'):
-                    dynamic_incentive += Decimal('1000.00')
-            
-            earned_incentive = q(gross_incentive * multiplier) + dynamic_incentive
-            earned_other_earnings = q(gross_other_earnings * multiplier)
-            
-            # Calculate Earned Gross Sum
-            gross_earnings = earned_basic + earned_hra + earned_conveyance + earned_child_edu + earned_personal + earned_incentive + earned_other_earnings
+            # 4. Earned Components (Pro-rated based on LOP deduction from Gross Salary)
+            if paid_days == 0:
+                earned_basic = Decimal('0.00')
+                earned_hra = Decimal('0.00')
+                earned_conveyance = Decimal('0.00')
+                earned_child_edu = Decimal('0.00')
+                earned_personal = Decimal('0.00')
+                earned_incentive = Decimal('0.00')
+                earned_other_earnings = Decimal('0.00')
+                gross_earnings = Decimal('0.00')
+            else:
+                one_day_salary = q(gross_salary / Decimal(total_days))
+                lop_deduction = q(one_day_salary * lop_days)
+                if lop_deduction > gross_salary:
+                    lop_deduction = gross_salary
+                gross_earnings = gross_salary - lop_deduction
+
+                # Pro-rate individual components
+                earned_basic = q(gross_basic * multiplier)
+                earned_hra = q(gross_hra * multiplier)
+                earned_conveyance = q(gross_conveyance * multiplier)
+                earned_child_edu = q(gross_child_edu * multiplier)
+                earned_incentive = q(gross_incentive * multiplier)
+                earned_other_earnings = q(gross_other_earnings * multiplier)
+
+                # Balance personal allowance to absorb rounding differences
+                earned_personal = gross_earnings - (earned_basic + earned_hra + earned_conveyance + earned_child_edu + earned_incentive + earned_other_earnings)
+                if earned_personal < Decimal('0.00'):
+                    earned_personal = Decimal('0.00')
 
             # 5. Deductions Components
             if emp.basic > Decimal('0.00'):
@@ -320,24 +311,54 @@ class PayslipViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def company_stats(self, request):
-        """Calculates high-level corporate KPIs based on true computed data."""
-        branch = request.query_params.get('branch')
-        qs = Payslip.objects.all()
-        if branch:
-            qs = qs.filter(employee__branch=branch)
-
-        from django.db.models import Sum
+        """Calculates detailed monthly payroll metrics per selected month, year, and branch."""
+        from django.db.models import Sum, Count
         from django.utils import timezone
+
         now = timezone.now()
-        
-        this_month_slips = qs.filter(month=now.month, year=now.year)
-        total_this_month = this_month_slips.aggregate(s=Sum('net_salary'))['s'] or 0
-        
-        ytd_slips = qs.filter(year=now.year)
-        total_ytd = ytd_slips.aggregate(s=Sum('net_salary'))['s'] or 0
-        
-        processed_pct = "100%" if total_this_month > 0 else "0%"
-        
+        month = request.query_params.get('month', now.month)
+        year = request.query_params.get('year', now.year)
+        branch = request.query_params.get('branch')
+
+        try:
+            month = int(month)
+            year = int(year)
+        except (ValueError, TypeError):
+            month = now.month
+            year = now.year
+
+        # Active employees in scope
+        emp_qs = Employee.objects.filter(status='active')
+        if branch:
+            emp_qs = emp_qs.filter(branch__iexact=branch)
+
+        total_active_employees = emp_qs.count()
+        total_base_salary = emp_qs.aggregate(s=Sum('salary'))['s'] or Decimal('0.00')
+
+        # Payslips in scope for selected month and year
+        slip_qs = Payslip.objects.filter(month=month, year=year)
+        if branch:
+            slip_qs = slip_qs.filter(employee__branch__iexact=branch)
+
+        slips_count = slip_qs.count()
+        total_generated_gross = slip_qs.aggregate(s=Sum('gross_earnings'))['s'] or Decimal('0.00')
+        total_generated_net = slip_qs.aggregate(s=Sum('net_salary'))['s'] or Decimal('0.00')
+        total_deductions = slip_qs.aggregate(s=Sum('gross_deductions'))['s'] or Decimal('0.00')
+
+        paid_slips = slip_qs.filter(status='Paid')
+        paid_count = paid_slips.count()
+        paid_amount = paid_slips.aggregate(s=Sum('net_salary'))['s'] or Decimal('0.00')
+
+        unpaid_slips = slip_qs.exclude(status='Paid')
+        unpaid_count = unpaid_slips.count()
+        unpaid_amount = unpaid_slips.aggregate(s=Sum('net_salary'))['s'] or Decimal('0.00')
+
+        # Cumulative YTD net for the selected year
+        ytd_slips = Payslip.objects.filter(year=year)
+        if branch:
+            ytd_slips = ytd_slips.filter(employee__branch__iexact=branch)
+        ytd_total_net = ytd_slips.aggregate(s=Sum('net_salary'))['s'] or Decimal('0.00')
+
         def fmt(val):
             fval = float(val)
             if fval >= 100000:
@@ -345,12 +366,32 @@ class PayslipViewSet(viewsets.ModelViewSet):
             if fval >= 1000:
                 return f"₹{(fval/1000.0):.1f}K"
             return f"₹{int(fval):,}"
-            
+
         return Response({
-            "thisMonth": fmt(total_this_month),
-            "ytdTotal": fmt(total_ytd),
-            "pending": "₹0",
-            "processed": processed_pct
+            "month": month,
+            "year": year,
+            "totalActiveEmployees": total_active_employees,
+            "totalBaseSalaryRaw": float(total_base_salary),
+            "totalBaseSalaryFmt": f"₹{int(total_base_salary):,}",
+            "generatedGrossRaw": float(total_generated_gross),
+            "generatedGrossFmt": f"₹{int(total_generated_gross):,}",
+            "generatedNetRaw": float(total_generated_net),
+            "generatedNetFmt": f"₹{int(total_generated_net):,}",
+            "totalDeductionsRaw": float(total_deductions),
+            "totalDeductionsFmt": f"₹{int(total_deductions):,}",
+            "slipsCount": slips_count,
+            "paidCount": paid_count,
+            "paidAmountRaw": float(paid_amount),
+            "paidAmountFmt": f"₹{int(paid_amount):,}",
+            "unpaidCount": unpaid_count,
+            "unpaidAmountRaw": float(unpaid_amount),
+            "unpaidAmountFmt": f"₹{int(unpaid_amount):,}",
+            "ytdTotalRaw": float(ytd_total_net),
+            "ytdTotalFmt": fmt(ytd_total_net),
+            "thisMonth": fmt(total_generated_net),
+            "ytdTotal": fmt(ytd_total_net),
+            "pending": f"₹{int(unpaid_amount):,}",
+            "processed": f"{round((slips_count / total_active_employees)*100)}%" if total_active_employees > 0 else "0%"
         }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'])
