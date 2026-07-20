@@ -12,10 +12,11 @@ class Payslip(models.Model):
     month = models.IntegerField()
     year = models.IntegerField()
     
-    # Days Tracking
+    # Days Tracking (2 decimal places so partial days like 5.05 are preserved)
     total_days = models.IntegerField(default=30)
-    lop_days = models.DecimalField(max_digits=4, decimal_places=1, default=0.0)
-    paid_days = models.DecimalField(max_digits=4, decimal_places=1, default=30.0)
+    lop_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
+    off_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
+    paid_days = models.DecimalField(max_digits=5, decimal_places=2, default=30.0)
     
     # Gross Salary Components (Defined in Structure)
     gross_basic = models.DecimalField(max_digits=10, decimal_places=2, default=0)

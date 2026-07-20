@@ -13,6 +13,193 @@ from employees.models import Employee, Performance
 from attendance.models import Attendance
 from authentication.models import get_allowed_branches
 
+def _q(val):
+    """Round a Decimal value to two decimal places (bankers-safe half-up)."""
+    return Decimal(val).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+
+def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=None, off_days=0):
+    """Compute every earnings/deduction/net field for one employee given the
+    period length, LOP (loss-of-pay) days and paid off-days.
+
+    This is the single source of truth for payslip math. Both bulk generation
+    (which derives lop_days from attendance) and manual recalculation (which
+    takes operator-supplied values) call this, so a manually edited slip is
+    always computed with exactly the same rules as an auto-generated one.
+
+    `off_days` are paid non-working days (weekly offs / holidays). They offset
+    LOP so they are NOT deducted: effective unpaid days = max(0, lop - off).
+    `other_deduction_override`, when not None, replaces the "Other Deduction"
+    line with an operator-supplied amount (the rest of the math is unchanged).
+
+    Returns the `defaults` dict used by update_or_create (minus `status`).
+    """
+    total_days = Decimal(total_days)
+    lop_days = Decimal(lop_days)
+    off_days = Decimal(off_days)
+    if lop_days < 0:
+        lop_days = Decimal(0)
+    if lop_days > total_days:
+        lop_days = total_days
+    if off_days < 0:
+        off_days = Decimal(0)
+    if off_days > lop_days:
+        off_days = lop_days
+
+    # Off days are paid, so they cancel out an equal number of LOP days.
+    effective_lop = lop_days - off_days
+    if effective_lop < 0:
+        effective_lop = Decimal(0)
+
+    paid_days = total_days - effective_lop
+    if paid_days < 0:
+        paid_days = Decimal(0)
+
+    # Pro-rata ratio
+    multiplier = paid_days / total_days if total_days > 0 else Decimal(0)
+
+    q = _q
+
+    # 3. Gross Structure (Base Fixed Monthly Salary)
+    if emp.basic > Decimal('0.00'):
+        gross_basic = emp.basic
+        gross_hra = emp.hra
+        gross_conveyance = emp.conveyance
+        gross_child_edu = emp.child_edu
+        gross_personal = emp.personal_allowance
+        gross_incentive = emp.incentive
+        gross_other_earnings = emp.other_earnings
+        gross_salary = emp.salary
+    else:
+        # Legacy/Fallback calculation
+        gross_salary = emp.salary
+        gross_basic = q(gross_salary * Decimal('0.50'))  # 50% Basic
+        gross_hra = q(gross_salary * Decimal('0.25'))    # 25% HRA
+        gross_conveyance = Decimal('1600.00')
+        gross_child_edu = Decimal('200.00')
+
+        if (gross_basic + gross_hra + gross_conveyance + gross_child_edu) > gross_salary:
+            gross_conveyance = Decimal(0)
+            gross_child_edu = Decimal(0)
+
+        gross_personal = gross_salary - gross_basic - gross_hra - gross_conveyance - gross_child_edu
+        if gross_personal < 0:
+            gross_personal = Decimal(0)
+        gross_incentive = emp.incentive
+        gross_other_earnings = emp.other_earnings
+        gross_salary = gross_basic + gross_hra + gross_conveyance + gross_child_edu + gross_personal + gross_incentive + gross_other_earnings
+
+    # 4. Earned Components (pro-rated by LOP)
+    if paid_days == 0:
+        earned_basic = Decimal('0.00')
+        earned_hra = Decimal('0.00')
+        earned_conveyance = Decimal('0.00')
+        earned_child_edu = Decimal('0.00')
+        earned_personal = Decimal('0.00')
+        earned_incentive = Decimal('0.00')
+        earned_other_earnings = Decimal('0.00')
+        gross_earnings = Decimal('0.00')
+    else:
+        # Compute the LOP deduction in a single step (no intermediate rounding
+        # of the per-day rate) so the earned figure is accurate to the paisa.
+        lop_deduction = q(gross_salary * effective_lop / total_days)
+        if lop_deduction > gross_salary:
+            lop_deduction = gross_salary
+        gross_earnings = gross_salary - lop_deduction
+
+        earned_basic = q(gross_basic * multiplier)
+        earned_hra = q(gross_hra * multiplier)
+        earned_conveyance = q(gross_conveyance * multiplier)
+        earned_child_edu = q(gross_child_edu * multiplier)
+        earned_incentive = q(gross_incentive * multiplier)
+        earned_other_earnings = q(gross_other_earnings * multiplier)
+
+        earned_personal = gross_earnings - (earned_basic + earned_hra + earned_conveyance + earned_child_edu + earned_incentive + earned_other_earnings)
+        if earned_personal < Decimal('0.00'):
+            earned_personal = Decimal('0.00')
+
+    # 5. Deductions
+    if emp.basic > Decimal('0.00'):
+        deduction_epf = q(emp.epf * multiplier)
+        deduction_esi = q(emp.esi * multiplier)
+        deduction_prof_tax = emp.prof_tax
+        deduction_lwf = emp.lwf
+        deduction_staff_advance = emp.staff_advance
+        deduction_tds = emp.tds
+        deduction_other = emp.other_deduction
+        deduction_insurance = emp.deduction_insurance
+
+        employer_epf = q(emp.employer_epf * multiplier)
+        employer_esi = q(emp.employer_esi * multiplier)
+        employer_insurance = emp.employer_insurance
+        petrol_allowance = q(emp.petrol_allowance * multiplier)
+    else:
+        deduction_epf = q(earned_basic * Decimal('0.12'))
+        deduction_prof_tax = Decimal('208.30') if gross_salary > 12000 else Decimal('0.00')
+        deduction_esi = Decimal('0.00')
+        deduction_lwf = Decimal('0.00')
+        deduction_staff_advance = Decimal('0.00')
+        deduction_tds = Decimal('0.00')
+        deduction_other = Decimal('0.00')
+        deduction_insurance = Decimal('0.00')
+
+        employer_epf = q(earned_basic * Decimal('0.13'))
+        employer_esi = Decimal('0.00')
+        employer_insurance = Decimal('0.00')
+        petrol_allowance = Decimal('0.00')
+
+    # Optional manual override of the "Other Deduction" line.
+    if other_deduction_override is not None:
+        deduction_other = q(other_deduction_override)
+
+    gross_deductions = deduction_epf + deduction_esi + deduction_prof_tax + deduction_lwf + deduction_staff_advance + deduction_tds + deduction_other + deduction_insurance
+
+    # 6. Net Take Home (kept accurate to the paisa; no whole-rupee rounding)
+    net_rounded = q(gross_earnings - gross_deductions)
+
+    return {
+        'total_days': int(total_days),
+        'lop_days': lop_days,
+        'off_days': off_days,
+        'paid_days': paid_days,
+
+        'gross_basic': gross_basic,
+        'gross_hra': gross_hra,
+        'gross_conveyance': gross_conveyance,
+        'gross_child_edu': gross_child_edu,
+        'gross_personal_allowance': gross_personal,
+        'gross_incentive': gross_incentive,
+        'gross_other_earnings': gross_other_earnings,
+        'gross_salary': gross_salary,
+
+        'earned_basic': earned_basic,
+        'earned_hra': earned_hra,
+        'earned_conveyance': earned_conveyance,
+        'earned_child_edu': earned_child_edu,
+        'earned_personal_allowance': earned_personal,
+        'earned_incentive': earned_incentive,
+        'earned_other_earnings': earned_other_earnings,
+        'gross_earnings': gross_earnings,
+
+        'deduction_epf': deduction_epf,
+        'deduction_esi': deduction_esi,
+        'deduction_prof_tax': deduction_prof_tax,
+        'deduction_lwf': deduction_lwf,
+        'deduction_staff_advance': deduction_staff_advance,
+        'deduction_tds': deduction_tds,
+        'deduction_other': deduction_other,
+        'deduction_insurance': deduction_insurance,
+        'gross_deductions': gross_deductions,
+
+        'employer_epf': employer_epf,
+        'employer_esi': employer_esi,
+        'employer_insurance': employer_insurance,
+        'petrol_allowance': petrol_allowance,
+
+        'net_salary': net_rounded,
+    }
+
+
 class PayslipViewSet(viewsets.ModelViewSet):
     queryset = Payslip.objects.all()
     serializer_class = PayslipSerializer
@@ -97,10 +284,6 @@ class PayslipViewSet(viewsets.ModelViewSet):
         created_count = 0
         updated_count = 0
 
-        def q(val):
-            """Helper to round Decimal value to two decimal places."""
-            return Decimal(val).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
         for emp in active_employees:
             # 2. Calculate LOP days based on Attendance Table within the range
             lop_days = Decimal(Attendance.objects.filter(
@@ -109,161 +292,16 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 status='Absent'
             ).count())
 
-            paid_days = Decimal(total_days) - lop_days
-            if paid_days < 0:
-                paid_days = Decimal(0)
-
-            # Pro-rata ratio
-            multiplier = paid_days / Decimal(total_days)
-
-            # 3. Gross Structure (Base Fixed Monthly Salary)
-            # If Employee has been configured with a base structure, use it!
-            if emp.basic > Decimal('0.00'):
-                gross_basic = emp.basic
-                gross_hra = emp.hra
-                gross_conveyance = emp.conveyance
-                gross_child_edu = emp.child_edu
-                gross_personal = emp.personal_allowance
-                gross_incentive = emp.incentive
-                gross_other_earnings = emp.other_earnings
-                gross_salary = emp.salary
-            else:
-                # Legacy/Fallback calculation
-                gross_salary = emp.salary
-                gross_basic = q(gross_salary * Decimal('0.50')) # 50% Basic
-                gross_hra = q(gross_salary * Decimal('0.25'))   # 25% HRA
-                gross_conveyance = Decimal('1600.00')
-                gross_child_edu = Decimal('200.00')
-                
-                # Handled fallback in case overall salary is low
-                if (gross_basic + gross_hra + gross_conveyance + gross_child_edu) > gross_salary:
-                    gross_conveyance = Decimal(0)
-                    gross_child_edu = Decimal(0)
-                
-                gross_personal = gross_salary - gross_basic - gross_hra - gross_conveyance - gross_child_edu
-                if gross_personal < 0:
-                    gross_personal = Decimal(0)
-                gross_incentive = emp.incentive
-                gross_other_earnings = emp.other_earnings
-                # Re-adjust gross total
-                gross_salary = gross_basic + gross_hra + gross_conveyance + gross_child_edu + gross_personal + gross_incentive + gross_other_earnings
-
-            # 4. Earned Components (Pro-rated based on LOP deduction from Gross Salary)
-            if paid_days == 0:
-                earned_basic = Decimal('0.00')
-                earned_hra = Decimal('0.00')
-                earned_conveyance = Decimal('0.00')
-                earned_child_edu = Decimal('0.00')
-                earned_personal = Decimal('0.00')
-                earned_incentive = Decimal('0.00')
-                earned_other_earnings = Decimal('0.00')
-                gross_earnings = Decimal('0.00')
-            else:
-                one_day_salary = q(gross_salary / Decimal(total_days))
-                lop_deduction = q(one_day_salary * lop_days)
-                if lop_deduction > gross_salary:
-                    lop_deduction = gross_salary
-                gross_earnings = gross_salary - lop_deduction
-
-                # Pro-rate individual components
-                earned_basic = q(gross_basic * multiplier)
-                earned_hra = q(gross_hra * multiplier)
-                earned_conveyance = q(gross_conveyance * multiplier)
-                earned_child_edu = q(gross_child_edu * multiplier)
-                earned_incentive = q(gross_incentive * multiplier)
-                earned_other_earnings = q(gross_other_earnings * multiplier)
-
-                # Balance personal allowance to absorb rounding differences
-                earned_personal = gross_earnings - (earned_basic + earned_hra + earned_conveyance + earned_child_edu + earned_incentive + earned_other_earnings)
-                if earned_personal < Decimal('0.00'):
-                    earned_personal = Decimal('0.00')
-
-            # 5. Deductions Components
-            if emp.basic > Decimal('0.00'):
-                # Pro-rate PF and ESI based on attendance, other fixed deductions taken fully
-                deduction_epf = q(emp.epf * multiplier)
-                deduction_esi = q(emp.esi * multiplier)
-                deduction_prof_tax = emp.prof_tax
-                deduction_lwf = emp.lwf
-                deduction_staff_advance = emp.staff_advance
-                deduction_tds = emp.tds
-                deduction_other = emp.other_deduction
-                deduction_insurance = emp.deduction_insurance
-                
-                # Pro-rate Employer contributions by attendance as well
-                employer_epf = q(emp.employer_epf * multiplier)
-                employer_esi = q(emp.employer_esi * multiplier)
-                employer_insurance = emp.employer_insurance
-                petrol_allowance = q(emp.petrol_allowance * multiplier)
-            else:
-                # Legacy/Fallback deduction calculation
-                deduction_epf = q(earned_basic * Decimal('0.12'))
-                deduction_prof_tax = Decimal('208.30') if gross_salary > 12000 else Decimal('0.00')
-                deduction_esi = Decimal('0.00')
-                deduction_lwf = Decimal('0.00')
-                deduction_staff_advance = Decimal('0.00')
-                deduction_tds = Decimal('0.00')
-                deduction_other = Decimal('0.00')
-                deduction_insurance = Decimal('0.00')
-                
-                # Fallback Employer Benefits
-                employer_epf = q(earned_basic * Decimal('0.13')) # Standard 13% fallback
-                employer_esi = Decimal('0.00')
-                employer_insurance = Decimal('0.00')
-                petrol_allowance = Decimal('0.00')
-            
-            gross_deductions = deduction_epf + deduction_esi + deduction_prof_tax + deduction_lwf + deduction_staff_advance + deduction_tds + deduction_other + deduction_insurance
-
-            # 6. Net Take Home Salary (Rounded to nearest full integer)
-            net_salary = gross_earnings - gross_deductions
-            net_rounded = Decimal(net_salary).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+            # 3-6. All earnings/deductions/net math lives in one shared helper.
+            defaults = compute_payslip_fields(emp, total_days, lop_days)
+            defaults['status'] = 'Generated'
 
             # Save / Update Record
             payslip, created = Payslip.objects.update_or_create(
                 employee=emp,
                 month=month,
                 year=year,
-                defaults={
-                    'total_days': total_days,
-                    'lop_days': lop_days,
-                    'paid_days': paid_days,
-                    
-                    'gross_basic': gross_basic,
-                    'gross_hra': gross_hra,
-                    'gross_conveyance': gross_conveyance,
-                    'gross_child_edu': gross_child_edu,
-                    'gross_personal_allowance': gross_personal,
-                    'gross_incentive': gross_incentive,
-                    'gross_other_earnings': gross_other_earnings,
-                    'gross_salary': gross_salary,
-                    
-                    'earned_basic': earned_basic,
-                    'earned_hra': earned_hra,
-                    'earned_conveyance': earned_conveyance,
-                    'earned_child_edu': earned_child_edu,
-                    'earned_personal_allowance': earned_personal,
-                    'earned_incentive': earned_incentive,
-                    'earned_other_earnings': earned_other_earnings,
-                    'gross_earnings': gross_earnings,
-                    
-                    'deduction_epf': deduction_epf,
-                    'deduction_esi': deduction_esi,
-                    'deduction_prof_tax': deduction_prof_tax,
-                    'deduction_lwf': deduction_lwf,
-                    'deduction_staff_advance': deduction_staff_advance,
-                    'deduction_tds': deduction_tds,
-                    'deduction_other': deduction_other,
-                    'deduction_insurance': deduction_insurance,
-                    'gross_deductions': gross_deductions,
-                    
-                    'employer_epf': employer_epf,
-                    'employer_esi': employer_esi,
-                    'employer_insurance': employer_insurance,
-                    'petrol_allowance': petrol_allowance,
-                    
-                    'net_salary': net_rounded,
-                    'status': 'Generated'
-                }
+                defaults=defaults,
             )
 
             if created:
@@ -279,6 +317,149 @@ class PayslipViewSet(viewsets.ModelViewSet):
             "created": created_count,
             "updated": updated_count
         }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def recalculate(self, request, pk=None):
+        """Recompute a single payslip from operator-supplied overrides.
+
+        Accepts any of: total_days, lop_days, off_days, paid_days,
+        other_deduction. The same pro-rata math as generate_all is applied via
+        compute_payslip_fields, so a manually edited slip is computed with
+        exactly the same rules as an auto-generated one. Only this one payslip
+        is touched.
+
+        Days resolution:
+          - total_days defaults to the slip's current value.
+          - off_days (paid weekly-offs/holidays) offset LOP; default to current.
+          - If paid_days is given, it is treated as the absolute worked+paid
+            figure: effective unpaid = total - paid_days (off reset to 0), so an
+            operator can enter a fractional figure like 25.05.
+          - Else lop_days is used (default current), reduced by off_days.
+        """
+        payslip = self.get_object()  # respects branch/role scoping in get_queryset
+
+        # Block editing a slip that has already been paid out.
+        if payslip.status == 'Paid':
+            return Response(
+                {"error": "This payslip is already marked Paid and cannot be recalculated."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        def to_decimal(value, field_name):
+            try:
+                return Decimal(str(value))
+            except (ValueError, ArithmeticError):
+                raise ValueError(f"{field_name} must be a number.")
+
+        try:
+            # total_days
+            if request.data.get('total_days') is not None:
+                total_days = to_decimal(request.data.get('total_days'), 'total_days')
+            else:
+                total_days = Decimal(payslip.total_days or 30)
+
+            if total_days <= 0:
+                return Response({"error": "total_days must be greater than 0."},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            # Off days (paid weekly-offs/holidays) default to the slip's current value.
+            if request.data.get('off_days') is not None:
+                off_days = to_decimal(request.data.get('off_days'), 'off_days')
+            else:
+                off_days = Decimal(payslip.off_days or 0)
+
+            # Days can be set by paid_days (absolute worked days) or lop_days.
+            if request.data.get('paid_days') is not None:
+                paid_days = to_decimal(request.data.get('paid_days'), 'paid_days')
+                # Absolute worked figure: express it purely as LOP, no off offset.
+                lop_days = total_days - paid_days
+                off_days = Decimal(0)
+            elif request.data.get('lop_days') is not None:
+                lop_days = to_decimal(request.data.get('lop_days'), 'lop_days')
+            else:
+                lop_days = Decimal(payslip.lop_days or 0)
+
+            # Optional other-deduction override.
+            other_override = None
+            if request.data.get('other_deduction') is not None:
+                other_override = to_decimal(request.data.get('other_deduction'), 'other_deduction')
+                if other_override < 0:
+                    return Response({"error": "other_deduction cannot be negative."},
+                                    status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if lop_days < 0 or lop_days > total_days:
+            return Response(
+                {"error": f"Worked/LOP days are out of range for a {total_days}-day cycle."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if off_days < 0 or off_days > total_days:
+            return Response(
+                {"error": f"Off days are out of range for a {total_days}-day cycle."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        defaults = compute_payslip_fields(
+            payslip.employee, total_days, lop_days,
+            other_deduction_override=other_override,
+            off_days=off_days,
+        )
+        for field, value in defaults.items():
+            setattr(payslip, field, value)
+        payslip.save()
+
+        serializer = self.get_serializer(payslip)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def revert(self, request, pk=None):
+        """Undo manual edits: recompute this payslip straight from attendance.
+
+        Re-derives LOP days from the Attendance table for the slip's own
+        cycle (25th of previous month to 24th of the slip's month) and applies
+        the standard structural math — exactly what bulk generation would
+        produce. This discards any manual total_days / lop_days / other_deduction
+        overrides for this one slip.
+        """
+        payslip = self.get_object()
+
+        if payslip.status == 'Paid':
+            return Response(
+                {"error": "This payslip is already marked Paid and cannot be reverted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        import datetime
+        from django.utils.timezone import make_aware
+
+        month, year = payslip.month, payslip.year
+        if month == 1:
+            prev_month, prev_year = 12, year - 1
+        else:
+            prev_month, prev_year = month - 1, year
+
+        start_date = datetime.date(prev_year, prev_month, 25)
+        end_date = datetime.date(year, month, 24)
+        total_days = (end_date - start_date).days + 1
+
+        start_datetime = make_aware(datetime.datetime.combine(start_date, datetime.time.min))
+        end_datetime = make_aware(datetime.datetime.combine(end_date, datetime.time.max))
+
+        lop_days = Decimal(Attendance.objects.filter(
+            employee=payslip.employee,
+            intime__range=(start_datetime, end_datetime),
+            status='Absent'
+        ).count())
+
+        defaults = compute_payslip_fields(payslip.employee, total_days, lop_days)
+        defaults['status'] = 'Generated'
+        for field, value in defaults.items():
+            setattr(payslip, field, value)
+        payslip.save()
+
+        serializer = self.get_serializer(payslip)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'])
     def cycles_summary(self, request):
