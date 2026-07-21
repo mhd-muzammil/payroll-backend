@@ -3,6 +3,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 from decimal import Decimal, ROUND_HALF_UP
 import calendar
@@ -222,8 +223,21 @@ class PayslipViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(month=month)
         if year:
             queryset = queryset.filter(year=year)
-            
+
         return queryset
+
+    def _report_scope(self, request):
+        """Scope enterprise reports. Returns:
+          - False  -> caller is an employee, deny (403).
+          - None   -> all branches allowed.
+          - [list] -> restrict to these branches.
+        """
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role == "employee":
+            return False
+        allowed = get_allowed_branches(user, "payslips")
+        return None if "All" in allowed else allowed
 
     @action(detail=False, methods=['post'])
     def generate_all(self, request):
@@ -464,8 +478,14 @@ class PayslipViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def cycles_summary(self, request):
         """Aggregates monthly payslip records to provide enterprise-wide Payroll status cycles."""
+        scope = self._report_scope(request)
+        if scope is False:
+            return Response({"error": "Not permitted."}, status=status.HTTP_403_FORBIDDEN)
+
         branch = request.query_params.get('branch')
         qs = Payslip.objects.all()
+        if scope is not None:
+            qs = qs.filter(employee__branch__in=scope)
         if branch:
             qs = qs.filter(employee__branch=branch)
 
@@ -508,8 +528,14 @@ class PayslipViewSet(viewsets.ModelViewSet):
             month = now.month
             year = now.year
 
+        scope = self._report_scope(request)
+        if scope is False:
+            return Response({"error": "Not permitted."}, status=status.HTTP_403_FORBIDDEN)
+
         # Active employees in scope
         emp_qs = Employee.objects.filter(status='active')
+        if scope is not None:
+            emp_qs = emp_qs.filter(branch__in=scope)
         if branch:
             emp_qs = emp_qs.filter(branch__iexact=branch)
 
@@ -518,6 +544,8 @@ class PayslipViewSet(viewsets.ModelViewSet):
 
         # Payslips in scope for selected month and year
         slip_qs = Payslip.objects.filter(month=month, year=year)
+        if scope is not None:
+            slip_qs = slip_qs.filter(employee__branch__in=scope)
         if branch:
             slip_qs = slip_qs.filter(employee__branch__iexact=branch)
 
@@ -585,25 +613,35 @@ class PayslipViewSet(viewsets.ModelViewSet):
         from employees.models import Employee
         from onboarding.models import Onboarding
         
+        scope = self._report_scope(request)
+        if scope is False:
+            return Response({"error": "Not permitted."}, status=status.HTTP_403_FORBIDDEN)
+
         branch = request.query_params.get('branch')
-        
+
         active_emps = Employee.objects.filter(status='active')
+        if scope is not None:
+            active_emps = active_emps.filter(branch__in=scope)
         if branch:
             active_emps = active_emps.filter(branch__iexact=branch)
-            
+
         total_employees = active_emps.count()
-        
+
         # Avg Salary of active employees
         avg_salary_raw = active_emps.aggregate(a=Avg('salary'))['a'] or 0
-        
+
         # Overall Lifetime Payroll distributed
         payslips = Payslip.objects.all()
+        if scope is not None:
+            payslips = payslips.filter(employee__branch__in=scope)
         if branch:
             payslips = payslips.filter(employee__branch__iexact=branch)
         total_payroll_raw = payslips.aggregate(s=Sum('net_salary'))['s'] or 0
-        
+
         # Pending onboarding processes
         pending_onboards = Onboarding.objects.exclude(status='Completed')
+        if scope is not None:
+            pending_onboards = pending_onboards.filter(work_location__in=scope)
         if branch:
             pending_onboards = pending_onboards.filter(work_location__icontains=branch)
         pending_approvals = pending_onboards.count()
@@ -907,3 +945,23 @@ class BranchFinancialViewSet(viewsets.ModelViewSet):
         if year:
             queryset = queryset.filter(year=year)
         return queryset
+
+    def _check_branch_allowed(self, serializer):
+        """Block writing financials for a branch the user does not control."""
+        user = self.request.user
+        allowed = get_allowed_branches(user, "payroll")
+        if "All" in allowed:
+            return
+        target_branch = serializer.validated_data.get("branch")
+        if target_branch and target_branch not in allowed:
+            raise PermissionDenied(
+                f"You are not allowed to manage financials for branch '{target_branch}'."
+            )
+
+    def perform_create(self, serializer):
+        self._check_branch_allowed(serializer)
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._check_branch_allowed(serializer)
+        serializer.save()

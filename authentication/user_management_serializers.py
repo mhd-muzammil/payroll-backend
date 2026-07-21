@@ -1,6 +1,8 @@
 from rest_framework import serializers
 from .models import User
 
+PRIVILEGED_ROLES = ["admin", "superadmin"]
+
 
 class UserManagementSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=False)
@@ -19,7 +21,6 @@ class UserManagementSerializer(serializers.ModelSerializer):
             "is_staff",
             "phone_number",
             "password",
-            "plain_password",
             "date_joined",
             "branch",
             "assigned_branch",
@@ -36,16 +37,41 @@ class UserManagementSerializer(serializers.ModelSerializer):
             return None
         return value
 
+    def validate(self, attrs):
+        """Prevent privilege escalation.
+
+        - Only a superadmin may create/modify admin or superadmin accounts.
+        - A user may never change their own role or active flag.
+        """
+        request = self.context.get("request")
+        actor = getattr(request, "user", None) if request else None
+        actor_is_superadmin = bool(
+            actor and (actor.is_superuser or getattr(actor, "role", None) == "superadmin")
+        )
+
+        target_role = attrs.get("role")
+        existing_role = getattr(self.instance, "role", None)
+        if (target_role in PRIVILEGED_ROLES or existing_role in PRIVILEGED_ROLES) and not actor_is_superadmin:
+            raise serializers.ValidationError(
+                "Only a superadmin may create or modify admin/superadmin accounts."
+            )
+
+        if actor is not None and self.instance is not None and self.instance.pk == actor.pk:
+            if target_role is not None and target_role != actor.role:
+                raise serializers.ValidationError("You cannot change your own role.")
+            if "is_active" in attrs and attrs["is_active"] != actor.is_active:
+                raise serializers.ValidationError("You cannot change your own active status.")
+
+        return attrs
+
     def create(self, validated_data):
         password = validated_data.pop("password", None)
         user = User(**validated_data)
         if password:
             user.set_password(password)
-            user.plain_password = password
         else:
             user.set_unusable_password()
-            user.plain_password = ""
-        user.is_staff = user.role in ["admin", "superadmin"] or user.is_superuser
+        user.is_staff = user.role in PRIVILEGED_ROLES or user.is_superuser
         user.save()
         return user
 
@@ -55,7 +81,6 @@ class UserManagementSerializer(serializers.ModelSerializer):
             setattr(instance, key, value)
         if password:
             instance.set_password(password)
-            instance.plain_password = password
-        instance.is_staff = instance.role in ["admin", "superadmin"] or instance.is_superuser
+        instance.is_staff = instance.role in PRIVILEGED_ROLES or instance.is_superuser
         instance.save()
         return instance

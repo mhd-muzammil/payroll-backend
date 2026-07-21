@@ -27,8 +27,7 @@ class User(AbstractUser):
 
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='employee')
     phone_number = models.CharField(max_length=20, unique=True, null=True, blank=True)
-    plain_password = models.CharField(max_length=100, null=True, blank=True)
-    
+
     allowed_sections = models.JSONField(default=default_sections, blank=True)
     assigned_branch = models.CharField(max_length=50, null=True, blank=True, default=None)
 
@@ -42,9 +41,10 @@ def get_allowed_branches(user, section_name):
 
     allowed_sec = getattr(user, "allowed_sections", None)
     if not allowed_sec:
+        # Fail closed: a non-admin user with no section config gets no access.
         if getattr(user, "assigned_branch", None):
             return [user.assigned_branch]
-        return ["All"]
+        return []
 
     if isinstance(allowed_sec, list):
         if section_name in allowed_sec:

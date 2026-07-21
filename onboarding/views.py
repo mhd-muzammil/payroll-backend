@@ -6,13 +6,15 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 
+from authentication.permissions import IsHRStaff
 from .models import Onboarding, Candidate
 from .serializers import DOCUMENT_FIELDS, OnboardingSerializer, CandidateSerializer
 
 class OnboardingViewSet(viewsets.ModelViewSet):
     queryset = Onboarding.objects.all().order_by('-created_at')
     serializer_class = OnboardingSerializer
-    permission_classes = [IsAuthenticated]
+    # Onboarding holds Aadhaar/PAN/bank PII — restrict to HR/admin/superadmin.
+    permission_classes = [IsAuthenticated, IsHRStaff]
 
     @action(
         detail=True,
@@ -52,4 +54,5 @@ class OnboardingViewSet(viewsets.ModelViewSet):
 class CandidateViewSet(viewsets.ModelViewSet):
     queryset = Candidate.objects.all().order_by('-created_at')
     serializer_class = CandidateSerializer
-    permission_classes = [IsAuthenticated]
+    # Candidate records hold salary slips / bank statements — HR-only.
+    permission_classes = [IsAuthenticated, IsHRStaff]

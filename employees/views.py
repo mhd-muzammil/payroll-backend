@@ -26,14 +26,34 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         queryset = Employee.objects.all().order_by("-id")
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
-            if self.action == 'list':
-                return queryset
+            # Employees may only ever see their own record (no cross-branch
+            # PII exposure in the list action).
             return queryset.filter(user=user)
-        
+
         branches = get_allowed_branches(user, "employees")
         if "All" not in branches:
             queryset = queryset.filter(branch__in=branches)
         return queryset
+
+    def _guard_write(self):
+        """Employees must not create/update/delete employee records (this is
+        where salary/EPF/branch/user live — mass-assignment risk)."""
+        user = self.request.user
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role == "employee":
+            raise PermissionDenied("Employees cannot modify employee records.")
+
+    def create(self, request, *args, **kwargs):
+        self._guard_write()
+        return super().create(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        self._guard_write()
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        self._guard_write()
+        return super().destroy(request, *args, **kwargs)
 
 
 class TaskViewSet(viewsets.ModelViewSet):
@@ -65,7 +85,8 @@ class TaskViewSet(viewsets.ModelViewSet):
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
             if instance.assigned_by != user:
-                allowed_keys = {'status', 'employee_notes', 'checklist', 'activity_log'}
+                # activity_log is a server-managed audit trail — not client-writable.
+                allowed_keys = {'status', 'employee_notes', 'checklist'}
                 for key in request.data.keys():
                     if key not in allowed_keys:
                         raise PermissionDenied("Employees can only update task status, checklists, progress notes, and comments for tasks assigned to them by others.")
@@ -134,7 +155,11 @@ class AssetViewSet(viewsets.ModelViewSet):
         
         branches = get_allowed_branches(user, "assets")
         if "All" not in branches:
-            queryset = queryset.filter(assigned_to__branch__in=branches)
+            # Include unassigned assets (assigned_to is null) so scoped HR can
+            # still see/manage the available equipment pool.
+            queryset = queryset.filter(
+                Q(assigned_to__branch__in=branches) | Q(assigned_to__isnull=True)
+            )
         return queryset
 
     def perform_create(self, serializer):

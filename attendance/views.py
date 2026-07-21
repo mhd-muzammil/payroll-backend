@@ -11,6 +11,7 @@ from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from .models import Attendance, LeaveRequest
 from .serializer import AttendanceSerializer, LeaveRequestSerializer
 from employees.models import Employee
@@ -31,6 +32,31 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 class AttendanceViewSet(viewsets.ModelViewSet):
     serializer_class = AttendanceSerializer
     permission_classes = [IsAuthenticated]
+
+    def _guard_write(self):
+        """Employees must not create/edit/delete raw attendance rows (fraud
+        vector: back-dating, flipping Absent→Present, injecting salary). They
+        may only mark attendance through the check_in / check_out actions."""
+        user = self.request.user
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role == "employee":
+            raise PermissionDenied("Employees can only mark attendance via check-in / check-out.")
+
+    def create(self, request, *args, **kwargs):
+        self._guard_write()
+        return super().create(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        self._guard_write()
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        self._guard_write()
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        self._guard_write()
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=False, methods=["post"])
     def import_sheet(self, request):
@@ -860,10 +886,17 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     def delete_all(self, request):
         user = request.user
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
-        if role not in ["superadmin", "admin"]:
+        # Mass-delete is superadmin-only and scoped to the caller's branches so a
+        # branch admin can never wipe every branch's attendance.
+        if not (user.is_superuser or role == "superadmin"):
             return Response({"detail": "Permission denied."}, status=403)
-        
-        count, _ = Attendance.objects.all().delete()
+
+        qs = Attendance.objects.all()
+        branches = get_allowed_branches(user, "attendance")
+        if "All" not in branches:
+            qs = qs.filter(employee__branch__in=branches)
+
+        count, _ = qs.delete()
         return Response({"detail": f"Successfully deleted {count} attendance records."}, status=200)
 
     def get_queryset(self):
@@ -935,7 +968,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         try:
             distance = haversine_distance(float(user_lat), float(user_lon), float(allowed_lat), float(allowed_lon))
-        except ValueError:
+        except (ValueError, TypeError):
             return Response({"detail": "Invalid coordinates provided."}, status=400)
 
         if distance > 50:
@@ -985,7 +1018,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         try:
             distance = haversine_distance(float(user_lat), float(user_lon), float(allowed_lat), float(allowed_lon))
-        except ValueError:
+        except (ValueError, TypeError):
             return Response({"detail": "Invalid coordinates provided."}, status=400)
 
         if distance > 50:

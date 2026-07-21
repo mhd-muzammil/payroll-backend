@@ -16,14 +16,17 @@ class EmployeeSerializer(serializers.ModelSerializer):
             self._onboarding_cache = {}
         if obj.id not in self._onboarding_cache:
             onboarding = None
-            if obj.emp_code:
-                onboarding = Onboarding.objects.filter(employee_id=obj.emp_code).first()
-            if not onboarding:
-                onboarding = Onboarding.objects.filter(employee_id=str(obj.id)).first()
-            if not onboarding and obj.email:
-                onboarding = Onboarding.objects.filter(email_id=obj.email).first()
-            if not onboarding:
-                onboarding = Onboarding.objects.filter(employee_name__iexact=obj.employee_name).first()
+            # Match on email first (unique, reliable). Only then fall back to
+            # emp_code qualified by branch, since emp_code is NOT globally
+            # unique. The old name-only fuzzy match leaked another employee's
+            # bank/PII and has been removed.
+            if obj.email:
+                onboarding = Onboarding.objects.filter(email_id__iexact=obj.email).first()
+            if not onboarding and obj.emp_code:
+                qs = Onboarding.objects.filter(employee_id=obj.emp_code)
+                if obj.branch:
+                    qs = qs.filter(work_location__iexact=obj.branch)
+                onboarding = qs.first()
             self._onboarding_cache[obj.id] = onboarding
         return self._onboarding_cache[obj.id]
 

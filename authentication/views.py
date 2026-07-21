@@ -1,6 +1,6 @@
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework import viewsets, filters
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django_filters.rest_framework import DjangoFilterBackend
 from .serializers import RoleTokenObtainPairSerializer, UserSerializer
 from .models import User
@@ -9,6 +9,7 @@ from .permissions import IsAdmin
 
 class RoleTokenObtainPairView(TokenObtainPairView):
     serializer_class = RoleTokenObtainPairSerializer
+    permission_classes = [AllowAny]  # login must stay public
 
 
 class UserViewSet(viewsets.ModelViewSet):
