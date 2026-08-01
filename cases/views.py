@@ -1,4 +1,5 @@
 import math
+import re
 from datetime import timedelta
 
 from django.utils import timezone
@@ -118,11 +119,17 @@ class CaseViewSet(viewsets.ModelViewSet):
 
     @staticmethod
     def _resolve_engineer(data):
-        """Look up an Employee by id, then email, then (case-insensitive) name."""
+        """Look up an Employee by id, then email, then phone, then name.
+
+        Email and phone are the reliable keys (both unique on the Employee),
+        so an engineer whose email OR mobile number matches the OpenCall record
+        links correctly even if the name is spelled differently. Phone is
+        compared on the last 10 digits so "+91 98765 43210" matches "9876543210".
+        """
         engineer_id = data.get("engineer_id")
         if engineer_id:
             # A non-numeric engineer_id would raise ValueError on a pk lookup;
-            # treat it as "not found" and fall through to email/name instead.
+            # treat it as "not found" and fall through to email/phone/name.
             try:
                 emp = Employee.objects.filter(pk=engineer_id).first()
             except (ValueError, TypeError):
@@ -134,6 +141,17 @@ class CaseViewSet(viewsets.ModelViewSet):
             emp = Employee.objects.filter(email__iexact=email).first()
             if emp:
                 return emp
+        phone = data.get("engineer_phone")
+        if phone:
+            digits = re.sub(r"\D", "", str(phone))
+            if len(digits) >= 10:
+                target = digits[-10:]
+                # Compare on digits-only, last 10, on BOTH sides — stored phones
+                # carry spaces/"+91" so a raw SQL endswith would miss. Employee
+                # tables are small, so a scan of phone-bearing rows is fine.
+                for emp in Employee.objects.exclude(phone__isnull=True).exclude(phone=""):
+                    if re.sub(r"\D", "", emp.phone)[-10:] == target:
+                        return emp
         name = data.get("engineer_name")
         if name:
             return Employee.objects.filter(employee_name__iexact=name).first()

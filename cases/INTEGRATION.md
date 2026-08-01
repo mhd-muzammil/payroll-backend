@@ -64,12 +64,16 @@ POST /api/cases/
 
 ```
 POST /api/cases/42/assign/
-{ "engineer_name": "Suresh" }   // OR "engineer_email": "..." OR "engineer_id": 7
+{ "engineer_email": "suresh@corp.com" }
+// any of: engineer_id | engineer_email | engineer_phone | engineer_name
 → 200 { ...case, "status": "assigned", "assigned_to": 7, "assigned_to_name": "Suresh" }
 ```
 
-> Payroll resolves the engineer by id → email → name (case-insensitive). Use the
-> same name/email that exists on the Payroll Employee record.
+> Payroll resolves the engineer by **id → email → phone → name**. Email and phone
+> are the reliable keys (both unique on the Employee); pass whichever you have —
+> ideally email AND phone. Phone is compared on the last 10 digits, so
+> "+91 98765 43210" matches "9876543210". Name is the last resort and breaks on
+> spelling differences, so keep the same email/phone on both systems.
 
 ---
 
