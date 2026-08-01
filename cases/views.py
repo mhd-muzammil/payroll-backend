@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from django.db.models import Max
+from django.db.models import Max, Q
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -61,10 +61,12 @@ class CaseViewSet(viewsets.ModelViewSet):
                 return qs.none()
             return qs.filter(assigned_to=employee)
 
-        # Staff: branch-scoped by the assigned engineer's branch.
+        # Staff: branch-scoped by the assigned engineer's branch. Unassigned
+        # cases have no branch yet, so include them too — otherwise a branch
+        # admin could never see (and assign) a freshly created open case.
         branches = get_allowed_branches(user, "attendance")
         if "All" not in branches:
-            qs = qs.filter(assigned_to__branch__in=branches)
+            qs = qs.filter(Q(assigned_to__branch__in=branches) | Q(assigned_to__isnull=True))
 
         params = self.request.query_params
         status_param = params.get("status")
@@ -78,6 +80,17 @@ class CaseViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         if not _is_staff_role(request.user):
             return Response({"detail": "Only admin/HR can create cases."}, status=403)
+        # Idempotent dispatch: if a case with this external_ref already exists,
+        # update it in place instead of creating a duplicate (OpenCall may
+        # re-send the same ticket when a row is re-scheduled).
+        ext = request.data.get("external_ref")
+        if ext:
+            existing = Case.objects.filter(external_ref=ext).first()
+            if existing:
+                serializer = self.get_serializer(existing, data=request.data, partial=True)
+                serializer.is_valid(raise_exception=True)
+                serializer.save()
+                return Response(serializer.data, status=200)
         return super().create(request, *args, **kwargs)
 
     def _guard_staff(self, request):
@@ -108,7 +121,12 @@ class CaseViewSet(viewsets.ModelViewSet):
         """Look up an Employee by id, then email, then (case-insensitive) name."""
         engineer_id = data.get("engineer_id")
         if engineer_id:
-            emp = Employee.objects.filter(pk=engineer_id).first()
+            # A non-numeric engineer_id would raise ValueError on a pk lookup;
+            # treat it as "not found" and fall through to email/name instead.
+            try:
+                emp = Employee.objects.filter(pk=engineer_id).first()
+            except (ValueError, TypeError):
+                emp = None
             if emp:
                 return emp
         email = data.get("engineer_email")
@@ -234,7 +252,12 @@ class TrackingViewSet(viewsets.ViewSet):
         case = None
         case_id = request.data.get("case_id")
         if case_id:
-            case = Case.objects.filter(pk=case_id).first()
+            # Tolerate a bad case_id (non-numeric) — just record the ping with no
+            # case rather than 500-ing on the pk lookup.
+            try:
+                case = Case.objects.filter(pk=case_id).first()
+            except (ValueError, TypeError):
+                case = None
 
         def _num(v):
             try:
@@ -260,9 +283,13 @@ class TrackingViewSet(viewsets.ViewSet):
             return Response({"detail": "Permission denied."}, status=403)
 
         since = timezone.now() - timedelta(minutes=LIVE_WINDOW_MINUTES)
-        # Latest ping id per engineer within the window.
+        # Latest ping id per engineer within the window. NOTE: .order_by() is
+        # required — LocationPing has Meta.ordering = ["-timestamp"], which Django
+        # would otherwise fold into the GROUP BY, breaking the per-engineer
+        # aggregation and returning one row per ping instead of per engineer.
         latest_ids = (
             LocationPing.objects.filter(timestamp__gte=since)
+            .order_by()
             .values("engineer")
             .annotate(last_id=Max("id"))
             .values_list("last_id", flat=True)
@@ -298,8 +325,14 @@ class TrackingViewSet(viewsets.ViewSet):
         user = request.user
         qs = LocationPing.objects.select_related("engineer").all()
 
-        case_id = request.query_params.get("case")
-        engineer_id = request.query_params.get("engineer")
+        # Only accept numeric ids; a non-numeric value would 500 on the filter.
+        raw_case = request.query_params.get("case")
+        raw_engineer = request.query_params.get("engineer")
+        case_id = raw_case if (raw_case and raw_case.isdigit()) else None
+        engineer_id = raw_engineer if (raw_engineer and raw_engineer.isdigit()) else None
+
+        if (raw_case or raw_engineer) and not (case_id or engineer_id):
+            return Response({"detail": "case and engineer must be numeric ids."}, status=400)
 
         if case_id:
             qs = qs.filter(case_id=case_id)

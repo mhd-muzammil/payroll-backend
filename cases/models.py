@@ -28,6 +28,11 @@ class Case(models.Model):
     # Human-friendly reference (e.g. OC-000042). Filled in save() on first save.
     case_number = models.CharField(max_length=20, unique=True, blank=True, db_index=True)
 
+    # Reference from the originating system (e.g. OpenCall ticket id). Used to
+    # make dispatch idempotent so re-assigning/re-scheduling the same ticket
+    # updates the one case instead of creating duplicates.
+    external_ref = models.CharField(max_length=100, blank=True, default="", db_index=True)
+
     customer_name = models.CharField(max_length=150)
     customer_phone = models.CharField(max_length=20, blank=True, default="")
 

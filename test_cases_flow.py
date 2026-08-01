@@ -81,11 +81,15 @@ def main():
         assert r.status_code == 201, ("ping", r.status_code, r.data)
     print(f"5. Sent {len(route)} location pings")
 
-    # 6. Staff reads live positions
+    # 6. Staff reads live positions — must be exactly ONE row per engineer (the
+    #    latest ping), even though several pings were sent. Guards the Meta
+    #    ordering + values().annotate() GROUP BY pitfall.
     r = staff.get("/api/tracking/live/")
     live = [x for x in r.data if x["engineer_id"] == engineer.id]
-    assert live and live[0]["active_case_number"], ("live", r.data)
-    print(f"6. Live map sees engineer at {live[0]['latitude']:.4f},{live[0]['longitude']:.4f} on {live[0]['active_case_number']}")
+    assert len(live) == 1, ("live must be one row per engineer, got", len(live))
+    assert live[0]["active_case_number"], ("live", r.data)
+    assert abs(live[0]["latitude"] - route[-1][0]) < 1e-6, ("live must be the LATEST ping", live[0])
+    print(f"6. Live map sees engineer (1 row) at {live[0]['latitude']:.4f},{live[0]['longitude']:.4f} on {live[0]['active_case_number']}")
 
     # 7. Staff reads the path + total km
     r = staff.get(f"/api/tracking/path/?case={case_id}")
