@@ -123,7 +123,14 @@ def _ensure_user_for_employee(emp):
 
     user = None
     if emp.email:
-        user = User.objects.filter(email__iexact=emp.email).first()
+        candidate = User.objects.filter(email__iexact=emp.email).first()
+        if candidate:
+            # Only reuse this user if it isn't already the login of a DIFFERENT
+            # employee (Employee.user is OneToOne — reusing it would raise an
+            # IntegrityError that leaves this employee with no login at all).
+            linked = getattr(candidate, "employee_profile", None)
+            if linked is None or linked.pk == emp.pk:
+                user = candidate
 
     if not user:
         base = (emp.email.split("@")[0] if emp.email else (emp.employee_name or "user")).lower()
@@ -171,16 +178,33 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
         if matched:
             branch_name = matched
 
-    # Try to find existing employee by email, emp_code, phone, or name
+    # Try to find existing employee by email, emp_code, phone, or name.
+    # matched_by_identity is True only for the reliable keys (email/code/phone);
+    # a name-only match is weak because names are not unique.
     emp = None
+    matched_by_identity = False
     if instance.email_id and instance.email_id.strip():
         emp = Employee.objects.filter(email__iexact=instance.email_id.strip()).first()
+        matched_by_identity = bool(emp)
     if not emp and instance.employee_id and instance.employee_id.strip():
         emp = Employee.objects.filter(emp_code=instance.employee_id.strip()).first()
+        matched_by_identity = bool(emp)
     if not emp and instance.mobile_number and instance.mobile_number.strip():
         emp = Employee.objects.filter(phone=instance.mobile_number.strip()).first()
+        matched_by_identity = bool(emp)
     if not emp and instance.employee_name and instance.employee_name.strip():
         emp = Employee.objects.filter(employee_name__iexact=instance.employee_name.strip()).first()
+
+    # A name-only match whose email OR phone CONFLICTS with the existing record
+    # is almost certainly a different person who happens to share the name —
+    # don't overwrite that person's identity; create a fresh employee instead.
+    if emp and not matched_by_identity:
+        onb_email = (instance.email_id or "").strip().lower()
+        onb_phone = (instance.mobile_number or "").strip()
+        if (onb_email and emp.email and emp.email.strip().lower() != onb_email) or (
+            onb_phone and emp.phone and emp.phone.strip() != onb_phone
+        ):
+            emp = None
 
     if emp:
         # Connect & update existing Employee

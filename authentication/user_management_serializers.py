@@ -7,6 +7,7 @@ PRIVILEGED_ROLES = ["admin", "superadmin"]
 class UserManagementSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=False)
     branch = serializers.SerializerMethodField()
+    plain_password = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -27,13 +28,26 @@ class UserManagementSerializer(serializers.ModelSerializer):
             "assigned_branch",
             "allowed_sections",
         )
-        # plain_password is populated by the server from `password`; clients read
-        # it (to copy/share) but never set it directly.
-        read_only_fields = ("date_joined", "is_staff", "plain_password")
+        read_only_fields = ("date_joined", "is_staff")
 
     def get_branch(self, obj):
         employee_profile = getattr(obj, "employee_profile", None)
         return employee_profile.branch if employee_profile else None
+
+    def get_plain_password(self, obj):
+        """Only reveal a viewable password when it is safe to: a superadmin may
+        see any account's; anyone else may see ONLY plain (employee) accounts'.
+        This stops a branch-scoped admin from reading an admin/superadmin's
+        plaintext credentials (privilege escalation)."""
+        request = self.context.get("request")
+        viewer = getattr(request, "user", None) if request else None
+        viewer_is_superadmin = bool(
+            viewer and (viewer.is_superuser or getattr(viewer, "role", None) == "superadmin")
+        )
+        target_privileged = obj.is_superuser or obj.is_staff or obj.role in PRIVILEGED_ROLES
+        if viewer_is_superadmin or not target_privileged:
+            return obj.plain_password
+        return None
 
     def validate_phone_number(self, value):
         if not value:

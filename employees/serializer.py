@@ -70,6 +70,11 @@ class EmployeeSerializer(serializers.ModelSerializer):
     def validate_work_lon(self, value):
         return value if value else None
 
+    def validate_salary(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("Salary cannot be negative.")
+        return value
+
     class Meta:
         model = Employee
         fields = '__all__'

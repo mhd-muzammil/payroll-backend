@@ -24,3 +24,12 @@ class PerformanceSerializer(serializers.ModelSerializer):
             'updated_at'
         ]
         read_only_fields = ['reviewer', 'overall_score', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        # Ratings are on a 0-10 scale; reject out-of-range values (they produce
+        # nonsense scores and previously could overflow overall_score).
+        for field in ('work_quality', 'attendance', 'communication', 'dependability'):
+            val = attrs.get(field)
+            if val is not None and (val < 0 or val > 10):
+                raise serializers.ValidationError({field: "Rating must be between 0 and 10."})
+        return attrs

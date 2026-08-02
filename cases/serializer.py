@@ -12,8 +12,14 @@ class CaseSerializer(serializers.ModelSerializer):
         fields = "__all__"
         # These are set by the server (dispatch action / lifecycle transitions),
         # never trusted from the client payload.
+        # status and assigned_to are driven ONLY by the assign / transition
+        # actions (which enforce the state machine + permissions), never by a
+        # raw create/update payload — otherwise a re-dispatched ticket could
+        # reopen a completed case or silently reassign it.
         read_only_fields = (
             "case_number",
+            "status",
+            "assigned_to",
             "assigned_by",
             "assigned_at",
             "started_at",

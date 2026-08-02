@@ -88,6 +88,15 @@ class CaseViewSet(viewsets.ModelViewSet):
         if ext:
             existing = Case.objects.filter(external_ref=ext).first()
             if existing:
+                # Enforce branch scope on the matched case so a branch-scoped
+                # admin can't reach across branches via a known external_ref.
+                branches = get_allowed_branches(request.user, "attendance")
+                if (
+                    "All" not in branches
+                    and existing.assigned_to
+                    and existing.assigned_to.branch not in branches
+                ):
+                    return Response({"detail": "Not allowed to modify this case."}, status=403)
                 serializer = self.get_serializer(existing, data=request.data, partial=True)
                 serializer.is_valid(raise_exception=True)
                 serializer.save()
@@ -149,12 +158,19 @@ class CaseViewSet(viewsets.ModelViewSet):
                 # Compare on digits-only, last 10, on BOTH sides — stored phones
                 # carry spaces/"+91" so a raw SQL endswith would miss. Employee
                 # tables are small, so a scan of phone-bearing rows is fine.
-                for emp in Employee.objects.exclude(phone__isnull=True).exclude(phone=""):
-                    if re.sub(r"\D", "", emp.phone)[-10:] == target:
-                        return emp
+                matches = [
+                    emp for emp in Employee.objects.exclude(phone__isnull=True).exclude(phone="")
+                    if re.sub(r"\D", "", emp.phone)[-10:] == target
+                ]
+                if len(matches) == 1:
+                    return matches[0]
+                # 0 or ambiguous (placeholder phones collide) -> fall through to name
         name = data.get("engineer_name")
         if name:
-            return Employee.objects.filter(employee_name__iexact=name).first()
+            # employee_name is NOT unique; refuse to guess between namesakes.
+            matches = list(Employee.objects.filter(employee_name__iexact=name.strip())[:2])
+            if len(matches) == 1:
+                return matches[0]
         return None
 
     @action(detail=True, methods=["post"])
@@ -372,9 +388,15 @@ class TrackingViewSet(viewsets.ViewSet):
             qs = qs.filter(engineer=employee)
 
         date_str = request.query_params.get("date")
-        target_date = parse_date(date_str) if date_str else None
-        if target_date:
-            qs = qs.filter(timestamp__date=target_date)
+        if date_str:
+            # parse_date raises ValueError on a format-valid but impossible date
+            # (e.g. 2026-13-01); treat that as a 400 rather than a 500.
+            try:
+                target_date = parse_date(date_str)
+            except ValueError:
+                return Response({"detail": "Invalid date."}, status=400)
+            if target_date:
+                qs = qs.filter(timestamp__date=target_date)
 
         pings = list(qs.order_by("timestamp"))
 

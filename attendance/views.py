@@ -641,7 +641,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                         if cell_val is not None:
                             try:
                                 dates_dict[date_obj]["present"] = float(cell_val)
-                            except ValueError:
+                            except (ValueError, TypeError):
                                 dates_dict[date_obj]["present"] = 0.0
 
         # 6. Database Transaction for bulk creation/updates
@@ -977,7 +977,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             }, status=403)
 
         # Check if already checked in today
-        today = timezone.now().date()
+        today = timezone.localdate()
         existing = Attendance.objects.filter(employee=employee, intime__date=today).first()
         
         if existing:
@@ -1026,7 +1026,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 "detail": f"You are too far from the office ({round(distance)}m). Must be within 50m to clock out."
             }, status=403)
 
-        today = timezone.now().date()
+        today = timezone.localdate()
         existing = Attendance.objects.filter(employee=employee, intime__date=today).first()
         
         if not existing:

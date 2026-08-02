@@ -44,10 +44,13 @@ def casual_leave_available(emp, year, month):
         if _months_of_service(doj, as_of) >= CASUAL_LEAVE_ELIGIBILITY_MONTHS:
             earned += 1
     earned = min(earned, CASUAL_LEAVE_ANNUAL_CAP)
-    used_before = Payslip.objects.filter(
-        employee=emp, year=year, month__lt=month
+    # Subtract CL used in every OTHER month of the year (exclude the current
+    # month so regenerating this slip doesn't double-count). Excluding only
+    # earlier months would let out-of-order generation blow past the annual cap.
+    used_other = Payslip.objects.filter(employee=emp, year=year).exclude(
+        month=month
     ).aggregate(s=Sum("casual_leave_used"))["s"] or Decimal(0)
-    avail = Decimal(earned) - Decimal(used_before)
+    avail = Decimal(earned) - Decimal(used_other)
     return avail if avail > 0 else Decimal(0)
 
 from .models import Payslip, BranchFinancial
@@ -306,8 +309,13 @@ class PayslipViewSet(viewsets.ModelViewSet):
         try:
             month = int(month)
             year = int(year)
-        except ValueError:
+        except (ValueError, TypeError):
             return Response({"error": "Invalid month or year format."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Guard the range so datetime.date(year, month, ...) below can't raise a
+        # 500 on e.g. month=13.
+        if not (1 <= month <= 12) or not (2000 <= year <= 3000):
+            return Response({"error": "Month must be 1-12 and year must be valid."}, status=status.HTTP_400_BAD_REQUEST)
 
         # 1. Get previous month/year to calculate days from previous month's 25th to current month's 24th
         if month == 1:
@@ -867,7 +875,7 @@ class PayslipViewSet(viewsets.ModelViewSet):
                     </tr>
                     <tr>
                         <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Conveyance / Other Allowances</td>
-                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace;">{float(payslip.earned_conveyance + payslip.earned_child_edu + payslip.earned_personal + payslip.earned_other_earnings):,.2f}</td>
+                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace;">{float(payslip.earned_conveyance + payslip.earned_child_edu + payslip.earned_personal_allowance + payslip.earned_other_earnings):,.2f}</td>
                     </tr>
                     <tr style="background-color: #f9fafb; font-weight: bold;">
                         <td style="padding: 10px; border-bottom: 2px solid #e5e7eb; color: #4f46e5;">Gross Earnings (A)</td>
@@ -875,7 +883,7 @@ class PayslipViewSet(viewsets.ModelViewSet):
                     </tr>
                     <tr>
                         <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; color: #dc2626;">Total Deductions (EPF, ESI, TDS) (B)</td>
-                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace; color: #dc2626;">{float(payslip.total_deductions):,.2f}</td>
+                        <td style="padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; font-family: monospace; color: #dc2626;">{float(payslip.gross_deductions):,.2f}</td>
                     </tr>
                     <tr style="background-color: #f0fdf4; font-weight: bold; border-top: 2px solid #bbf7d0;">
                         <td style="padding: 12px; font-size: 15px; color: #166534;">NET TAKE HOME SALARY</td>

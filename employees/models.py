@@ -104,7 +104,9 @@ class Performance(models.Model):
     attendance = models.IntegerField(default=5)
     communication = models.IntegerField(default=5)
     dependability = models.IntegerField(default=5)
-    overall_score = models.DecimalField(max_digits=3, decimal_places=2, default=5.0)
+    # max_digits=5 so a perfect 10-scale average (10.00) fits; max_digits=3
+    # previously overflowed (DataError/500) whenever the average reached 10.
+    overall_score = models.DecimalField(max_digits=5, decimal_places=2, default=5.0)
     comments = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

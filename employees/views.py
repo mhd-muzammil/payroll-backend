@@ -43,12 +43,27 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         if role == "employee":
             raise PermissionDenied("Employees cannot modify employee records.")
 
+    def _guard_branch(self, request):
+        """A branch-scoped admin/HR may only create or move an employee within
+        their allowed branch(es) — otherwise they could plant/move records into
+        branches they don't manage."""
+        branches = get_allowed_branches(self.request.user, "employees")
+        if "All" in branches:
+            return
+        target_branch = request.data.get("branch")
+        if target_branch and target_branch not in branches:
+            raise PermissionDenied(
+                f"You can only manage employees in your branch(es): {', '.join(branches) or 'none'}."
+            )
+
     def create(self, request, *args, **kwargs):
         self._guard_write()
+        self._guard_branch(request)
         return super().create(request, *args, **kwargs)
 
     def update(self, request, *args, **kwargs):
         self._guard_write()
+        self._guard_branch(request)
         return super().update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
