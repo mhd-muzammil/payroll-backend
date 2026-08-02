@@ -107,6 +107,55 @@ class Candidate(models.Model):
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
+
+def _ensure_user_for_employee(emp):
+    """Create + link a login User for an employee that has none, so an onboarded
+    person is provisioned everywhere. Prefers an existing user matched by email;
+    otherwise generates a unique username + a temp password (stored as
+    plain_password so an admin can copy/share it from the Users section). Safe to
+    call repeatedly — a no-op once the employee already has a user."""
+    import re
+    import secrets
+    from authentication.models import User
+
+    if getattr(emp, "user_id", None):
+        return
+
+    user = None
+    if emp.email:
+        user = User.objects.filter(email__iexact=emp.email).first()
+
+    if not user:
+        base = (emp.email.split("@")[0] if emp.email else (emp.employee_name or "user")).lower()
+        base = re.sub(r"[^a-z0-9_.]", "", base.replace(" ", "")) or "user"
+        username = base
+        i = 1
+        while User.objects.filter(username=username).exists():
+            username = f"{base}_{i}"
+            i += 1
+        first = "User"
+        if emp.employee_name and emp.employee_name.strip():
+            first = re.sub(r"[^a-zA-Z]", "", emp.employee_name.strip().split()[0]).capitalize() or "User"
+        temp_pwd = f"{first}@{secrets.randbelow(9000) + 1000}"
+        try:
+            user = User.objects.create_user(
+                username=username,
+                email=emp.email or f"{username}@company.com",
+                first_name=emp.employee_name or "",
+                role="employee",
+                password=temp_pwd,
+                plain_password=temp_pwd,
+            )
+        except Exception:
+            return
+
+    emp.user = user
+    try:
+        emp.save(update_fields=["user"])
+    except Exception:
+        pass
+
+
 @receiver(post_save, sender=Onboarding)
 def sync_onboarding_to_employee(sender, instance, created, **kwargs):
     """Automatically connects or creates corresponding Employee record upon Onboarding save."""
@@ -148,6 +197,8 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
             emp.role = instance.designation.strip()
         if branch_name:
             emp.branch = branch_name
+        if instance.date_of_joining:
+            emp.date_of_joining = instance.date_of_joining
         emp.status = 'active'
         try:
             emp.save()
@@ -156,7 +207,7 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
     else:
         # Create new Employee
         try:
-            Employee.objects.create(
+            emp = Employee.objects.create(
                 employee_name=instance.employee_name.strip() if instance.employee_name else "New Employee",
                 emp_code=instance.employee_id.strip() if instance.employee_id else None,
                 email=instance.email_id.strip() if instance.email_id else None,
@@ -165,13 +216,20 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
                 role=instance.designation.strip() if instance.designation else 'Staff',
                 branch=branch_name,
                 salary=Decimal('0.00'),
-                status='active'
+                status='active',
+                date_of_joining=instance.date_of_joining,
             )
         except IntegrityError:
-            existing = Employee.objects.filter(employee_name__iexact=instance.employee_name.strip()).first()
-            if existing:
-                existing.status = 'active'
+            emp = Employee.objects.filter(employee_name__iexact=instance.employee_name.strip()).first()
+            if emp:
+                emp.status = 'active'
                 try:
-                    existing.save()
+                    emp.save()
                 except Exception:
                     pass
+
+    # Ensure the employee has a linked login user, so onboarding auto-provisions
+    # across all sections: the account shows in Users (with a shareable password),
+    # the person can check in for Attendance, and they are picked up by Payroll.
+    if emp:
+        _ensure_user_for_employee(emp)
