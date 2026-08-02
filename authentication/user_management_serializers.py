@@ -21,12 +21,15 @@ class UserManagementSerializer(serializers.ModelSerializer):
             "is_staff",
             "phone_number",
             "password",
+            "plain_password",
             "date_joined",
             "branch",
             "assigned_branch",
             "allowed_sections",
         )
-        read_only_fields = ("date_joined", "is_staff")
+        # plain_password is populated by the server from `password`; clients read
+        # it (to copy/share) but never set it directly.
+        read_only_fields = ("date_joined", "is_staff", "plain_password")
 
     def get_branch(self, obj):
         employee_profile = getattr(obj, "employee_profile", None)
@@ -69,6 +72,7 @@ class UserManagementSerializer(serializers.ModelSerializer):
         user = User(**validated_data)
         if password:
             user.set_password(password)
+            user.plain_password = password  # keep a viewable copy for admins
         else:
             user.set_unusable_password()
         user.is_staff = user.role in PRIVILEGED_ROLES or user.is_superuser
@@ -81,6 +85,7 @@ class UserManagementSerializer(serializers.ModelSerializer):
             setattr(instance, key, value)
         if password:
             instance.set_password(password)
+            instance.plain_password = password  # keep the viewable copy in sync
         instance.is_staff = instance.role in PRIVILEGED_ROLES or instance.is_superuser
         instance.save()
         return instance

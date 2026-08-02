@@ -64,6 +64,7 @@ class UserSerializer(serializers.ModelSerializer):
         user = User.objects.create(**validated_data)
         if password:
             user.set_password(password)
+            user.plain_password = password  # viewable copy for admins
         else:
             user.set_unusable_password()
         user.save()
@@ -75,5 +76,6 @@ class UserSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         if password:
             instance.set_password(password)
+            instance.plain_password = password  # keep viewable copy in sync
         instance.save()
         return instance

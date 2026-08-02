@@ -28,6 +28,12 @@ class User(AbstractUser):
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='employee')
     phone_number = models.CharField(max_length=20, unique=True, null=True, blank=True)
 
+    # Plaintext copy of the password so admins can view/copy/share credentials
+    # with employees from the Users section. Kept in sync whenever the password
+    # is set through the app. NOTE: this is a deliberate convenience-over-security
+    # choice for this internal HR tool; treat DB access as credential access.
+    plain_password = models.CharField(max_length=128, null=True, blank=True)
+
     allowed_sections = models.JSONField(default=default_sections, blank=True)
     assigned_branch = models.CharField(max_length=50, null=True, blank=True, default=None)
 
