@@ -57,7 +57,11 @@ class Employee(models.Model):
     work_lat = models.FloatField(null=True, blank=True, help_text="Allowed work location latitude")
     work_lon = models.FloatField(null=True, blank=True, help_text="Allowed work location longitude")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    # `joining_date` is auto-stamped at record creation and is NOT the real hire
+    # date. `date_of_joining` is the real hire date (editable, from onboarding or
+    # HR) and is what casual-leave accrual (6-month rule) is computed from.
     joining_date = models.DateField(auto_now_add=True)
+    date_of_joining = models.DateField(null=True, blank=True, help_text="Real hire date; used for casual leave accrual")
 
     def __str__(self):
         return self.employee_name

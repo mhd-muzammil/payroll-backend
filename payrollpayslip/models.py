@@ -16,6 +16,9 @@ class Payslip(models.Model):
     total_days = models.IntegerField(default=30)
     lop_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     off_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
+    # Absent days paid via the employee's earned casual-leave balance this period.
+    # Like off_days, these offset LOP so they are NOT deducted.
+    casual_leave_used = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     paid_days = models.DecimalField(max_digits=5, decimal_places=2, default=30.0)
     
     # Gross Salary Components (Defined in Structure)

@@ -1,4 +1,4 @@
-from django.db.models import Q
+from django.db.models import Q, Sum
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -7,6 +7,48 @@ from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 from decimal import Decimal, ROUND_HALF_UP
 import calendar
+import datetime
+
+# Casual leave: employees earn 1 CL per month once they have completed 6 months
+# of service (probation), capped per calendar year.
+CASUAL_LEAVE_ANNUAL_CAP = 12
+CASUAL_LEAVE_ELIGIBILITY_MONTHS = 6
+
+
+def _months_of_service(doj, as_of):
+    """Whole completed months of service from date-of-joining `doj` to `as_of`."""
+    if not doj:
+        return 0
+    months = (as_of.year - doj.year) * 12 + (as_of.month - doj.month)
+    if as_of.day < doj.day:
+        months -= 1
+    return max(0, months)
+
+
+def casual_leave_available(emp, year, month):
+    """CL balance available to offset LOP for this employee's payslip period.
+
+    Entitlement = 1 CL for each month of the calendar `year` (up to `month`) in
+    which the employee had completed >= 6 months of service, capped at the annual
+    cap. Balance = entitlement minus CL already used earlier in the same year.
+    Returns 0 for employees with no real date_of_joining (feature is opt-in per
+    employee, so existing employees are unaffected until HR sets their DOJ).
+    """
+    doj = emp.date_of_joining
+    if not doj:
+        return Decimal(0)
+    earned = 0
+    for m in range(1, month + 1):
+        last_day = calendar.monthrange(year, m)[1]
+        as_of = datetime.date(year, m, last_day)
+        if _months_of_service(doj, as_of) >= CASUAL_LEAVE_ELIGIBILITY_MONTHS:
+            earned += 1
+    earned = min(earned, CASUAL_LEAVE_ANNUAL_CAP)
+    used_before = Payslip.objects.filter(
+        employee=emp, year=year, month__lt=month
+    ).aggregate(s=Sum("casual_leave_used"))["s"] or Decimal(0)
+    avail = Decimal(earned) - Decimal(used_before)
+    return avail if avail > 0 else Decimal(0)
 
 from .models import Payslip, BranchFinancial
 from .serializer import PayslipSerializer, BranchFinancialSerializer
@@ -19,7 +61,7 @@ def _q(val):
     return Decimal(val).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
-def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=None, off_days=0):
+def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=None, off_days=0, casual_leave_days=0):
     """Compute every earnings/deduction/net field for one employee given the
     period length, LOP (loss-of-pay) days and paid off-days.
 
@@ -38,6 +80,7 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
     total_days = Decimal(total_days)
     lop_days = Decimal(lop_days)
     off_days = Decimal(off_days)
+    casual_leave_days = Decimal(casual_leave_days)
     if lop_days < 0:
         lop_days = Decimal(0)
     if lop_days > total_days:
@@ -46,9 +89,18 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         off_days = Decimal(0)
     if off_days > lop_days:
         off_days = lop_days
+    # Casual leave (paid) offsets the LOP that remains after off-days, capped so
+    # off + casual can never exceed the LOP being offset.
+    if casual_leave_days < 0:
+        casual_leave_days = Decimal(0)
+    if casual_leave_days > (lop_days - off_days):
+        casual_leave_days = lop_days - off_days
+    if casual_leave_days < 0:
+        casual_leave_days = Decimal(0)
 
-    # Off days are paid, so they cancel out an equal number of LOP days.
-    effective_lop = lop_days - off_days
+    # Off days and casual leave are paid, so they cancel out an equal number of
+    # LOP days.
+    effective_lop = lop_days - off_days - casual_leave_days
     if effective_lop < 0:
         effective_lop = Decimal(0)
 
@@ -162,6 +214,7 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         'total_days': int(total_days),
         'lop_days': lop_days,
         'off_days': off_days,
+        'casual_leave_used': casual_leave_days,
         'paid_days': paid_days,
 
         'gross_basic': gross_basic,
@@ -306,8 +359,14 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 status='Absent'
             ).count())
 
+            # 2b. Offset LOP with the employee's earned casual-leave balance
+            # (6-month rule, from their real date_of_joining). CL days become
+            # paid, so they are not deducted. Zero for employees without a DOJ.
+            cl_available = casual_leave_available(emp, year, month)
+            cl_apply = min(cl_available, lop_days)
+
             # 3-6. All earnings/deductions/net math lives in one shared helper.
-            defaults = compute_payslip_fields(emp, total_days, lop_days)
+            defaults = compute_payslip_fields(emp, total_days, lop_days, casual_leave_days=cl_apply)
             defaults['status'] = 'Generated'
 
             # Save / Update Record
@@ -393,6 +452,16 @@ class PayslipViewSet(viewsets.ModelViewSet):
             else:
                 lop_days = Decimal(payslip.lop_days or 0)
 
+            # Casual leave: when an absolute paid_days is supplied that figure is
+            # final, so CL must not further reduce LOP. Otherwise preserve the
+            # slip's current CL (auto-applied at generation) unless overridden.
+            if request.data.get('paid_days') is not None:
+                cl_days = Decimal(0)
+            elif request.data.get('casual_leave_used') is not None:
+                cl_days = to_decimal(request.data.get('casual_leave_used'), 'casual_leave_used')
+            else:
+                cl_days = Decimal(payslip.casual_leave_used or 0)
+
             # Optional other-deduction override.
             other_override = None
             if request.data.get('other_deduction') is not None:
@@ -418,6 +487,7 @@ class PayslipViewSet(viewsets.ModelViewSet):
             payslip.employee, total_days, lop_days,
             other_deduction_override=other_override,
             off_days=off_days,
+            casual_leave_days=cl_days,
         )
         for field, value in defaults.items():
             setattr(payslip, field, value)
