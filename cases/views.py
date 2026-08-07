@@ -167,10 +167,19 @@ class CaseViewSet(viewsets.ModelViewSet):
                 # 0 or ambiguous (placeholder phones collide) -> fall through to name
         name = data.get("engineer_name")
         if name:
+            nm = name.strip()
             # employee_name is NOT unique; refuse to guess between namesakes.
-            matches = list(Employee.objects.filter(employee_name__iexact=name.strip())[:2])
+            matches = list(Employee.objects.filter(employee_name__iexact=nm)[:2])
             if len(matches) == 1:
                 return matches[0]
+            if not matches and nm:
+                # Tolerate a trailing surname/initial the other system omits
+                # ("Praveen" in OpenCall vs "Praveen S" in Payroll) — but ONLY
+                # when it resolves to exactly ONE employee, so real namesakes
+                # (e.g. several "Vijayakumar") are never guessed.
+                prefix = list(Employee.objects.filter(employee_name__istartswith=nm + " ")[:2])
+                if len(prefix) == 1:
+                    return prefix[0]
         return None
 
     @action(detail=True, methods=["post"])
