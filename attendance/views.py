@@ -738,7 +738,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
                         user_obj = User.objects.create_user(
                             username=username,
-                            email=f"{username}@company.com",
+                            email="",
                             first_name=name,
                             role='employee',
                             password=temp_pwd,
@@ -791,7 +791,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
                             user_obj = User.objects.create_user(
                                 username=username,
-                                email=f"{username}@company.com",
+                                email="",
                                 first_name=name,
                                 role='employee',
                                 password=temp_pwd,

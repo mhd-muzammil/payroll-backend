@@ -147,7 +147,7 @@ def _ensure_user_for_employee(emp):
         try:
             user = User.objects.create_user(
                 username=username,
-                email=emp.email or f"{username}@company.com",
+                email=emp.email or "",
                 first_name=emp.employee_name or "",
                 role="employee",
                 password=temp_pwd,
