@@ -193,7 +193,13 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
         emp = Employee.objects.filter(phone=instance.mobile_number.strip()).first()
         matched_by_identity = bool(emp)
     if not emp and instance.employee_name and instance.employee_name.strip():
-        emp = Employee.objects.filter(employee_name__iexact=instance.employee_name.strip()).first()
+        nm = instance.employee_name.strip()
+        # Prefer a match WITHIN the onboarding's branch (same name in another
+        # branch is a different person); fall back to a plain name match only if
+        # there is none in this branch.
+        emp = Employee.objects.filter(employee_name__iexact=nm, branch=branch_name).first()
+        if not emp:
+            emp = Employee.objects.filter(employee_name__iexact=nm).first()
 
     # A name-only match whose email OR phone CONFLICTS with the existing record
     # is almost certainly a different person who happens to share the name —
