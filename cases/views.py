@@ -60,7 +60,16 @@ class CaseViewSet(viewsets.ModelViewSet):
             employee = _get_employee(user)
             if not employee:
                 return qs.none()
-            return qs.filter(assigned_to=employee)
+            # Show ONLY today's still-open assigned cases — the engineer's
+            # to-do for today. Older days (by assigned date) and completed/
+            # cancelled cases are HIDDEN from this list (never deleted), so the
+            # view stays "today's assigned" without touching any data.
+            active_statuses = ["open", "assigned", "accepted", "on_the_way", "reached", "working"]
+            return qs.filter(
+                assigned_to=employee,
+                assigned_at__date=timezone.localdate(),
+                status__in=active_statuses,
+            )
 
         # Staff: branch-scoped by the assigned engineer's branch. Unassigned
         # cases have no branch yet, so include them too — otherwise a branch
