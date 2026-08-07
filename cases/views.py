@@ -252,6 +252,14 @@ class CaseViewSet(viewsets.ModelViewSet):
         if not isinstance(items, list):
             return Response({"detail": 'Body must be {"cases": [ ... ]}.'}, status=400)
 
+        # Mirror mode (default on): after upserting the incoming set, any OTHER
+        # previously-synced case is marked CANCELLED (NOT deleted) so each
+        # engineer's list mirrors exactly the current "Assigned" set. Send
+        # {"mirror": false} to disable. Non-destructive — cancelled cases stay
+        # in the DB, just hidden from the engineer's active list.
+        mirror = request.data.get("mirror", True)
+        incoming_refs = set()
+
         valid_priorities = dict(Case.PRIORITY_CHOICES)
         created = updated = assigned = skipped = 0
         details = []
@@ -263,6 +271,8 @@ class CaseViewSet(viewsets.ModelViewSet):
                 continue
 
             ext = (raw.get("external_ref") or "").strip()
+            if ext:
+                incoming_refs.add(ext)
             existing = Case.objects.filter(external_ref=ext).first() if ext else None
             case = existing or Case()
 
@@ -316,11 +326,28 @@ class CaseViewSet(viewsets.ModelViewSet):
                 "status": case.status,
             })
 
+        cancelled = 0
+        # Mirror: a synced case whose ticket is NO LONGER in the incoming
+        # "Assigned" set is stale — mark it cancelled (kept in the DB, just
+        # hidden from the engineer's active list). NON-destructive. Only synced
+        # cases (external_ref set) are ever touched, never manually-created
+        # ones. Guarded: full-access (All-branch) caller + non-empty incoming
+        # set, so an empty/failed sync never cancels anything.
+        if mirror and incoming_refs and "All" in get_allowed_branches(request.user, "attendance"):
+            stale = (
+                Case.objects.exclude(external_ref="")
+                .exclude(external_ref__in=incoming_refs)
+                .exclude(status="cancelled")
+            )
+            cancelled = stale.count()
+            stale.update(status="cancelled")
+
         return Response({
             "created": created,
             "updated": updated,
             "assigned": assigned,
             "skipped": skipped,
+            "cancelled": cancelled,
             "total": len(items),
             "details": details,
         })
