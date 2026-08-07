@@ -118,7 +118,23 @@ def _ensure_user_for_employee(emp):
     import secrets
     from authentication.models import User
 
+    # Already has a login: keep the User in sync with the Employee (email + name)
+    # so onboarding details align across the User and Employee sections too.
     if getattr(emp, "user_id", None):
+        existing = getattr(emp, "user", None)
+        if existing:
+            changed = False
+            if emp.email and (existing.email or "").lower() != emp.email.lower():
+                existing.email = emp.email
+                changed = True
+            if emp.employee_name and existing.first_name != emp.employee_name:
+                existing.first_name = emp.employee_name
+                changed = True
+            if changed:
+                try:
+                    existing.save(update_fields=["email", "first_name"])
+                except Exception:
+                    pass
         return
 
     user = None
