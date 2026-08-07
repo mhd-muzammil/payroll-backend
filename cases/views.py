@@ -271,9 +271,10 @@ class CaseViewSet(viewsets.ModelViewSet):
 
             engineer = self._resolve_engineer(raw)
             if engineer is None:
-                # Save the case (so it exists / stays idempotent) but leave it
-                # unassigned — it just won't show for any engineer yet.
-                case.save()
+                # Do NOT create an orphan case for an engineer we can't match —
+                # an unassigned case just clutters Payroll and shows to nobody.
+                # Skip it; a later sync picks it up once that engineer exists in
+                # Payroll (e.g. after onboarding).
                 skipped += 1
                 details.append({"external_ref": ext, "result": "skipped", "reason": "engineer not matched"})
                 continue
