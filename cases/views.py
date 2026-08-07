@@ -198,6 +198,114 @@ class CaseViewSet(viewsets.ModelViewSet):
         case.save()
         return Response(self.get_serializer(case).data)
 
+    # Normalised external status hint -> Payroll status. Lets a backfill mark a
+    # ticket that is already finished in the originating system (OpenCall) as
+    # completed/cancelled in Payroll, so historical calls don't clutter the
+    # engineer's ACTIVE list while still appearing in their case history.
+    _EXTERNAL_STATUS_MAP = {
+        "completed": "completed",
+        "closed": "completed",
+        "done": "completed",
+        "cancelled": "cancelled",
+        "canceled": "cancelled",
+        "assigned": "assigned",
+        "active": "assigned",
+        "open": "assigned",
+        "scheduled": "assigned",
+    }
+
+    @action(detail=False, methods=["post"])
+    def bulk_dispatch(self, request):
+        """Dispatch MANY cases in one call (OpenCall "Sync to Payroll" backfill).
+
+        Body: {"cases": [ { external_ref, customer_name, customer_phone, title,
+        description, address, priority, status?, engineer_id?/engineer_email?/
+        engineer_phone?/engineer_name? }, ... ] }
+
+        Each item is idempotent on external_ref (re-syncing updates the one case,
+        never duplicates), resolves the engineer the same way /assign does, and
+        optionally maps an external status so already-finished calls land as
+        completed. An item whose engineer can't be matched is saved UNASSIGNED
+        and reported in `skipped` rather than failing the whole batch."""
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Only admin/HR can dispatch cases."}, status=403)
+
+        items = request.data.get("cases")
+        if not isinstance(items, list):
+            return Response({"detail": 'Body must be {"cases": [ ... ]}.'}, status=400)
+
+        valid_priorities = dict(Case.PRIORITY_CHOICES)
+        created = updated = assigned = skipped = 0
+        details = []
+
+        for raw in items:
+            if not isinstance(raw, dict):
+                skipped += 1
+                details.append({"external_ref": None, "result": "skipped", "reason": "not an object"})
+                continue
+
+            ext = (raw.get("external_ref") or "").strip()
+            existing = Case.objects.filter(external_ref=ext).first() if ext else None
+            case = existing or Case()
+
+            case.external_ref = ext
+            case.customer_name = (raw.get("customer_name") or case.customer_name or "Unknown")[:150]
+            case.customer_phone = (raw.get("customer_phone") or case.customer_phone or "")[:20]
+            case.title = (raw.get("title") or case.title or "Service call")[:200]
+            if raw.get("description") is not None:
+                case.description = raw.get("description") or ""
+            if raw.get("address") is not None:
+                case.address = raw.get("address") or ""
+            pr = raw.get("priority")
+            if pr in valid_priorities:
+                case.priority = pr
+
+            engineer = self._resolve_engineer(raw)
+            if engineer is None:
+                # Save the case (so it exists / stays idempotent) but leave it
+                # unassigned — it just won't show for any engineer yet.
+                case.save()
+                skipped += 1
+                details.append({"external_ref": ext, "result": "skipped", "reason": "engineer not matched"})
+                continue
+
+            is_new = case.pk is None
+            case.assigned_to = engineer
+            case.assigned_by = request.user
+            if case.assigned_at is None:
+                case.assigned_at = timezone.now()
+
+            desired = self._EXTERNAL_STATUS_MAP.get((raw.get("status") or "").strip().lower())
+            if desired:
+                case.status = desired
+                if desired == "completed" and case.completed_at is None:
+                    case.completed_at = timezone.now()
+            elif case.status == "open":
+                case.status = "assigned"
+
+            case.save()
+            assigned += 1
+            if is_new:
+                created += 1
+            else:
+                updated += 1
+            details.append({
+                "external_ref": ext,
+                "result": "assigned",
+                "case_number": case.case_number,
+                "engineer": engineer.employee_name,
+                "status": case.status,
+            })
+
+        return Response({
+            "created": created,
+            "updated": updated,
+            "assigned": assigned,
+            "skipped": skipped,
+            "total": len(items),
+            "details": details,
+        })
+
     def _engineer_transition(self, request, pk, allowed_from, new_status, stamp_field=None, extra=None):
         """Shared helper for the field-driven status transitions. Only the
         engineer the case is assigned to (or staff) may move it."""
