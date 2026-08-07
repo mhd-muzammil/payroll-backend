@@ -7,6 +7,7 @@ from employees.models import Employee
 class AttendanceSerializer(serializers.ModelSerializer):
     employee_id = serializers.IntegerField(source="employee.id", read_only=True)
     branch = serializers.SerializerMethodField()
+    email = serializers.SerializerMethodField()
 
     class Meta:
         model = Attendance
@@ -17,6 +18,11 @@ class AttendanceSerializer(serializers.ModelSerializer):
         if obj.employee:
             return obj.employee.branch
         return "Chennai"
+
+    def get_email(self, obj):
+        # Expose the employee's email so the attendance view can show it and
+        # duplicate/namesake rows can be told apart.
+        return obj.employee.email if obj.employee else None
 
     def _get_employee_for_user(self, user):
         try:
