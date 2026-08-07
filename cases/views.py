@@ -252,13 +252,15 @@ class CaseViewSet(viewsets.ModelViewSet):
         if not isinstance(items, list):
             return Response({"detail": 'Body must be {"cases": [ ... ]}.'}, status=400)
 
-        # Mirror mode (default on): after upserting the incoming set, any OTHER
-        # previously-synced case is marked CANCELLED (NOT deleted) so each
-        # engineer's list mirrors exactly the current "Assigned" set. Send
-        # {"mirror": false} to disable. Non-destructive — cancelled cases stay
-        # in the DB, just hidden from the engineer's active list.
+        # Mirror mode (default on): after upserting, any OTHER previously-synced
+        # case whose ticket was NOT successfully assigned in THIS call is marked
+        # CANCELLED (NOT deleted) so each engineer's list mirrors exactly the
+        # current "Assigned" set. We track the refs actually ASSIGNED (not merely
+        # received) so a ticket that moved to an engineer we can't match in
+        # Payroll doesn't linger on its old engineer. Send {"mirror": false} to
+        # disable. Non-destructive — cancelled cases stay in the DB, just hidden.
         mirror = request.data.get("mirror", True)
-        incoming_refs = set()
+        assigned_refs = set()
 
         valid_priorities = dict(Case.PRIORITY_CHOICES)
         created = updated = assigned = skipped = 0
@@ -271,8 +273,6 @@ class CaseViewSet(viewsets.ModelViewSet):
                 continue
 
             ext = (raw.get("external_ref") or "").strip()
-            if ext:
-                incoming_refs.add(ext)
             existing = Case.objects.filter(external_ref=ext).first() if ext else None
             case = existing or Case()
 
@@ -313,6 +313,8 @@ class CaseViewSet(viewsets.ModelViewSet):
                 case.status = "assigned"
 
             case.save()
+            if ext:
+                assigned_refs.add(ext)
             assigned += 1
             if is_new:
                 created += 1
@@ -327,16 +329,18 @@ class CaseViewSet(viewsets.ModelViewSet):
             })
 
         cancelled = 0
-        # Mirror: a synced case whose ticket is NO LONGER in the incoming
-        # "Assigned" set is stale — mark it cancelled (kept in the DB, just
-        # hidden from the engineer's active list). NON-destructive. Only synced
-        # cases (external_ref set) are ever touched, never manually-created
-        # ones. Guarded: full-access (All-branch) caller + non-empty incoming
-        # set, so an empty/failed sync never cancels anything.
-        if mirror and incoming_refs and "All" in get_allowed_branches(request.user, "attendance"):
+        # Mirror: a synced case whose ticket was NOT assigned in THIS call is
+        # stale — mark it cancelled (kept in the DB, just hidden from the
+        # engineer's active list). Keyed on assigned_refs (tickets actually
+        # assigned now), so a ticket that moved to an unmatched engineer stops
+        # lingering on its old one. NON-destructive. Only synced cases
+        # (external_ref set) are ever touched, never manually-created ones.
+        # Guarded: full-access (All-branch) caller + at least one assignment, so
+        # an empty/failed sync never cancels anything.
+        if mirror and assigned_refs and "All" in get_allowed_branches(request.user, "attendance"):
             stale = (
                 Case.objects.exclude(external_ref="")
-                .exclude(external_ref__in=incoming_refs)
+                .exclude(external_ref__in=assigned_refs)
                 .exclude(status="cancelled")
             )
             cancelled = stale.count()
