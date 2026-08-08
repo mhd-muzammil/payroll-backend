@@ -128,6 +128,50 @@ class EngineerAlias(models.Model):
         return f"{self.external_name} -> {self.employee.employee_name}"
 
 
+class DutySession(models.Model):
+    """One stretch of an engineer being on duty, from Start Duty to Stop Duty.
+
+    Duty is a STATE the engineer declares, not something inferred from whether
+    their phone happens to be sending GPS. A locked phone, a backgrounded tab or
+    a dead signal stops the pings, but the engineer is still on duty — so the
+    live view can say "on duty, no signal for 15m" instead of dropping them off
+    the board as if they had gone home. It also gives a record of who was on
+    duty, for how long, and how far they travelled in that stretch.
+    """
+
+    # A session left open this long is treated as forgotten and auto-closed, so
+    # one missed Stop Duty doesn't show an engineer on duty for days.
+    MAX_DURATION_HOURS = 16
+
+    engineer = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="duty_sessions",
+    )
+    started_at = models.DateTimeField(default=timezone.now, db_index=True)
+    # NULL means the engineer is still on duty right now.
+    ended_at = models.DateTimeField(null=True, blank=True)
+    # Set when MAX_DURATION_HOURS closed it instead of the engineer.
+    auto_closed = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [
+            models.Index(fields=["engineer", "ended_at"]),
+        ]
+
+    @property
+    def is_open(self):
+        return self.ended_at is None
+
+    def duration_minutes(self):
+        return int(((self.ended_at or timezone.now()) - self.started_at).total_seconds() // 60)
+
+    def __str__(self):
+        state = "on duty" if self.is_open else "ended"
+        return f"{self.engineer.employee_name} {state} since {self.started_at:%Y-%m-%d %H:%M}"
+
+
 class LocationPing(models.Model):
     """One live GPS reading sent by an engineer's app while on duty. A trail of
     these draws the travel path; the latest per engineer is their live position.

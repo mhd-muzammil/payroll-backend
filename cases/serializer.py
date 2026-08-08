@@ -45,17 +45,32 @@ class LocationPingSerializer(serializers.ModelSerializer):
 
 
 class LiveEngineerSerializer(serializers.Serializer):
-    """Read-only shape for the admin live map: one row per engineer with their
-    latest known position and what they are currently working on."""
+    """Read-only shape for the admin live map: one row per ON-DUTY engineer with
+    their last known position, how long they have been on duty and how far they
+    have travelled on it.
+
+    Position fields are nullable: an engineer can be on duty with no fix yet, or
+    with an old one. `stale` says the position is not current; `on_duty` still
+    being true is the point — they have not gone home, their phone has just
+    stopped reporting.
+    """
 
     engineer_id = serializers.IntegerField()
     engineer_name = serializers.CharField()
     branch = serializers.CharField(allow_null=True)
-    latitude = serializers.FloatField()
-    longitude = serializers.FloatField()
+
+    on_duty = serializers.BooleanField()
+    duty_started_at = serializers.DateTimeField()
+    duty_minutes = serializers.IntegerField()
+    stale = serializers.BooleanField()
+    last_seen_minutes = serializers.IntegerField(allow_null=True)
+    distance_km = serializers.FloatField()
+
+    latitude = serializers.FloatField(allow_null=True)
+    longitude = serializers.FloatField(allow_null=True)
     accuracy = serializers.FloatField(allow_null=True)
     speed = serializers.FloatField(allow_null=True)
     status = serializers.CharField(allow_blank=True)
-    timestamp = serializers.DateTimeField()
+    timestamp = serializers.DateTimeField(allow_null=True)
     active_case_id = serializers.IntegerField(allow_null=True)
     active_case_number = serializers.CharField(allow_null=True)

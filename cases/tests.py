@@ -15,7 +15,7 @@ from rest_framework.test import APIClient
 
 from employees.models import Employee
 
-from .models import Case, EngineerAlias
+from .models import Case, DutySession, EngineerAlias, LocationPing
 
 User = get_user_model()
 
@@ -408,3 +408,188 @@ class CaseSyncTests(TestCase):
         )
         self.assertEqual(res.data["assigned"], 1)
         self.assertEqual(res.data["unreachable_engineers"], ["Sivaraj"])
+
+
+class DutyAndLiveTrackingTests(TestCase):
+    """Duty is a state the engineer DECLARES. The live board must follow that
+    declaration, not the phone's signal — an engineer whose phone stopped
+    reporting is still on duty, just not visible."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            username="ops", password="x", role="admin", is_staff=True
+        )
+        self.engineer_user = User.objects.create_user(
+            username="praveen", password="x", role="employee"
+        )
+        self.engineer = Employee.objects.create(
+            user=self.engineer_user, employee_name="Praveen S", branch="Chennai", salary=0
+        )
+        self.admin_client = APIClient()
+        self.admin_client.force_authenticate(self.admin)
+        self.eng = APIClient()
+        self.eng.force_authenticate(self.engineer_user)
+
+    def _live(self):
+        res = self.admin_client.get("/api/tracking/live/")
+        self.assertEqual(res.status_code, 200, res.data)
+        return res.data
+
+    def _ping(self, lat, lon, accuracy=10, minutes_ago=0):
+        res = self.eng.post(
+            "/api/tracking/ping/",
+            {"latitude": lat, "longitude": lon, "accuracy": accuracy},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        if minutes_ago:
+            ping = LocationPing.objects.latest("id")
+            ping.timestamp = timezone.now() - timedelta(minutes=minutes_ago)
+            ping.save(update_fields=["timestamp"])
+        return res.data
+
+    # -- the core promise -----------------------------------------------------
+
+    def test_start_duty_puts_the_engineer_on_the_live_board(self):
+        self.assertEqual(self._live(), [], "nobody on duty yet")
+
+        res = self.eng.post("/api/tracking/start_duty/")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertTrue(res.data["on_duty"])
+
+        rows = self._live()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["engineer_name"], "Praveen S")
+        self.assertTrue(rows[0]["on_duty"])
+        # On duty but no fix yet: listed, with no position for the map to plot.
+        self.assertIsNone(rows[0]["latitude"])
+        self.assertTrue(rows[0]["stale"])
+
+    def test_engineer_stays_on_duty_when_the_phone_stops_reporting(self):
+        """The whole point of a declared duty: a locked phone must not read as
+        'went home'."""
+        self.eng.post("/api/tracking/start_duty/")
+        self._ping(13.08, 80.27, minutes_ago=25)
+
+        rows = self._live()
+        self.assertEqual(len(rows), 1, "must NOT disappear from the board")
+        self.assertTrue(rows[0]["on_duty"])
+        self.assertTrue(rows[0]["stale"], "position is old")
+        self.assertGreaterEqual(rows[0]["last_seen_minutes"], 24)
+        # The last known position is still there to show where they were.
+        self.assertAlmostEqual(rows[0]["latitude"], 13.08, places=4)
+
+    def test_a_fresh_ping_clears_the_stale_flag(self):
+        self.eng.post("/api/tracking/start_duty/")
+        self._ping(13.08, 80.27, minutes_ago=25)
+        self.assertTrue(self._live()[0]["stale"])
+
+        self._ping(13.09, 80.28)
+        row = self._live()[0]
+        self.assertFalse(row["stale"])
+        self.assertEqual(row["last_seen_minutes"], 0)
+
+    def test_end_duty_removes_them_from_the_board(self):
+        self.eng.post("/api/tracking/start_duty/")
+        self._ping(13.08, 80.27)
+        self.assertEqual(len(self._live()), 1)
+
+        res = self.eng.post("/api/tracking/end_duty/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertFalse(res.data["on_duty"])
+        self.assertEqual(self._live(), [])
+
+    def test_pinging_without_starting_duty_does_not_put_you_on_the_board(self):
+        """Membership is the declared duty, not the presence of GPS data."""
+        self._ping(13.08, 80.27)
+        self.assertEqual(self._live(), [])
+
+    # -- distance -------------------------------------------------------------
+
+    def test_distance_covers_this_duty_and_ignores_earlier_travel(self):
+        # Travel from a previous shift, before today's duty starts.
+        self._ping(13.00, 80.00)
+        self._ping(13.50, 80.00)
+        old = LocationPing.objects.all()
+        for p in old:
+            p.timestamp = timezone.now() - timedelta(hours=3)
+            p.save(update_fields=["timestamp"])
+
+        self.eng.post("/api/tracking/start_duty/")
+        # ~11.1 km apart at this latitude (0.1 degree of latitude).
+        self._ping(13.00, 80.00)
+        self._ping(13.10, 80.00)
+
+        row = self._live()[0]
+        self.assertGreater(row["distance_km"], 10)
+        self.assertLess(row["distance_km"], 12, "must not include the earlier shift")
+
+    def test_noisy_fixes_do_not_inflate_the_distance(self):
+        self.eng.post("/api/tracking/start_duty/")
+        self._ping(13.00, 80.00, accuracy=10)
+        self._ping(13.90, 80.00, accuracy=5000)  # a wild, low-confidence jump
+        self._ping(13.00, 80.00, accuracy=10)
+
+        self.assertEqual(self._live()[0]["distance_km"], 0.0)
+
+    # -- robustness -----------------------------------------------------------
+
+    def test_start_duty_twice_does_not_open_two_sessions(self):
+        self.eng.post("/api/tracking/start_duty/")
+        self.eng.post("/api/tracking/start_duty/")
+        self.assertEqual(DutySession.objects.filter(ended_at__isnull=True).count(), 1)
+        self.assertEqual(len(self._live()), 1)
+
+    def test_end_duty_when_not_on_duty_is_a_no_op(self):
+        res = self.eng.post("/api/tracking/end_duty/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertFalse(res.data["on_duty"])
+
+    def test_duty_endpoint_lets_the_app_resume_after_a_reload(self):
+        self.eng.post("/api/tracking/start_duty/")
+        res = self.eng.get("/api/tracking/duty/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertTrue(res.data["on_duty"])
+        self.assertIsNotNone(res.data["started_at"])
+
+    def test_a_forgotten_session_is_auto_closed(self):
+        """One missed Stop Duty must not show someone on duty for days."""
+        session = DutySession.objects.create(engineer=self.engineer)
+        session.started_at = timezone.now() - timedelta(
+            hours=DutySession.MAX_DURATION_HOURS + 1
+        )
+        session.save(update_fields=["started_at"])
+
+        self.assertEqual(self._live(), [])
+        session.refresh_from_db()
+        self.assertIsNotNone(session.ended_at)
+        self.assertTrue(session.auto_closed)
+
+    def test_branch_scoped_staff_only_see_their_own_branch(self):
+        other_user = User.objects.create_user(username="vel", password="x", role="employee")
+        other = Employee.objects.create(
+            user=other_user, employee_name="Vellore Engineer", branch="Vellore", salary=0
+        )
+        DutySession.objects.create(engineer=other)
+        self.eng.post("/api/tracking/start_duty/")
+
+        self.assertEqual(len(self._live()), 2, "full-access admin sees both")
+
+        # Scoping comes from allowed_sections, not assigned_branch alone — the
+        # default sections grant "All", which is why this must be set explicitly.
+        scoped = User.objects.create_user(
+            username="vellore-admin",
+            password="x",
+            role="hr",
+            assigned_branch="Vellore",
+            allowed_sections={"attendance": ["Vellore"]},
+        )
+        client = APIClient()
+        client.force_authenticate(scoped)
+        res = client.get("/api/tracking/live/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual([r["engineer_name"] for r in res.data], [other.employee_name])
+
+    def test_an_engineer_cannot_read_the_live_board(self):
+        res = self.eng.get("/api/tracking/live/")
+        self.assertEqual(res.status_code, 403)

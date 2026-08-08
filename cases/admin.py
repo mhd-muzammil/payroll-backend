@@ -1,5 +1,12 @@
 from django.contrib import admin
-from .models import Case, EngineerAlias, LocationPing
+from .models import Case, DutySession, EngineerAlias, LocationPing
+
+
+@admin.register(DutySession)
+class DutySessionAdmin(admin.ModelAdmin):
+    list_display = ("engineer", "started_at", "ended_at", "auto_closed")
+    list_filter = ("auto_closed",)
+    search_fields = ("engineer__employee_name",)
 
 
 @admin.register(EngineerAlias)

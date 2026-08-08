@@ -12,7 +12,7 @@ from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Case, EngineerAlias, LocationPing
+from .models import Case, DutySession, EngineerAlias, LocationPing
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
 from employees.models import Employee
 from authentication.models import get_allowed_branches
@@ -58,6 +58,20 @@ class NoEmployeeProfile(APIException):
     status_code = 409
     default_detail = "Your login is not linked to an employee record. Contact HR."
     default_code = "no_employee_profile"
+
+
+def _trail_km(pings):
+    """Total distance along an ordered trail, in km.
+
+    Low-accuracy fixes are dropped first so one stray jump across town does not
+    inflate the day's kilometres. Shared by /live and /path so the number an
+    engineer's row shows is computed exactly the same way as their detail view.
+    """
+    clean = [p for p in pings if p.accuracy is None or p.accuracy <= MAX_ACCURACY_METERS]
+    total = 0.0
+    for prev, cur in zip(clean, clean[1:]):
+        total += haversine_km(prev.latitude, prev.longitude, cur.latitude, cur.longitude)
+    return round(total, 2)
 
 
 def _role(user):
@@ -514,11 +528,72 @@ class CaseViewSet(viewsets.ModelViewSet):
 
 
 class TrackingViewSet(viewsets.ViewSet):
-    """Live GPS tracking of field engineers. Engineers POST their position to
-    /ping while on duty; staff read /live (everyone's latest position) and
+    """Live GPS tracking of field engineers. Engineers declare duty via
+    /start_duty and /end_duty and POST their position to /ping while on it;
+    staff read /live (everyone on duty, with their last known position) and
     /path (one engineer's or one case's full trail + distance travelled)."""
 
     permission_classes = [IsAuthenticated]
+
+    # -- duty state ---------------------------------------------------------
+
+    @staticmethod
+    def _close_forgotten_sessions():
+        """Auto-close sessions nobody ever stopped, so a missed Stop Duty does
+        not leave someone 'on duty' for days. Cheap and idempotent; run before
+        any read or write of duty state."""
+        cutoff = timezone.now() - timedelta(hours=DutySession.MAX_DURATION_HOURS)
+        DutySession.objects.filter(ended_at__isnull=True, started_at__lt=cutoff).update(
+            ended_at=timezone.now(), auto_closed=True
+        )
+
+    @classmethod
+    def _open_session(cls, employee):
+        cls._close_forgotten_sessions()
+        return DutySession.objects.filter(engineer=employee, ended_at__isnull=True).first()
+
+    def _duty_payload(self, employee):
+        session = self._open_session(employee)
+        return {
+            "on_duty": session is not None,
+            "session_id": session.id if session else None,
+            "started_at": session.started_at if session else None,
+            "duration_minutes": session.duration_minutes() if session else 0,
+        }
+
+    @action(detail=False, methods=["get"])
+    def duty(self, request):
+        """The caller's own duty state. The engineer's app reads this on load so
+        a refresh (or a reopened tab) resumes tracking instead of silently
+        going off duty while the engineer believes they are on."""
+        employee = _get_employee(request.user)
+        if not employee:
+            raise NoEmployeeProfile()
+        return Response(self._duty_payload(employee))
+
+    @action(detail=False, methods=["post"], url_path="start_duty")
+    def start_duty(self, request):
+        employee = _get_employee(request.user)
+        if not employee:
+            raise NoEmployeeProfile()
+        # Idempotent: tapping Start twice (or a reconnect) must not open a second
+        # overlapping session and double-count the day.
+        if not self._open_session(employee):
+            DutySession.objects.create(engineer=employee)
+        return Response(self._duty_payload(employee), status=201)
+
+    @action(detail=False, methods=["post"], url_path="end_duty")
+    def end_duty(self, request):
+        employee = _get_employee(request.user)
+        if not employee:
+            raise NoEmployeeProfile()
+        session = self._open_session(employee)
+        if session:
+            session.ended_at = timezone.now()
+            session.save(update_fields=["ended_at"])
+        # Always report the resulting state, so "stop when already stopped" is a
+        # success rather than an error the app has to special-case.
+        return Response(self._duty_payload(employee))
 
     @action(detail=False, methods=["post"])
     def ping(self, request):
@@ -566,42 +641,86 @@ class TrackingViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"])
     def live(self, request):
-        """Latest position of every engineer active within LIVE_WINDOW_MINUTES."""
+        """Everyone currently ON DUTY, with their last known position and the
+        distance they have covered on this duty.
+
+        Membership of this list is the engineer's DECLARED duty, not their GPS.
+        A locked phone or a dead signal stops the pings but does not end the
+        duty, so such an engineer stays here with stale=True and a growing
+        last_seen_minutes — "on duty, no signal for 15m" — instead of vanishing
+        as though they had gone home. An engineer who is on duty but has not
+        sent a single fix yet has latitude/longitude of None; the map skips
+        them, the table still lists them.
+        """
         if not _is_staff_role(request.user):
             return Response({"detail": "Permission denied."}, status=403)
 
-        since = timezone.now() - timedelta(minutes=LIVE_WINDOW_MINUTES)
-        # Latest ping id per engineer within the window. NOTE: .order_by() is
-        # required — LocationPing has Meta.ordering = ["-timestamp"], which Django
-        # would otherwise fold into the GROUP BY, breaking the per-engineer
+        self._close_forgotten_sessions()
+        sessions = (
+            DutySession.objects.filter(ended_at__isnull=True)
+            .select_related("engineer")
+            .order_by("engineer__employee_name")
+        )
+
+        branches = get_allowed_branches(request.user, "attendance")
+        if "All" not in branches:
+            sessions = sessions.filter(engineer__branch__in=branches)
+        sessions = list(sessions)
+        if not sessions:
+            return Response([])
+
+        engineer_ids = [s.engineer_id for s in sessions]
+
+        # Latest ping per on-duty engineer. NOTE: .order_by() is required —
+        # LocationPing has Meta.ordering = ["-timestamp"], which Django would
+        # otherwise fold into the GROUP BY, breaking the per-engineer
         # aggregation and returning one row per ping instead of per engineer.
         latest_ids = (
-            LocationPing.objects.filter(timestamp__gte=since)
+            LocationPing.objects.filter(engineer_id__in=engineer_ids)
             .order_by()
             .values("engineer")
             .annotate(last_id=Max("id"))
             .values_list("last_id", flat=True)
         )
-        pings = LocationPing.objects.select_related("engineer", "case").filter(id__in=list(latest_ids))
+        latest_by_engineer = {
+            p.engineer_id: p
+            for p in LocationPing.objects.select_related("case").filter(id__in=list(latest_ids))
+        }
 
-        branches = get_allowed_branches(request.user, "attendance")
+        # Distance covered since each duty started, from that session's own
+        # pings — so the number resets with the duty instead of carrying over
+        # yesterday's, and matches what "this shift" means to the operator.
+        now = timezone.now()
         rows = []
-        for p in pings:
-            if "All" not in branches and p.engineer.branch not in branches:
-                continue
+        for session in sessions:
+            ping = latest_by_engineer.get(session.engineer_id)
+            trail = LocationPing.objects.filter(
+                engineer_id=session.engineer_id, timestamp__gte=session.started_at
+            ).order_by("timestamp")
+            last_seen_minutes = (
+                int((now - ping.timestamp).total_seconds() // 60) if ping else None
+            )
             rows.append(
                 {
-                    "engineer_id": p.engineer_id,
-                    "engineer_name": p.engineer.employee_name,
-                    "branch": p.engineer.branch,
-                    "latitude": p.latitude,
-                    "longitude": p.longitude,
-                    "accuracy": p.accuracy,
-                    "speed": p.speed,
-                    "status": p.status,
-                    "timestamp": p.timestamp,
-                    "active_case_id": p.case_id,
-                    "active_case_number": p.case.case_number if p.case else None,
+                    "engineer_id": session.engineer_id,
+                    "engineer_name": session.engineer.employee_name,
+                    "branch": session.engineer.branch,
+                    "on_duty": True,
+                    "duty_started_at": session.started_at,
+                    "duty_minutes": session.duration_minutes(),
+                    # No fix yet, or the last one is older than the live window:
+                    # still on duty, just not currently reporting.
+                    "stale": ping is None or (now - ping.timestamp) > timedelta(minutes=LIVE_WINDOW_MINUTES),
+                    "last_seen_minutes": last_seen_minutes,
+                    "distance_km": _trail_km(trail),
+                    "latitude": ping.latitude if ping else None,
+                    "longitude": ping.longitude if ping else None,
+                    "accuracy": ping.accuracy if ping else None,
+                    "speed": ping.speed if ping else None,
+                    "status": ping.status if ping else "",
+                    "timestamp": ping.timestamp if ping else None,
+                    "active_case_id": ping.case_id if ping else None,
+                    "active_case_number": ping.case.case_number if (ping and ping.case) else None,
                 }
             )
         return Response(LiveEngineerSerializer(rows, many=True).data)
@@ -654,20 +773,10 @@ class TrackingViewSet(viewsets.ViewSet):
 
         pings = list(qs.order_by("timestamp"))
 
-        # Total distance, skipping low-accuracy noise so a stray jump doesn't
-        # inflate the kilometers.
-        total_km = 0.0
-        clean = [
-            p for p in pings
-            if p.accuracy is None or p.accuracy <= MAX_ACCURACY_METERS
-        ]
-        for prev, cur in zip(clean, clean[1:]):
-            total_km += haversine_km(prev.latitude, prev.longitude, cur.latitude, cur.longitude)
-
         return Response(
             {
                 "count": len(pings),
-                "total_km": round(total_km, 2),
+                "total_km": _trail_km(pings),
                 "points": LocationPingSerializer(pings, many=True).data,
             }
         )
