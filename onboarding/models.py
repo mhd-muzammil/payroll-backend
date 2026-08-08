@@ -51,11 +51,28 @@ class Onboarding(models.Model):
     skills = models.CharField(max_length=50, blank=True, null=True)
 
     # Timestamps and internal tracking
+    # How far the onboarding PAPERWORK got. Separate from employment_status
+    # below: a person can be fully onboarded and since have left.
     status = models.CharField(max_length=20, default='Completed')
+
+    # Where the person stands with the company TODAY. These three are mutually
+    # exclusive and cover everyone, so the summary cards can count each person
+    # exactly once instead of showing the same head under several totals.
+    EMPLOYMENT_STATUS_CHOICES = (
+        ('Active', 'Active'),        # working with us
+        ('Inactive', 'Inactive'),    # on our books but not currently working
+        ('Relieved', 'Relieved'),    # left the company
+    )
+    employment_status = models.CharField(
+        max_length=20,
+        choices=EMPLOYMENT_STATUS_CHOICES,
+        default='Active',
+        db_index=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.employee_name} ({self.status})"
+        return f"{self.employee_name} ({self.employment_status})"
 
 
 class Candidate(models.Model):
@@ -179,6 +196,17 @@ def _ensure_user_for_employee(emp):
         pass
 
 
+def _employee_status_for(employment_status):
+    """Onboarding's employment status -> the Employee record's status.
+
+    Employee has no 'relieved' of its own, and someone who has left must not
+    stay active: they would keep showing up in attendance, payroll and the
+    payslip run. Both Inactive and Relieved therefore land on 'inactive';
+    which of the two it was stays readable on the onboarding record.
+    """
+    return 'active' if employment_status == 'Active' else 'inactive'
+
+
 @receiver(post_save, sender=Onboarding)
 def sync_onboarding_to_employee(sender, instance, created, **kwargs):
     """Automatically connects or creates corresponding Employee record upon Onboarding save."""
@@ -245,7 +273,10 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
             emp.branch = branch_name
         if instance.date_of_joining:
             emp.date_of_joining = instance.date_of_joining
-        emp.status = 'active'
+        # Follow the onboarding record. This used to be hardcoded to 'active',
+        # which silently revived anyone HR had marked Inactive or Relieved on
+        # the next save of their onboarding row.
+        emp.status = _employee_status_for(instance.employment_status)
         try:
             emp.save()
         except IntegrityError:
@@ -262,13 +293,13 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
                 role=instance.designation.strip() if instance.designation else 'Staff',
                 branch=branch_name,
                 salary=Decimal('0.00'),
-                status='active',
+                status=_employee_status_for(instance.employment_status),
                 date_of_joining=instance.date_of_joining,
             )
         except IntegrityError:
             emp = Employee.objects.filter(employee_name__iexact=instance.employee_name.strip()).first()
             if emp:
-                emp.status = 'active'
+                emp.status = _employee_status_for(instance.employment_status)
                 try:
                     emp.save()
                 except Exception:
