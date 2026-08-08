@@ -78,6 +78,7 @@ INSTALLED_APPS = [
     'payrollpayslip',
     'onboarding',
     'cases',
+    'staffrequests',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',

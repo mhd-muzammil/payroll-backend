@@ -29,6 +29,7 @@ urlpatterns = [
     path('api/', include('payrollpayslip.urls')),
     path('api/', include('onboarding.urls')),
     path('api/', include('cases.urls')),
+    path('api/', include('staffrequests.urls')),
     path("api/auth/", include("authentication.urls")),
 ]
 
