@@ -1,3 +1,4 @@
+import logging
 import math
 import re
 from datetime import timedelta
@@ -7,13 +8,24 @@ from django.utils.dateparse import parse_date
 from django.db.models import Max, Q
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Case, LocationPing
+from .models import Case, EngineerAlias, LocationPing
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
 from employees.models import Employee
 from authentication.models import get_allowed_branches
+
+logger = logging.getLogger(__name__)
+
+# Statuses that still need the engineer's attention — what their case list shows.
+ACTIVE_STATUSES = ["open", "assigned", "accepted", "on_the_way", "reached", "working"]
+
+# Once the engineer has moved a case past "assigned" in the field, THEY own its
+# status. An incoming sync that merely repeats "still assigned upstream" must
+# not drag them back to the start (or resurrect work they already finished).
+ENGINEER_OWNED_STATUSES = ("accepted", "on_the_way", "reached", "working", "completed")
 
 # An engineer is considered "live" if their last ping is within this window.
 LIVE_WINDOW_MINUTES = 10
@@ -31,6 +43,21 @@ def haversine_km(lat1, lon1, lat2, lon2):
         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
     )
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+class NoEmployeeProfile(APIException):
+    """The user logs in fine but no Employee record is linked to their account.
+
+    Reported explicitly instead of returning an empty list: an engineer handed a
+    login that was never linked (or whose employee row was deleted) would
+    otherwise see the exact same "No cases assigned to you." as a genuinely
+    quiet day, and nobody could tell the two apart. TrackingViewSet.ping already
+    reports this condition; the case list now does too.
+    """
+
+    status_code = 409
+    default_detail = "Your login is not linked to an employee record. Contact HR."
+    default_code = "no_employee_profile"
 
 
 def _role(user):
@@ -59,17 +86,15 @@ class CaseViewSet(viewsets.ModelViewSet):
         if _role(user) == "employee":
             employee = _get_employee(user)
             if not employee:
-                return qs.none()
-            # Show ONLY today's still-open assigned cases — the engineer's
-            # to-do for today. Older days (by assigned date) and completed/
-            # cancelled cases are HIDDEN from this list (never deleted), so the
-            # view stays "today's assigned" without touching any data.
-            active_statuses = ["open", "assigned", "accepted", "on_the_way", "reached", "working"]
-            return qs.filter(
-                assigned_to=employee,
-                assigned_at__date=timezone.localdate(),
-                status__in=active_statuses,
-            )
+                raise NoEmployeeProfile()
+            # The engineer's live to-do: every case assigned to them that is
+            # still open. NOT filtered by assigned date — a service call stays
+            # assigned until it is closed, so a ticket dispatched yesterday and
+            # still in OpenCall's "Assigned" set must keep showing today.
+            # Anything that leaves that set is CANCELLED by bulk_dispatch's
+            # mirror pass (never deleted), and completed/cancelled cases drop
+            # out here — so the list tracks the productivity view by itself.
+            return qs.filter(assigned_to=employee, status__in=ACTIVE_STATUSES)
 
         # Staff: branch-scoped by the assigned engineer's branch. Unassigned
         # cases have no branch yet, so include them too — otherwise a branch
@@ -177,8 +202,26 @@ class CaseViewSet(viewsets.ModelViewSet):
         name = data.get("engineer_name")
         if name:
             nm = name.strip()
+            # An explicit alias always wins: it is the operator stating outright
+            # who this name is, which is the only safe way to resolve a name the
+            # automatic rules refuse (a namesake, or a spelling with nothing in
+            # common like "Lava" -> "LAVAKUMAR").
+            alias = EngineerAlias.objects.filter(
+                external_name=nm.lower()
+            ).select_related("employee").first()
+            if alias:
+                return alias.employee
+            # Name matching only ever considers employees who HAVE a login. A
+            # case pinned to a login-less row is readable by nobody, yet the
+            # dispatch reports success — so the ticket looks delivered and the
+            # real engineer sees nothing. Duplicate/stale rows for the same
+            # person are common (e.g. an old "Vijaya kumar (ARK)" alongside the
+            # live "VIJAYAKUMAR (ark)"), and dropping the login-less ones also
+            # disambiguates several of those pairs down to a single match.
+            # email/phone are unique and explicit, so those branches stay open.
+            reachable = Employee.objects.exclude(user__isnull=True)
             # employee_name is NOT unique; refuse to guess between namesakes.
-            matches = list(Employee.objects.filter(employee_name__iexact=nm)[:2])
+            matches = list(reachable.filter(employee_name__iexact=nm)[:2])
             if len(matches) == 1:
                 return matches[0]
             if not matches and nm:
@@ -186,7 +229,7 @@ class CaseViewSet(viewsets.ModelViewSet):
                 # ("Praveen" in OpenCall vs "Praveen S" in Payroll) — but ONLY
                 # when it resolves to exactly ONE employee, so real namesakes
                 # (e.g. several "Vijayakumar") are never guessed.
-                prefix = list(Employee.objects.filter(employee_name__istartswith=nm + " ")[:2])
+                prefix = list(reachable.filter(employee_name__istartswith=nm + " ")[:2])
                 if len(prefix) == 1:
                     return prefix[0]
         return None
@@ -265,6 +308,12 @@ class CaseViewSet(viewsets.ModelViewSet):
         valid_priorities = dict(Case.PRIORITY_CHOICES)
         created = updated = assigned = skipped = 0
         details = []
+        # Engineer names the caller sent that no Payroll employee answers to, and
+        # matched employees who have no login. Both mean "these tickets reach
+        # nobody" — reported back (and logged) so whoever runs the sync can SEE
+        # which people need onboarding instead of guessing at an empty list.
+        unmatched_engineers = set()
+        unreachable_engineers = set()
 
         for raw in items:
             if not isinstance(raw, dict):
@@ -294,21 +343,51 @@ class CaseViewSet(viewsets.ModelViewSet):
                 # an unassigned case just clutters Payroll and shows to nobody.
                 # Skip it; a later sync picks it up once that engineer exists in
                 # Payroll (e.g. after onboarding).
+                who = (raw.get("engineer_name") or "").strip()
+                if who:
+                    unmatched_engineers.add(who)
                 skipped += 1
-                details.append({"external_ref": ext, "result": "skipped", "reason": "engineer not matched"})
+                details.append({
+                    "external_ref": ext,
+                    "result": "skipped",
+                    "reason": "engineer not matched",
+                    "engineer_name": who or None,
+                })
                 continue
 
+            if engineer.user_id is None:
+                # Matched by email/phone onto a row with no login. The case is
+                # still saved (the data is real), but flag it — nobody can open it.
+                unreachable_engineers.add(engineer.employee_name)
+
             is_new = case.pk is None
+            reassigned = case.assigned_to_id not in (None, engineer.id)
             case.assigned_to = engineer
             case.assigned_by = request.user
-            if case.assigned_at is None:
+            # Stamp on first assignment, and re-stamp when the ticket actually
+            # moves to a different engineer — for the new engineer it IS a fresh
+            # assignment. An unchanged engineer keeps the original timestamp.
+            if case.assigned_at is None or reassigned:
                 case.assigned_at = timezone.now()
 
             desired = self._EXTERNAL_STATUS_MAP.get((raw.get("status") or "").strip().lower())
-            if desired:
+            if desired in ("completed", "cancelled"):
+                # Terminal upstream: the originating system says this call is
+                # finished, which always wins over the field status.
                 case.status = desired
                 if desired == "completed" and case.completed_at is None:
                     case.completed_at = timezone.now()
+            elif reassigned:
+                # New engineer — restart their side of the lifecycle, whatever
+                # the previous engineer had already done.
+                case.status = desired or "assigned"
+            elif case.status in ENGINEER_OWNED_STATUSES:
+                # Sync runs every few minutes and keeps repeating "assigned";
+                # leave an engineer who is already on the way / working / done
+                # exactly where they are.
+                pass
+            elif desired:
+                case.status = desired
             elif case.status == "open":
                 case.status = "assigned"
 
@@ -336,15 +415,29 @@ class CaseViewSet(viewsets.ModelViewSet):
         # lingering on its old one. NON-destructive. Only synced cases
         # (external_ref set) are ever touched, never manually-created ones.
         # Guarded: full-access (All-branch) caller + at least one assignment, so
-        # an empty/failed sync never cancels anything.
+        # an empty/failed sync never cancels anything. Cases the engineer already
+        # COMPLETED are left alone — the work happened; cancelling it would erase
+        # a real outcome (and the completed ones are already out of the list).
         if mirror and assigned_refs and "All" in get_allowed_branches(request.user, "attendance"):
             stale = (
                 Case.objects.exclude(external_ref="")
                 .exclude(external_ref__in=assigned_refs)
-                .exclude(status="cancelled")
+                .exclude(status__in=["cancelled", "completed"])
             )
             cancelled = stale.count()
             stale.update(status="cancelled")
+
+        # ASCII only: these lines get read in a Docker/Dokploy log tail.
+        if unmatched_engineers:
+            logger.warning(
+                "bulk_dispatch: skipped tickets, no Payroll employee matches: %s",
+                ", ".join(sorted(unmatched_engineers)),
+            )
+        if unreachable_engineers:
+            logger.warning(
+                "bulk_dispatch: assigned cases nobody can open (employee has no login): %s",
+                ", ".join(sorted(unreachable_engineers)),
+            )
 
         return Response({
             "created": created,
@@ -353,6 +446,9 @@ class CaseViewSet(viewsets.ModelViewSet):
             "skipped": skipped,
             "cancelled": cancelled,
             "total": len(items),
+            # The two lists that explain a short sync at a glance.
+            "unmatched_engineers": sorted(unmatched_engineers),
+            "unreachable_engineers": sorted(unreachable_engineers),
             "details": details,
         })
 

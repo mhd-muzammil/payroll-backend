@@ -1,5 +1,15 @@
 from django.contrib import admin
-from .models import Case, LocationPing
+from .models import Case, EngineerAlias, LocationPing
+
+
+@admin.register(EngineerAlias)
+class EngineerAliasAdmin(admin.ModelAdmin):
+    """Where an operator fixes an engineer whose OpenCall name Payroll can't match.
+    The names needing an entry come back in bulk_dispatch's `unmatched_engineers`."""
+
+    list_display = ("external_name", "employee", "note", "created_at")
+    search_fields = ("external_name", "employee__employee_name")
+    autocomplete_fields = ("employee",)
 
 
 @admin.register(Case)

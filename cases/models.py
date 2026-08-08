@@ -87,6 +87,47 @@ class Case(models.Model):
         return f"{self.case_number or 'OC-?'} - {self.customer_name}"
 
 
+class EngineerAlias(models.Model):
+    """Maps a name used by the originating system (OpenCall) onto a Payroll employee.
+
+    Automatic matching deliberately refuses to guess: it will not pick between
+    four people called "VIJAYAKUMAR", and it cannot know that OpenCall's "Lava"
+    is Payroll's "LAVAKUMAR". Rather than loosening the rules — which would
+    silently route one engineer's jobs to another person — the mapping is stated
+    explicitly here, once per engineer, and consulted before any name matching.
+
+    Fill this in from the `unmatched_engineers` list that /cases/bulk_dispatch/
+    returns after a sync; those are exactly the names that need an entry.
+    """
+
+    external_name = models.CharField(
+        max_length=150,
+        unique=True,
+        help_text="The engineer's name exactly as the other system sends it (case-insensitive).",
+    )
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="external_aliases",
+        help_text="The Payroll employee those cases belong to.",
+    )
+    note = models.CharField(max_length=200, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["external_name"]
+        verbose_name_plural = "Engineer aliases"
+
+    def save(self, *args, **kwargs):
+        # Store normalised so lookup is a plain exact match and duplicates that
+        # differ only by case/padding collide on the unique constraint.
+        self.external_name = (self.external_name or "").strip().lower()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.external_name} -> {self.employee.employee_name}"
+
+
 class LocationPing(models.Model):
     """One live GPS reading sent by an engineer's app while on duty. A trail of
     these draws the travel path; the latest per engineer is their live position.
