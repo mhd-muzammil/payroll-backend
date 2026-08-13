@@ -328,9 +328,6 @@ class CaseViewSet(viewsets.ModelViewSet):
         # which people need onboarding instead of guessing at an empty list.
         unmatched_engineers = set()
         unreachable_engineers = set()
-        # The tickets that reached nobody, by ref. Counting them was not enough:
-        # one lost WO hides inside "skipped=37" with nothing naming it.
-        skipped_refs = []
 
         for raw in items:
             if not isinstance(raw, dict):
@@ -363,8 +360,6 @@ class CaseViewSet(viewsets.ModelViewSet):
                 who = (raw.get("engineer_name") or "").strip()
                 if who:
                     unmatched_engineers.add(who)
-                if ext:
-                    skipped_refs.append(ext)
                 skipped += 1
                 details.append({
                     "external_ref": ext,
@@ -390,35 +385,16 @@ class CaseViewSet(viewsets.ModelViewSet):
                 case.assigned_at = timezone.now()
 
             desired = self._EXTERNAL_STATUS_MAP.get((raw.get("status") or "").strip().lower())
-            # A closure the ENGINEER made is theirs; a closure the originating
-            # system reported can be taken back, because the same ticket may be
-            # re-scheduled tomorrow.
-            upstream_closed = (
-                case.status == "completed"
-                and case.completion_source == Case.COMPLETED_BY_UPSTREAM
-            )
             if desired in ("completed", "cancelled"):
                 # Terminal upstream: the originating system says this call is
                 # finished, which always wins over the field status.
                 case.status = desired
-                if desired == "completed":
-                    if case.completed_at is None:
-                        case.completed_at = timezone.now()
-                    # Do not overwrite an engineer's own closure attribution.
-                    if not case.completion_source:
-                        case.completion_source = Case.COMPLETED_BY_UPSTREAM
+                if desired == "completed" and case.completed_at is None:
+                    case.completed_at = timezone.now()
             elif reassigned:
                 # New engineer — restart their side of the lifecycle, whatever
                 # the previous engineer had already done.
                 case.status = desired or "assigned"
-                case.completion_source = ""
-            elif upstream_closed:
-                # Closed upstream before, back in the plan now: re-scheduled, so
-                # put it in front of the engineer again. Without this the closure
-                # would be permanent and the re-booked call invisible to them.
-                case.status = desired or "assigned"
-                case.completed_at = None
-                case.completion_source = ""
             elif case.status in ENGINEER_OWNED_STATUSES:
                 # Sync runs every few minutes and keeps repeating "assigned";
                 # leave an engineer who is already on the way / working / done
@@ -446,7 +422,6 @@ class CaseViewSet(viewsets.ModelViewSet):
             })
 
         cancelled = 0
-        cancelled_refs = []
         # Mirror: a synced case whose ticket was NOT assigned in THIS call is
         # stale — mark it cancelled (kept in the DB, just hidden from the
         # engineer's active list). Keyed on assigned_refs (tickets actually
@@ -463,19 +438,8 @@ class CaseViewSet(viewsets.ModelViewSet):
                 .exclude(external_ref__in=assigned_refs)
                 .exclude(status__in=["cancelled", "completed"])
             )
-            # Capture WHICH refs before updating them. A retraction that only
-            # reports a count is a ticket disappearing from an engineer's list
-            # with nothing anywhere naming it — the exact failure that took a
-            # database query to explain.
-            cancelled_refs = sorted(stale.values_list("external_ref", flat=True))
-            cancelled = len(cancelled_refs)
+            cancelled = stale.count()
             stale.update(status="cancelled")
-            if cancelled_refs:
-                logger.warning(
-                    "bulk_dispatch: mirror retracted %d case(s) absent from this push: %s",
-                    cancelled,
-                    ", ".join(cancelled_refs[:40]),
-                )
 
         # ASCII only: these lines get read in a Docker/Dokploy log tail.
         if unmatched_engineers:
@@ -495,9 +459,6 @@ class CaseViewSet(viewsets.ModelViewSet):
             "assigned": assigned,
             "skipped": skipped,
             "cancelled": cancelled,
-            # Named, not just counted, so a retraction is traceable to a ticket.
-            "cancelled_refs": cancelled_refs,
-            "skipped_refs": skipped_refs,
             "total": len(items),
             # The two lists that explain a short sync at a glance.
             "unmatched_engineers": sorted(unmatched_engineers),
@@ -556,18 +517,13 @@ class CaseViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
         notes = request.data.get("resolution_notes", "")
-        # Attributed to the engineer, which makes it final: a later sync saying
-        # "still assigned" will not reopen work they have reported as done.
-        extra = {"completion_source": Case.COMPLETED_BY_ENGINEER}
-        if notes:
-            extra["resolution_notes"] = notes
         return self._engineer_transition(
             request,
             pk,
             ["working", "reached"],
             "completed",
             stamp_field="completed_at",
-            extra=extra,
+            extra={"resolution_notes": notes} if notes else None,
         )
 
 
