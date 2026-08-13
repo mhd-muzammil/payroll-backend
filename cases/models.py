@@ -72,6 +72,26 @@ class Case(models.Model):
 
     resolution_notes = models.TextField(blank=True, default="")
 
+    # WHO decided this case was finished. The engineer tapping Complete in the
+    # field is a fact about the work and must never be undone by a sync. A
+    # closure the originating system merely reported is a fact about the ticket,
+    # and that ticket can be re-scheduled tomorrow — so that kind of completion
+    # has to be reopenable, or a carried call closed one evening and re-booked
+    # the next morning would vanish from the engineer's list for good.
+    COMPLETED_BY_ENGINEER = "engineer"
+    COMPLETED_BY_UPSTREAM = "upstream"
+    COMPLETION_SOURCE_CHOICES = (
+        (COMPLETED_BY_ENGINEER, "Engineer closed it in the field"),
+        (COMPLETED_BY_UPSTREAM, "Reported closed by the originating system"),
+    )
+    completion_source = models.CharField(
+        max_length=20,
+        choices=COMPLETION_SOURCE_CHOICES,
+        blank=True,
+        default="",
+        help_text="Empty unless the case is completed.",
+    )
+
     class Meta:
         ordering = ["-created_at"]
 
