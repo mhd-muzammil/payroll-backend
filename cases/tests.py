@@ -794,3 +794,235 @@ class DutyAndLiveTrackingTests(TestCase):
     def test_an_engineer_cannot_read_the_live_board(self):
         res = self.eng.get("/api/tracking/live/")
         self.assertEqual(res.status_code, 403)
+
+
+class EngineerDayViewTests(TestCase):
+    """The "what did they actually do today" view: route, distance, time on duty,
+    where they stood still and for how long, and a readable timeline."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            username="ops", password="x", role="admin", is_staff=True
+        )
+        self.admin_client = APIClient()
+        self.admin_client.force_authenticate(self.admin)
+
+        self.engineer_user = User.objects.create_user(
+            username="praveen", password="x", role="employee"
+        )
+        self.engineer = Employee.objects.create(
+            user=self.engineer_user, employee_name="Praveen S", branch="Chennai", salary=0
+        )
+        self.today = timezone.localdate()
+        self.base = timezone.now().replace(hour=9, minute=0, second=0, microsecond=0)
+
+    def _ping(self, lat, lon, minutes, accuracy=10, case=None):
+        """A fix at `minutes` past the start of the day."""
+        return LocationPing.objects.create(
+            engineer=self.engineer,
+            case=case,
+            latitude=lat,
+            longitude=lon,
+            accuracy=accuracy,
+            timestamp=self.base + timedelta(minutes=minutes),
+        )
+
+    def _day(self, **params):
+        query = {"engineer": self.engineer.id, **params}
+        res = self.admin_client.get("/api/tracking/day/", query)
+        self.assertEqual(res.status_code, 200, res.data)
+        return res.data
+
+    # -- stops ---------------------------------------------------------------
+
+    def test_standing_still_for_a_while_is_reported_as_a_stop(self):
+        # Same spot, 09:00 to 09:30 — a customer visit.
+        for minute in range(0, 31, 5):
+            self._ping(13.0000, 80.0000, minute)
+
+        day = self._day()
+        self.assertEqual(day["stop_count"], 1)
+        stop = day["stops"][0]
+        self.assertGreaterEqual(stop["minutes"], 30)
+        self.assertAlmostEqual(stop["latitude"], 13.0, places=4)
+
+    def test_moving_through_traffic_is_not_a_stop(self):
+        """Junctions and signals must not read as visits."""
+        for i in range(12):
+            # ~550 m apart each fix, five minutes apart: continuously moving.
+            self._ping(13.0000 + i * 0.005, 80.0000, i * 5)
+
+        self.assertEqual(self._day()["stop_count"], 0)
+
+    def test_a_brief_pause_is_not_a_stop(self):
+        # Four minutes in one place — a red light, not a job.
+        self._ping(13.0000, 80.0000, 0)
+        self._ping(13.0000, 80.0000, 4)
+        self._ping(13.0500, 80.0000, 20)
+
+        self.assertEqual(self._day()["stop_count"], 0)
+
+    def test_gps_wander_while_parked_still_counts_as_one_stop(self):
+        """A phone indoors drifts tens of metres; that is one visit, not many."""
+        for i, minute in enumerate(range(0, 31, 5)):
+            # Jitter of ~0.0004 degrees is roughly 45 m.
+            self._ping(13.0000 + (i % 2) * 0.0004, 80.0000 + (i % 3) * 0.0003, minute)
+
+        day = self._day()
+        self.assertEqual(day["stop_count"], 1, "one visit, not one per wobble")
+
+    def test_two_separate_visits_are_two_stops(self):
+        for minute in range(0, 31, 5):
+            self._ping(13.0000, 80.0000, minute)
+        # Drive 5 km away, then sit again.
+        for minute in range(60, 91, 5):
+            self._ping(13.0450, 80.0000, minute)
+
+        day = self._day()
+        self.assertEqual(day["stop_count"], 2)
+        self.assertLess(day["stops"][0]["arrived_at"], day["stops"][1]["arrived_at"])
+
+    def test_a_stop_names_the_case_the_engineer_was_attending(self):
+        case = Case.objects.create(
+            customer_name="Ramesh",
+            title="Service call",
+            assigned_to=self.engineer,
+            status="working",
+            external_ref="WO-1",
+        )
+        for minute in range(0, 31, 5):
+            self._ping(13.0000, 80.0000, minute, case=case)
+
+        stop = self._day()["stops"][0]
+        self.assertEqual(stop["case_number"], case.case_number)
+
+    def test_noisy_fixes_do_not_invent_a_stop(self):
+        self._ping(13.0000, 80.0000, 0, accuracy=5000)
+        self._ping(13.0000, 80.0000, 30, accuracy=5000)
+
+        day = self._day()
+        self.assertEqual(day["stop_count"], 0)
+        self.assertEqual(day["points"], [])
+
+    # -- the day as a whole ---------------------------------------------------
+
+    def test_the_day_reports_distance_duty_time_and_the_route(self):
+        session = DutySession.objects.create(engineer=self.engineer)
+        session.started_at = self.base
+        session.ended_at = self.base + timedelta(hours=3)
+        session.save(update_fields=["started_at", "ended_at"])
+
+        self._ping(13.0000, 80.0000, 0)
+        self._ping(13.0450, 80.0000, 60)  # ~5 km
+        self._ping(13.0900, 80.0000, 120)  # ~5 km more
+
+        day = self._day()
+        self.assertEqual(day["engineer_name"], "Praveen S")
+        self.assertGreater(day["total_km"], 9)
+        self.assertLess(day["total_km"], 11)
+        self.assertEqual(day["duty_minutes"], 180)
+        self.assertEqual(len(day["points"]), 3, "the route the map draws")
+        self.assertIsNotNone(day["first_seen"])
+        self.assertIsNotNone(day["last_seen"])
+
+    def test_the_timeline_reads_in_the_order_the_day_happened(self):
+        session = DutySession.objects.create(engineer=self.engineer)
+        session.started_at = self.base
+        session.ended_at = self.base + timedelta(hours=4)
+        session.save(update_fields=["started_at", "ended_at"])
+
+        for minute in range(30, 61, 5):
+            self._ping(13.0000, 80.0000, minute)
+
+        events = self._day()["events"]
+        types = [e["type"] for e in events]
+        self.assertEqual(types[0], "duty_start")
+        self.assertEqual(types[-1], "duty_end")
+        self.assertIn("stop", types)
+        # Chronological, always.
+        moments = [e["at"] for e in events]
+        self.assertEqual(moments, sorted(moments))
+
+    def test_case_milestones_appear_on_the_timeline(self):
+        Case.objects.create(
+            customer_name="Ramesh",
+            title="Service call",
+            assigned_to=self.engineer,
+            status="completed",
+            external_ref="WO-1",
+            assigned_at=self.base,
+            started_at=self.base + timedelta(minutes=30),
+            reached_at=self.base + timedelta(minutes=50),
+            completed_at=self.base + timedelta(minutes=90),
+        )
+
+        labels = [e["label"] for e in self._day()["events"]]
+        self.assertIn("Left for the call", labels)
+        self.assertIn("Reached the site", labels)
+        self.assertIn("Completed the call", labels)
+
+    def test_an_auto_closed_duty_says_so(self):
+        session = DutySession.objects.create(engineer=self.engineer)
+        session.started_at = self.base
+        session.ended_at = self.base + timedelta(hours=17)
+        session.auto_closed = True
+        session.save(update_fields=["started_at", "ended_at", "auto_closed"])
+
+        labels = [e["label"] for e in self._day()["events"]]
+        self.assertIn("Auto-closed (no Stop Duty)", labels)
+
+    def test_an_earlier_day_can_be_read_back(self):
+        yesterday = self.today - timedelta(days=1)
+        LocationPing.objects.create(
+            engineer=self.engineer,
+            latitude=13.0,
+            longitude=80.0,
+            accuracy=10,
+            timestamp=timezone.now() - timedelta(days=1),
+        )
+
+        self.assertEqual(len(self._day(date=yesterday.isoformat())["points"]), 1)
+        self.assertEqual(len(self._day()["points"]), 0, "today is separate")
+
+    def test_a_quiet_day_answers_with_zeroes_rather_than_an_error(self):
+        day = self._day()
+        self.assertEqual(day["total_km"], 0.0)
+        self.assertEqual(day["duty_minutes"], 0)
+        self.assertEqual(day["stops"], [])
+        self.assertEqual(day["events"], [])
+        self.assertIsNone(day["first_seen"])
+
+    # -- who may read it ------------------------------------------------------
+
+    def test_an_engineer_cannot_read_the_day_view(self):
+        client = APIClient()
+        client.force_authenticate(self.engineer_user)
+        res = client.get("/api/tracking/day/", {"engineer": self.engineer.id})
+        self.assertEqual(res.status_code, 403)
+
+    def test_staff_from_another_branch_cannot_read_it(self):
+        scoped = User.objects.create_user(
+            username="vellore-hr",
+            password="x",
+            role="hr",
+            assigned_branch="Vellore",
+            allowed_sections={"attendance": ["Vellore"]},
+        )
+        client = APIClient()
+        client.force_authenticate(scoped)
+        res = client.get("/api/tracking/day/", {"engineer": self.engineer.id})
+        self.assertEqual(res.status_code, 403)
+
+    def test_a_bad_engineer_or_date_is_rejected_cleanly(self):
+        self.assertEqual(
+            self.admin_client.get("/api/tracking/day/", {"engineer": "abc"}).status_code, 400
+        )
+        self.assertEqual(
+            self.admin_client.get("/api/tracking/day/", {"engineer": 999999}).status_code, 404
+        )
+        self.assertEqual(
+            self.admin_client.get(
+                "/api/tracking/day/", {"engineer": self.engineer.id, "date": "2026-13-45"}
+            ).status_code,
+            400,
+        )

@@ -32,6 +32,14 @@ LIVE_WINDOW_MINUTES = 10
 # Pings less accurate than this (meters) are ignored for distance / path drawing.
 MAX_ACCURACY_METERS = 100
 
+# A stop is the engineer staying inside this circle for at least this long. The
+# radius has to comfortably exceed ordinary GPS wander while parked (a phone
+# indoors drifts tens of metres), and the duration has to exceed a traffic light
+# or a slow junction — otherwise every red signal on the ride would read as a
+# visit to a customer.
+STOP_RADIUS_METERS = 120
+STOP_MIN_MINUTES = 8
+
 
 def haversine_km(lat1, lon1, lat2, lon2):
     """Great-circle distance between two points, in kilometers."""
@@ -72,6 +80,72 @@ def _trail_km(pings):
     for prev, cur in zip(clean, clean[1:]):
         total += haversine_km(prev.latitude, prev.longitude, cur.latitude, cur.longitude)
     return round(total, 2)
+
+
+def _usable_pings(pings):
+    """Ordered pings with the low-accuracy noise dropped.
+
+    Everything that reasons about where somebody WAS uses this, so a stray fix
+    from a cold GPS cannot invent a journey or a visit.
+    """
+    return [p for p in pings if p.accuracy is None or p.accuracy <= MAX_ACCURACY_METERS]
+
+
+def _detect_stops(pings):
+    """Where the engineer stood still, and for how long.
+
+    Walks the day's fixes and grows a cluster while they stay within
+    STOP_RADIUS_METERS of where the cluster began. A cluster that lasted at
+    least STOP_MIN_MINUTES is a stop — a customer visit, a parts pickup, lunch.
+    Anything shorter is traffic, so junctions and signals do not show up as
+    visits.
+
+    Distance is measured from the cluster's ANCHOR rather than from the previous
+    fix: comparing neighbours would let a slow walk drift across a whole street
+    while every individual step stayed under the radius.
+
+    Returns dicts, not model objects — nothing is written to the database. The
+    stops are derived from the trail every time it is read, so changing the
+    thresholds re-reads history correctly instead of leaving stale rows behind.
+    """
+    clean = _usable_pings(pings)
+    stops = []
+    if not clean:
+        return stops
+
+    def close_run(cluster):
+        minutes = (cluster[-1].timestamp - cluster[0].timestamp).total_seconds() / 60
+        if minutes < STOP_MIN_MINUTES:
+            return
+        # Centre of the cluster, so the marker sits where they actually were
+        # rather than on whichever fix happened to arrive first.
+        stops.append(
+            {
+                "latitude": sum(p.latitude for p in cluster) / len(cluster),
+                "longitude": sum(p.longitude for p in cluster) / len(cluster),
+                "arrived_at": cluster[0].timestamp,
+                "left_at": cluster[-1].timestamp,
+                "minutes": int(minutes),
+                "fixes": len(cluster),
+                # The case they were attending, if the app was tagging pings.
+                "case_id": next((p.case_id for p in reversed(cluster) if p.case_id), None),
+                "case_number": next(
+                    (p.case.case_number for p in reversed(cluster) if p.case_id and p.case), None
+                ),
+            }
+        )
+
+    cluster = [clean[0]]
+    for ping in clean[1:]:
+        anchor = cluster[0]
+        metres = haversine_km(anchor.latitude, anchor.longitude, ping.latitude, ping.longitude) * 1000
+        if metres <= STOP_RADIUS_METERS:
+            cluster.append(ping)
+        else:
+            close_run(cluster)
+            cluster = [ping]
+    close_run(cluster)
+    return stops
 
 
 def _role(user):
@@ -803,5 +877,133 @@ class TrackingViewSet(viewsets.ViewSet):
                 "count": len(pings),
                 "total_km": _trail_km(pings),
                 "points": LocationPingSerializer(pings, many=True).data,
+            }
+        )
+
+    @action(detail=False, methods=["get"])
+    def day(self, request):
+        """One engineer's whole day: the route, the distance, the time on duty,
+        where they stood still and for how long, and a timeline of what happened.
+
+        Query: ?engineer=<id>&date=YYYY-MM-DD (date defaults to today)
+
+        This is the "what did they actually do" view. Everything is derived from
+        the trail and the duty sessions on read, so nothing here can go stale.
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        raw_engineer = request.query_params.get("engineer")
+        if not (raw_engineer and raw_engineer.isdigit()):
+            return Response({"detail": "engineer must be a numeric id."}, status=400)
+        engineer = Employee.objects.filter(pk=int(raw_engineer)).first()
+        if not engineer:
+            return Response({"detail": "Engineer not found."}, status=404)
+
+        branches = get_allowed_branches(request.user, "attendance")
+        if "All" not in branches and engineer.branch not in branches:
+            return Response({"detail": "Permission denied."}, status=403)
+
+        date_str = request.query_params.get("date")
+        if date_str:
+            try:
+                target_date = parse_date(date_str)
+            except ValueError:
+                target_date = None
+            if not target_date:
+                return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
+        else:
+            target_date = timezone.localdate()
+
+        pings = list(
+            LocationPing.objects.select_related("case")
+            .filter(engineer=engineer, timestamp__date=target_date)
+            .order_by("timestamp")
+        )
+        sessions = list(
+            DutySession.objects.filter(engineer=engineer, started_at__date=target_date).order_by(
+                "started_at"
+            )
+        )
+        stops = _detect_stops(pings)
+
+        # A timeline the office can read top to bottom, the way the day happened.
+        events = []
+        for session in sessions:
+            events.append(
+                {"at": session.started_at, "type": "duty_start", "label": "Started duty"}
+            )
+            if session.ended_at:
+                events.append(
+                    {
+                        "at": session.ended_at,
+                        "type": "duty_end",
+                        "label": "Auto-closed (no Stop Duty)"
+                        if session.auto_closed
+                        else "Stopped duty",
+                        "minutes": session.duration_minutes(),
+                    }
+                )
+        for stop in stops:
+            events.append(
+                {
+                    "at": stop["arrived_at"],
+                    "type": "stop",
+                    "label": f"Stopped {stop['minutes']} min",
+                    "minutes": stop["minutes"],
+                    "latitude": stop["latitude"],
+                    "longitude": stop["longitude"],
+                    "case_number": stop["case_number"],
+                }
+            )
+        # What the engineer did to their cases that day, so a stop can be read
+        # against the job it belongs to.
+        case_moments = (
+            ("assigned_at", "Case assigned"),
+            ("started_at", "Left for the call"),
+            ("reached_at", "Reached the site"),
+            ("completed_at", "Completed the call"),
+        )
+        for case in Case.objects.filter(assigned_to=engineer).only(
+            "case_number", "title", "assigned_at", "started_at", "reached_at", "completed_at"
+        ):
+            for field, label in case_moments:
+                moment = getattr(case, field)
+                if moment and timezone.localtime(moment).date() == target_date:
+                    events.append(
+                        {
+                            "at": moment,
+                            "type": field.replace("_at", ""),
+                            "label": label,
+                            "case_number": case.case_number,
+                        }
+                    )
+        events.sort(key=lambda e: e["at"])
+
+        clean = _usable_pings(pings)
+        return Response(
+            {
+                "engineer_id": engineer.id,
+                "engineer_name": engineer.employee_name,
+                "branch": engineer.branch,
+                "date": target_date,
+                "total_km": _trail_km(pings),
+                "duty_minutes": sum(s.duration_minutes() for s in sessions),
+                "first_seen": clean[0].timestamp if clean else None,
+                "last_seen": clean[-1].timestamp if clean else None,
+                "stop_count": len(stops),
+                "stops": stops,
+                "events": events,
+                # The route, thinned of noise so the line drawn matches the km.
+                "points": [
+                    {
+                        "latitude": p.latitude,
+                        "longitude": p.longitude,
+                        "timestamp": p.timestamp,
+                        "accuracy": p.accuracy,
+                        "status": p.status,
+                    }
+                    for p in clean
+                ],
             }
         )
