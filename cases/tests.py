@@ -924,6 +924,87 @@ class EngineerRosterTests(TestCase):
         client.force_authenticate(self.on_duty.user)
         self.assertEqual(client.get("/api/tracking/roster/").status_code, 403)
 
+    # -- driven by the caller's engineer register ------------------------------
+
+    def _roster_for(self, names, **params):
+        res = self.client_admin.post(
+            "/api/tracking/roster/", {"names": names, **params}, format="json"
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        return {row["engineer_name"]: row for row in res.data}
+
+    def test_asking_by_name_returns_a_row_per_name(self):
+        DutySession.objects.create(engineer=self.on_duty)
+
+        roster = self._roster_for(["On Duty Ravi", "Absent Suresh"])
+        self.assertEqual(set(roster), {"On Duty Ravi", "Absent Suresh"})
+        self.assertEqual(roster["On Duty Ravi"]["state"], "on_duty")
+        self.assertEqual(roster["Absent Suresh"]["state"], "absent")
+
+    def test_duty_survives_a_name_the_alias_table_resolves(self):
+        """The bug this replaced: matching on the caller's side lost the duty
+        state for any name only the alias table could resolve, so an engineer
+        standing in a customer's shop read as off duty."""
+        EngineerAlias.objects.create(external_name="Ravi", employee=self.on_duty)
+        DutySession.objects.create(engineer=self.on_duty)
+
+        row = self._roster_for(["Ravi"])["Ravi"]
+        self.assertTrue(row["matched"])
+        self.assertEqual(row["state"], "on_duty")
+        self.assertEqual(row["engineer_id"], self.on_duty.id)
+        # Their register spelling is echoed back; the matched record is alongside.
+        self.assertEqual(row["payroll_name"], "On Duty Ravi")
+
+    def test_a_shorter_register_name_still_matches(self):
+        praveen = self._engineer("Praveen S", "Chennai")
+        DutySession.objects.create(engineer=praveen)
+
+        row = self._roster_for(["Praveen"])["Praveen"]
+        self.assertTrue(row["matched"])
+        self.assertEqual(row["state"], "on_duty")
+
+    def test_a_name_nobody_answers_to_comes_back_as_a_row(self):
+        """Not dropped: this is the same gap that makes their cases get skipped,
+        and a board that quietly omits them hides it."""
+        roster = self._roster_for(["Nobody At All", "On Duty Ravi"])
+
+        self.assertEqual(set(roster), {"Nobody At All", "On Duty Ravi"})
+        gap = roster["Nobody At All"]
+        self.assertFalse(gap["matched"])
+        self.assertEqual(gap["state"], "unmatched")
+        self.assertIsNone(gap["engineer_id"])
+
+    def test_an_ambiguous_name_is_reported_rather_than_guessed(self):
+        self._engineer("Vijayakumar A", "Chennai")
+        self._engineer("Vijayakumar B", "Chennai")
+
+        row = self._roster_for(["Vijayakumar"])["Vijayakumar"]
+        self.assertFalse(row["matched"], "two namesakes must never be guessed between")
+
+    def test_the_same_name_asked_twice_yields_one_row(self):
+        roster = self._roster_for(["On Duty Ravi", "on duty ravi"])
+        self.assertEqual(len(roster), 1)
+
+    def test_branch_scope_still_applies_when_asking_by_name(self):
+        other = self._engineer("Vellore Vishnu", "Vellore")
+        DutySession.objects.create(engineer=other)
+        scoped = User.objects.create_user(
+            username="chennai-hr",
+            password="x",
+            role="hr",
+            assigned_branch="Chennai",
+            allowed_sections={"attendance": ["Chennai"]},
+        )
+        client = APIClient()
+        client.force_authenticate(scoped)
+
+        res = client.post(
+            "/api/tracking/roster/", {"names": ["Vellore Vishnu", "On Duty Ravi"]}, format="json"
+        )
+        rows = {r["engineer_name"]: r for r in res.data}
+        self.assertFalse(rows["Vellore Vishnu"]["matched"], "out of branch is not resolved")
+        self.assertTrue(rows["On Duty Ravi"]["matched"])
+
     def test_inactive_employees_are_left_off(self):
         gone = self._engineer("Left The Company", "Chennai")
         gone.status = "inactive"

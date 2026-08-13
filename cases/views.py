@@ -160,6 +160,84 @@ def _get_employee(user):
     return getattr(user, "employee_profile", None)
 
 
+# Shared by case dispatch AND the tracking roster, so an engineer who can be
+# sent a case can always be tracked, and vice versa. When the two had separate
+# matching, a name only the alias table could resolve came back unmatched on the
+# roster and that engineer's duty state was silently lost.
+def resolve_engineer(data):
+    """Look up an Employee by id, then email, then phone, then name.
+
+    Email and phone are the reliable keys (both unique on the Employee),
+    so an engineer whose email OR mobile number matches the OpenCall record
+    links correctly even if the name is spelled differently. Phone is
+    compared on the last 10 digits so "+91 98765 43210" matches "9876543210".
+    """
+    engineer_id = data.get("engineer_id")
+    if engineer_id:
+        # A non-numeric engineer_id would raise ValueError on a pk lookup;
+        # treat it as "not found" and fall through to email/phone/name.
+        try:
+            emp = Employee.objects.filter(pk=engineer_id).first()
+        except (ValueError, TypeError):
+            emp = None
+        if emp:
+            return emp
+    email = data.get("engineer_email")
+    if email:
+        emp = Employee.objects.filter(email__iexact=email).first()
+        if emp:
+            return emp
+    phone = data.get("engineer_phone")
+    if phone:
+        digits = re.sub(r"\D", "", str(phone))
+        if len(digits) >= 10:
+            target = digits[-10:]
+            # Compare on digits-only, last 10, on BOTH sides — stored phones
+            # carry spaces/"+91" so a raw SQL endswith would miss. Employee
+            # tables are small, so a scan of phone-bearing rows is fine.
+            matches = [
+                emp for emp in Employee.objects.exclude(phone__isnull=True).exclude(phone="")
+                if re.sub(r"\D", "", emp.phone)[-10:] == target
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            # 0 or ambiguous (placeholder phones collide) -> fall through to name
+    name = data.get("engineer_name")
+    if name:
+        nm = name.strip()
+        # An explicit alias always wins: it is the operator stating outright
+        # who this name is, which is the only safe way to resolve a name the
+        # automatic rules refuse (a namesake, or a spelling with nothing in
+        # common like "Lava" -> "LAVAKUMAR").
+        alias = EngineerAlias.objects.filter(
+            external_name=nm.lower()
+        ).select_related("employee").first()
+        if alias:
+            return alias.employee
+        # Name matching only ever considers employees who HAVE a login. A
+        # case pinned to a login-less row is readable by nobody, yet the
+        # dispatch reports success — so the ticket looks delivered and the
+        # real engineer sees nothing. Duplicate/stale rows for the same
+        # person are common (e.g. an old "Vijaya kumar (ARK)" alongside the
+        # live "VIJAYAKUMAR (ark)"), and dropping the login-less ones also
+        # disambiguates several of those pairs down to a single match.
+        # email/phone are unique and explicit, so those branches stay open.
+        reachable = Employee.objects.exclude(user__isnull=True)
+        # employee_name is NOT unique; refuse to guess between namesakes.
+        matches = list(reachable.filter(employee_name__iexact=nm)[:2])
+        if len(matches) == 1:
+            return matches[0]
+        if not matches and nm:
+            # Tolerate a trailing surname/initial the other system omits
+            # ("Praveen" in OpenCall vs "Praveen S" in Payroll) — but ONLY
+            # when it resolves to exactly ONE employee, so real namesakes
+            # (e.g. several "Vijayakumar") are never guessed.
+            prefix = list(reachable.filter(employee_name__istartswith=nm + " ")[:2])
+            if len(prefix) == 1:
+                return prefix[0]
+    return None
+
+
 class CaseViewSet(viewsets.ModelViewSet):
     """Case management + dispatch. Admin/HR create and assign cases; the assigned
     engineer sees only their own cases and drives the status forward in the field."""
@@ -252,77 +330,9 @@ class CaseViewSet(viewsets.ModelViewSet):
 
     @staticmethod
     def _resolve_engineer(data):
-        """Look up an Employee by id, then email, then phone, then name.
-
-        Email and phone are the reliable keys (both unique on the Employee),
-        so an engineer whose email OR mobile number matches the OpenCall record
-        links correctly even if the name is spelled differently. Phone is
-        compared on the last 10 digits so "+91 98765 43210" matches "9876543210".
-        """
-        engineer_id = data.get("engineer_id")
-        if engineer_id:
-            # A non-numeric engineer_id would raise ValueError on a pk lookup;
-            # treat it as "not found" and fall through to email/phone/name.
-            try:
-                emp = Employee.objects.filter(pk=engineer_id).first()
-            except (ValueError, TypeError):
-                emp = None
-            if emp:
-                return emp
-        email = data.get("engineer_email")
-        if email:
-            emp = Employee.objects.filter(email__iexact=email).first()
-            if emp:
-                return emp
-        phone = data.get("engineer_phone")
-        if phone:
-            digits = re.sub(r"\D", "", str(phone))
-            if len(digits) >= 10:
-                target = digits[-10:]
-                # Compare on digits-only, last 10, on BOTH sides — stored phones
-                # carry spaces/"+91" so a raw SQL endswith would miss. Employee
-                # tables are small, so a scan of phone-bearing rows is fine.
-                matches = [
-                    emp for emp in Employee.objects.exclude(phone__isnull=True).exclude(phone="")
-                    if re.sub(r"\D", "", emp.phone)[-10:] == target
-                ]
-                if len(matches) == 1:
-                    return matches[0]
-                # 0 or ambiguous (placeholder phones collide) -> fall through to name
-        name = data.get("engineer_name")
-        if name:
-            nm = name.strip()
-            # An explicit alias always wins: it is the operator stating outright
-            # who this name is, which is the only safe way to resolve a name the
-            # automatic rules refuse (a namesake, or a spelling with nothing in
-            # common like "Lava" -> "LAVAKUMAR").
-            alias = EngineerAlias.objects.filter(
-                external_name=nm.lower()
-            ).select_related("employee").first()
-            if alias:
-                return alias.employee
-            # Name matching only ever considers employees who HAVE a login. A
-            # case pinned to a login-less row is readable by nobody, yet the
-            # dispatch reports success — so the ticket looks delivered and the
-            # real engineer sees nothing. Duplicate/stale rows for the same
-            # person are common (e.g. an old "Vijaya kumar (ARK)" alongside the
-            # live "VIJAYAKUMAR (ark)"), and dropping the login-less ones also
-            # disambiguates several of those pairs down to a single match.
-            # email/phone are unique and explicit, so those branches stay open.
-            reachable = Employee.objects.exclude(user__isnull=True)
-            # employee_name is NOT unique; refuse to guess between namesakes.
-            matches = list(reachable.filter(employee_name__iexact=nm)[:2])
-            if len(matches) == 1:
-                return matches[0]
-            if not matches and nm:
-                # Tolerate a trailing surname/initial the other system omits
-                # ("Praveen" in OpenCall vs "Praveen S" in Payroll) — but ONLY
-                # when it resolves to exactly ONE employee, so real namesakes
-                # (e.g. several "Vijayakumar") are never guessed.
-                prefix = list(reachable.filter(employee_name__istartswith=nm + " ")[:2])
-                if len(prefix) == 1:
-                    return prefix[0]
-        return None
+        """Kept as the dispatch entry point; the logic lives at module level
+        because the tracking roster resolves names the same way."""
+        return resolve_engineer(data)
 
     @action(detail=True, methods=["post"])
     def assign(self, request, pk=None):
@@ -880,7 +890,7 @@ class TrackingViewSet(viewsets.ViewSet):
             }
         )
 
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["get", "post"])
     def roster(self, request):
         """EVERY engineer and where they stand on a given day.
 
@@ -889,12 +899,21 @@ class TrackingViewSet(viewsets.ViewSet):
         day. This is the board you pick from: on duty, checked out, or never
         started, all clickable.
 
-        Query: ?date=YYYY-MM-DD (defaults to today)
+        GET  ?date=YYYY-MM-DD           -> every active employee
+        POST {"names": [...], "date": ...} -> one row per NAME asked for
+
+        The POST form exists so the caller's own engineer register can drive the
+        board while the NAME MATCHING stays here, in the one place that owns it:
+        the same _resolve_engineer the case dispatch uses, aliases included. When
+        this was matched on the caller's side instead, a name the alias table
+        would have resolved came back unmatched and the engineer's duty state was
+        silently lost — they read as off duty while standing in a customer's shop.
         """
         if not _is_staff_role(request.user):
             return Response({"detail": "Permission denied."}, status=403)
 
-        date_str = request.query_params.get("date")
+        date_str = request.data.get("date") if request.method == "POST" else None
+        date_str = date_str or request.query_params.get("date")
         if date_str:
             try:
                 target_date = parse_date(date_str)
@@ -907,19 +926,40 @@ class TrackingViewSet(viewsets.ViewSet):
 
         self._close_forgotten_sessions()
 
-        # Every active employee, with their duty state. WHICH of them counts as a
-        # field engineer is not Payroll's call — OpenCall's "Add Engineers" list
-        # is the authority, and the OpenCall side narrows this to those people.
-        # Answering broadly here keeps that decision in one place.
-        engineers = Employee.objects.filter(status__in=["active", "onleave"])
         branches = get_allowed_branches(request.user, "attendance")
-        if "All" not in branches:
-            engineers = engineers.filter(branch__in=branches)
-        engineers = list(engineers.order_by("employee_name"))
-        if not engineers:
+
+        # Asked for by name (the caller's engineer register), or every active
+        # employee when no names are given.
+        requested_names = request.data.get("names") if request.method == "POST" else None
+
+        # (employee, the name the caller asked under) — the caller's spelling is
+        # echoed back so their board can label the row the way their users know it.
+        resolved = []
+        unmatched_names = []
+        if isinstance(requested_names, list):
+            seen = set()
+            for raw_name in requested_names:
+                name = str(raw_name or "").strip()
+                if not name or name.lower() in seen:
+                    continue
+                seen.add(name.lower())
+                # The SAME resolution the case dispatch uses, so an engineer who
+                # can receive a case can always be tracked, and vice versa.
+                employee = resolve_engineer({"engineer_name": name})
+                if employee and ("All" in branches or employee.branch in branches):
+                    resolved.append((employee, name))
+                else:
+                    unmatched_names.append(name)
+        else:
+            qs = Employee.objects.filter(status__in=["active", "onleave"])
+            if "All" not in branches:
+                qs = qs.filter(branch__in=branches)
+            resolved = [(e, e.employee_name) for e in qs.order_by("employee_name")]
+
+        if not resolved and not unmatched_names:
             return Response([])
 
-        ids = [e.id for e in engineers]
+        ids = [e.id for e, _ in resolved]
 
         # That day's duty, per engineer: the open one if there is one, otherwise
         # the last that ended.
@@ -955,7 +995,7 @@ class TrackingViewSet(viewsets.ViewSet):
 
         now = timezone.now()
         rows = []
-        for engineer in engineers:
+        for engineer, asked_as in resolved:
             session = sessions_by_engineer.get(engineer.id)
             ping = latest_by_engineer.get(engineer.id)
             trail = trails.get(engineer.id, [])
@@ -973,7 +1013,11 @@ class TrackingViewSet(viewsets.ViewSet):
             rows.append(
                 {
                     "engineer_id": engineer.id,
-                    "engineer_name": engineer.employee_name,
+                    # The caller's spelling, so their board reads the way their
+                    # users know the person; payroll_name is the record it matched.
+                    "engineer_name": asked_as,
+                    "payroll_name": engineer.employee_name,
+                    "matched": True,
                     "branch": engineer.branch,
                     "state": state,
                     "on_duty": state == "on_duty",
@@ -996,6 +1040,37 @@ class TrackingViewSet(viewsets.ViewSet):
                     "active_case_number": ping.case.case_number if (ping and ping.case) else None,
                 }
             )
+
+        # Names the caller asked for that no employee answers to. Returned as
+        # rows, not dropped: this is the same gap that makes their cases get
+        # skipped, and a board that quietly omits them hides it.
+        for name in unmatched_names:
+            rows.append(
+                {
+                    "engineer_id": None,
+                    "engineer_name": name,
+                    "payroll_name": None,
+                    "matched": False,
+                    "branch": None,
+                    "state": "unmatched",
+                    "on_duty": False,
+                    "duty_started_at": None,
+                    "duty_ended_at": None,
+                    "duty_minutes": 0,
+                    "auto_closed": False,
+                    "distance_km": 0.0,
+                    "stale": False,
+                    "last_seen_minutes": None,
+                    "latitude": None,
+                    "longitude": None,
+                    "accuracy": None,
+                    "status": "",
+                    "timestamp": None,
+                    "active_case_id": None,
+                    "active_case_number": None,
+                }
+            )
+        rows.sort(key=lambda r: r["engineer_name"].lower())
         return Response(rows)
 
     @action(detail=False, methods=["get"])
