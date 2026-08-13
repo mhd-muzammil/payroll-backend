@@ -101,14 +101,16 @@ class CaseViewSet(viewsets.ModelViewSet):
             employee = _get_employee(user)
             if not employee:
                 raise NoEmployeeProfile()
-            # The engineer's live to-do: every case assigned to them that is
-            # still open. NOT filtered by assigned date — a service call stays
-            # assigned until it is closed, so a ticket dispatched yesterday and
-            # still in OpenCall's "Assigned" set must keep showing today.
-            # Anything that leaves that set is CANCELLED by bulk_dispatch's
-            # mirror pass (never deleted), and completed/cancelled cases drop
-            # out here — so the list tracks the productivity view by itself.
-            return qs.filter(assigned_to=employee, status__in=ACTIVE_STATUSES)
+            # EXACTLY the engineer's Assigned column, one case per ticket.
+            #
+            # Driven by in_current_plan, not by status: filtering on status made
+            # the count drift from what OpenCall shows — a call the engineer had
+            # completed dropped out of their list while OpenCall still counted it
+            # as assigned, so 5 upstream showed as 4 here. A ticket leaves this
+            # list only when it leaves the plan, which the mirror pass records.
+            return qs.filter(assigned_to=employee, in_current_plan=True).exclude(
+                status="cancelled"
+            )
 
         # Staff: branch-scoped by the assigned engineer's branch. Unassigned
         # cases have no branch yet, so include them too — otherwise a branch
@@ -376,6 +378,9 @@ class CaseViewSet(viewsets.ModelViewSet):
 
             is_new = case.pk is None
             reassigned = case.assigned_to_id not in (None, engineer.id)
+            # Pushed in this batch, so it IS in the plan — including a ticket
+            # coming back after having dropped out.
+            case.in_current_plan = True
             case.assigned_to = engineer
             case.assigned_by = request.user
             # Stamp on first assignment, and re-stamp when the ticket actually
@@ -429,17 +434,26 @@ class CaseViewSet(viewsets.ModelViewSet):
         # lingering on its old one. NON-destructive. Only synced cases
         # (external_ref set) are ever touched, never manually-created ones.
         # Guarded: full-access (All-branch) caller + at least one assignment, so
-        # an empty/failed sync never cancels anything. Cases the engineer already
-        # COMPLETED are left alone — the work happened; cancelling it would erase
-        # a real outcome (and the completed ones are already out of the list).
+        # an empty/failed sync never cancels anything.
         if mirror and assigned_refs and "All" in get_allowed_branches(request.user, "attendance"):
-            stale = (
+            # Out of the plan: drop the flag on EVERY synced case that is no
+            # longer pushed, completed ones included — that is what keeps the
+            # engineer's count equal to the Assigned column. The status is left
+            # alone here, so a completed call keeps saying completed.
+            left_plan = (
                 Case.objects.exclude(external_ref="")
                 .exclude(external_ref__in=assigned_refs)
-                .exclude(status__in=["cancelled", "completed"])
+                .filter(in_current_plan=True)
             )
-            cancelled = stale.count()
-            stale.update(status="cancelled")
+            cancelled_refs = sorted(left_plan.values_list("external_ref", flat=True))
+            cancelled = len(cancelled_refs)
+            left_plan.update(in_current_plan=False)
+
+            # A call that never reached a terminal state and has left the plan is
+            # cancelled, as before — a real outcome (completed) is never rewritten.
+            Case.objects.exclude(external_ref="").filter(
+                in_current_plan=False, status__in=ACTIVE_STATUSES
+            ).update(status="cancelled")
 
         # ASCII only: these lines get read in a Docker/Dokploy log tail.
         if unmatched_engineers:

@@ -19,6 +19,10 @@ class CaseSerializer(serializers.ModelSerializer):
         read_only_fields = (
             "case_number",
             "status",
+            # Owned by the sync's mirror pass — it is what makes the engineer's
+            # count equal OpenCall's Assigned column, so a raw PATCH must not
+            # move a case in or out of the plan.
+            "in_current_plan",
             "assigned_to",
             "assigned_by",
             "assigned_at",

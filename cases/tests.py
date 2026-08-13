@@ -101,14 +101,17 @@ class CaseSyncTests(TestCase):
         case.refresh_from_db()
         self.assertEqual(case.status, "on_the_way")
 
-    def test_completed_case_is_hidden_from_the_active_list(self):
+    def test_a_completed_case_stays_listed_while_it_is_still_in_the_plan(self):
+        """Membership is the plan, not the status. Hiding a completed case made
+        the engineer's count smaller than OpenCall's Assigned column."""
         self._sync(["TKT-1", "TKT-2"])
         case = Case.objects.get(external_ref="TKT-1")
         case.status = "completed"
         case.save(update_fields=["status"])
 
-        refs = {c["external_ref"] for c in self._engineer_cases()}
-        self.assertEqual(refs, {"TKT-2"})
+        rows = {c["external_ref"]: c["status"] for c in self._engineer_cases()}
+        self.assertEqual(set(rows), {"TKT-1", "TKT-2"}, "both still assigned upstream")
+        self.assertEqual(rows["TKT-1"], "completed", "shown as finished, not hidden")
 
     def test_ticket_dropped_from_the_assigned_set_disappears(self):
         """Mirror mode: a ticket no longer in the Assigned set is cancelled
@@ -202,7 +205,10 @@ class CaseSyncTests(TestCase):
         )
         case.refresh_from_db()
         self.assertEqual(case.status, "completed")
-        self.assertEqual(self._engineer_cases(), [])
+        # Still counted: it was in this push, so it is still in the plan. The
+        # engineer sees it marked completed rather than having it vanish.
+        rows = {c["external_ref"]: c["status"] for c in self._engineer_cases()}
+        self.assertEqual(rows, {"TKT-1": "completed"})
 
     def test_reassigned_ticket_moves_to_the_new_engineer_and_restarts(self):
         other_user = User.objects.create_user(username="samim", password="x", role="employee")
@@ -385,6 +391,86 @@ class CaseSyncTests(TestCase):
 
         self._sync(["TKT-1"])
         self.assertEqual(Case.objects.get(external_ref="TKT-1").assigned_to_id, self.engineer.id)
+
+    # -- the count must equal OpenCall's Assigned column ----------------------
+
+    def _assert_parity(self, tickets):
+        """The engineer sees exactly the pushed Assigned set — no more, no fewer."""
+        seen = {c["external_ref"] for c in self._engineer_cases()}
+        self.assertEqual(
+            seen,
+            set(tickets),
+            f"Payroll shows {len(seen)} case(s), OpenCall assigned {len(tickets)}",
+        )
+
+    def test_the_list_holds_exactly_as_many_cases_as_were_assigned(self):
+        tickets = ["WO-1", "WO-2", "WO-3", "WO-4", "WO-5"]
+        self._sync(tickets)
+        self._assert_parity(tickets)
+
+    def test_a_case_the_engineer_completed_still_counts(self):
+        """This is the drift that made 5 upstream read as 4 here: filtering the
+        list by status dropped work the engineer had finished, while OpenCall
+        went on counting it as assigned."""
+        tickets = ["WO-1", "WO-2", "WO-3", "WO-4", "WO-5"]
+        self._sync(tickets)
+
+        case = Case.objects.get(external_ref="WO-3")
+        for step in ("accept", "start_travel", "reached", "start_work", "complete"):
+            res = self.engineer_client.post(f"/api/cases/{case.id}/{step}/")
+            self.assertEqual(res.status_code, 200, f"{step}: {res.data}")
+
+        # Still five, and the finished one still says so.
+        self._assert_parity(tickets)
+        rows = {c["external_ref"]: c["status"] for c in self._engineer_cases()}
+        self.assertEqual(rows["WO-3"], "completed")
+
+        # And it survives the next tick unchanged.
+        self._sync(tickets)
+        self._assert_parity(tickets)
+        self.assertEqual(Case.objects.get(external_ref="WO-3").status, "completed")
+
+    def test_a_ticket_that_leaves_the_plan_leaves_the_list(self):
+        self._sync(["WO-1", "WO-2", "WO-3"])
+        self._assert_parity(["WO-1", "WO-2", "WO-3"])
+
+        self._sync(["WO-1", "WO-3"])
+        self._assert_parity(["WO-1", "WO-3"])
+
+    def test_a_completed_ticket_that_leaves_the_plan_also_leaves_the_list(self):
+        """Parity works in both directions — a finished call that is no longer
+        booked must not linger and inflate the count."""
+        self._sync(["WO-1", "WO-2"])
+        case = Case.objects.get(external_ref="WO-2")
+        for step in ("accept", "start_travel", "reached", "start_work", "complete"):
+            self.engineer_client.post(f"/api/cases/{case.id}/{step}/")
+        self._assert_parity(["WO-1", "WO-2"])
+
+        self._sync(["WO-1"])
+
+        self._assert_parity(["WO-1"])
+        case.refresh_from_db()
+        self.assertEqual(case.status, "completed", "the outcome is never rewritten")
+        self.assertFalse(case.in_current_plan)
+
+    def test_a_ticket_that_comes_back_is_counted_again(self):
+        self._sync(["WO-1", "WO-2"])
+        self._sync(["WO-1"])
+        self._assert_parity(["WO-1"])
+
+        self._sync(["WO-1", "WO-2"])
+        self._assert_parity(["WO-1", "WO-2"])
+
+    def test_parity_holds_across_a_realistic_day(self):
+        """Praveen's actual shape: five assigned, one of them closed."""
+        tickets = ["WO-035491534", "WO-035454195", "WO-035444535", "WO-035362112", "WO-035451081"]
+        self._sync(tickets)
+
+        closed = Case.objects.get(external_ref="WO-035451081")
+        for step in ("accept", "start_travel", "reached", "start_work", "complete"):
+            self.engineer_client.post(f"/api/cases/{closed.id}/{step}/")
+
+        self.assertEqual(len(self._engineer_cases()), 5, "five assigned upstream, five here")
 
     def test_email_match_onto_a_loginless_row_is_reported_as_unreachable(self):
         """email/phone stay authoritative, but a case nobody can open is flagged."""

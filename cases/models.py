@@ -72,6 +72,15 @@ class Case(models.Model):
 
     resolution_notes = models.TextField(blank=True, default="")
 
+    # Is this ticket in the originating system's CURRENT plan for its engineer?
+    #
+    # Owned by the sync, and deliberately separate from `status`. The engineer's
+    # list is built from this flag alone, so it holds exactly as many cases as
+    # OpenCall's Assigned column shows — no more, no fewer. Keeping it apart from
+    # status is what lets both facts stay true at once: what happened to the call
+    # (status) and whether it is still booked to them (this).
+    in_current_plan = models.BooleanField(default=True, db_index=True)
+
     class Meta:
         ordering = ["-created_at"]
 
