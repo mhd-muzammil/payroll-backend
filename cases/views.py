@@ -907,6 +907,10 @@ class TrackingViewSet(viewsets.ViewSet):
 
         self._close_forgotten_sessions()
 
+        # Every active employee, with their duty state. WHICH of them counts as a
+        # field engineer is not Payroll's call — OpenCall's "Add Engineers" list
+        # is the authority, and the OpenCall side narrows this to those people.
+        # Answering broadly here keeps that decision in one place.
         engineers = Employee.objects.filter(status__in=["active", "onleave"])
         branches = get_allowed_branches(request.user, "attendance")
         if "All" not in branches:
