@@ -81,6 +81,15 @@ class Case(models.Model):
     # (status) and whether it is still booked to them (this).
     in_current_plan = models.BooleanField(default=True, db_index=True)
 
+    # Everything the originating system knows about the ticket — case id, WIP
+    # aging, product and serial, account, contact, the postal address. Stored as
+    # a bag rather than columns on purpose: OpenCall's report gains and renames
+    # columns, and an engineer should not wait for a migration here to see one.
+    # The fields an engineer acts on (customer_name, customer_phone, address)
+    # are ALSO copied to the real columns above, so they stay searchable and the
+    # rest of the app keeps working without knowing about this.
+    details = models.JSONField(default=dict, blank=True)
+
     class Meta:
         ordering = ["-created_at"]
 

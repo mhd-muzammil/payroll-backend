@@ -392,6 +392,121 @@ class CaseSyncTests(TestCase):
         self._sync(["TKT-1"])
         self.assertEqual(Case.objects.get(external_ref="TKT-1").assigned_to_id, self.engineer.id)
 
+    # -- the ticket detail the engineer needs on site -------------------------
+
+    def test_the_ticket_detail_reaches_the_engineer(self):
+        detail = {
+            "ticket_id": "WO-035444535",
+            "case_id": "5163050263",
+            "wip_aging": "4",
+            "location": "Padi",
+            "engineer": "Praveen",
+            "product_name": "HP LaserJet M404dn",
+            "product_serial_no": "CNB1234567",
+            "product_line_name": "LaserJet",
+            "work_location": "ASPS01461",
+            "account_name": "Acme Industries",
+            "customer_name": "Ramesh Kumar",
+            "contact": "9876543210",
+            "customer_mail": "ramesh@example.com",
+            "common_address": "12 Anna Salai, Padi",
+            "customer_address": "12 Anna Salai",
+            "customer_pincode": "600050",
+        }
+        res = self.bot_client.post(
+            "/api/cases/bulk_dispatch/",
+            {
+                "cases": [
+                    {
+                        "external_ref": "WO-035444535",
+                        "title": "Service call (WO-035444535)",
+                        "engineer_name": "Praveen",
+                        "status": "assigned",
+                        "customer_name": "Ramesh Kumar",
+                        "customer_phone": "9876543210",
+                        "address": "12 Anna Salai, Padi - 600050",
+                        "details": detail,
+                    }
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+
+        rows = self._engineer_cases()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        # The three the engineer acts on are real columns, not buried in the bag.
+        self.assertEqual(row["customer_name"], "Ramesh Kumar")
+        self.assertEqual(row["customer_phone"], "9876543210")
+        self.assertIn("Anna Salai", row["address"])
+        self.assertIn("600050", row["address"], "the pincode travels with the address")
+        # And every field asked for is on the record.
+        self.assertEqual(row["details"], detail)
+
+    def test_a_later_sync_replaces_the_detail_rather_than_merging_it(self):
+        """The originating system is the authority — a value it has cleared must
+        not survive here."""
+        self._sync(["TKT-1"])
+        case = Case.objects.get(external_ref="TKT-1")
+        case.details = {"contact": "9999999999", "product_name": "Old printer"}
+        case.save(update_fields=["details"])
+
+        self.bot_client.post(
+            "/api/cases/bulk_dispatch/",
+            {
+                "cases": [
+                    {
+                        "external_ref": "TKT-1",
+                        "title": "Service call (TKT-1)",
+                        "engineer_name": "Praveen",
+                        "status": "assigned",
+                        "details": {"product_name": "New printer"},
+                    }
+                ]
+            },
+            format="json",
+        )
+        case.refresh_from_db()
+        self.assertEqual(case.details, {"product_name": "New printer"})
+
+    def test_a_malformed_detail_payload_is_ignored(self):
+        res = self.bot_client.post(
+            "/api/cases/bulk_dispatch/",
+            {
+                "cases": [
+                    {
+                        "external_ref": "TKT-1",
+                        "title": "a",
+                        "engineer_name": "Praveen",
+                        "status": "assigned",
+                        "details": "not a dict",
+                    }
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(Case.objects.get(external_ref="TKT-1").details, {})
+
+    def test_a_ticket_with_no_detail_still_arrives(self):
+        """Detail is a bonus; a missing report row must never cost the engineer
+        the case itself."""
+        self._sync(["TKT-1"])
+        rows = self._engineer_cases()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["details"], {})
+
+    def test_an_engineer_cannot_edit_the_detail(self):
+        self._sync(["TKT-1"])
+        case = Case.objects.get(external_ref="TKT-1")
+        res = self.engineer_client.patch(
+            f"/api/cases/{case.id}/", {"details": {"contact": "0000000000"}}, format="json"
+        )
+        self.assertEqual(res.status_code, 403)
+        case.refresh_from_db()
+        self.assertEqual(case.details, {})
+
     # -- the count must equal OpenCall's Assigned column ----------------------
 
     def _assert_parity(self, tickets):

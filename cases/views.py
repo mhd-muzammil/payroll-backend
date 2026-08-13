@@ -352,6 +352,17 @@ class CaseViewSet(viewsets.ModelViewSet):
             pr = raw.get("priority")
             if pr in valid_priorities:
                 case.priority = pr
+            # Ticket detail for the engineer's screen: customer, contact,
+            # product, address. Replaced wholesale rather than merged — the
+            # originating system is the authority, and a merge would keep a
+            # value it has since cleared. Non-dict payloads are ignored so a bad
+            # item cannot poison the record.
+            incoming_details = raw.get("details")
+            if isinstance(incoming_details, dict):
+                case.details = {
+                    str(k): ("" if v is None else str(v))
+                    for k, v in incoming_details.items()
+                }
 
             engineer = self._resolve_engineer(raw)
             if engineer is None:
