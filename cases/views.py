@@ -881,6 +881,120 @@ class TrackingViewSet(viewsets.ViewSet):
         )
 
     @action(detail=False, methods=["get"])
+    def roster(self, request):
+        """EVERY engineer and where they stand on a given day.
+
+        /live answers "who is out right now", which means an engineer vanishes
+        from it the moment they tap Stop Duty — and then nobody can open their
+        day. This is the board you pick from: on duty, checked out, or never
+        started, all clickable.
+
+        Query: ?date=YYYY-MM-DD (defaults to today)
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        date_str = request.query_params.get("date")
+        if date_str:
+            try:
+                target_date = parse_date(date_str)
+            except ValueError:
+                target_date = None
+            if not target_date:
+                return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
+        else:
+            target_date = timezone.localdate()
+
+        self._close_forgotten_sessions()
+
+        engineers = Employee.objects.filter(status__in=["active", "onleave"])
+        branches = get_allowed_branches(request.user, "attendance")
+        if "All" not in branches:
+            engineers = engineers.filter(branch__in=branches)
+        engineers = list(engineers.order_by("employee_name"))
+        if not engineers:
+            return Response([])
+
+        ids = [e.id for e in engineers]
+
+        # That day's duty, per engineer: the open one if there is one, otherwise
+        # the last that ended.
+        sessions_by_engineer = {}
+        for session in DutySession.objects.filter(
+            engineer_id__in=ids, started_at__date=target_date
+        ).order_by("started_at"):
+            current = sessions_by_engineer.get(session.engineer_id)
+            # An open session always wins; otherwise keep the latest.
+            if current is None or session.ended_at is None or current.ended_at is not None:
+                sessions_by_engineer[session.engineer_id] = session
+
+        # Their last fix of that day, for the marker and the "last seen" age.
+        latest_ids = (
+            LocationPing.objects.filter(engineer_id__in=ids, timestamp__date=target_date)
+            .order_by()
+            .values("engineer")
+            .annotate(last_id=Max("id"))
+            .values_list("last_id", flat=True)
+        )
+        latest_by_engineer = {
+            p.engineer_id: p
+            for p in LocationPing.objects.select_related("case").filter(id__in=list(latest_ids))
+        }
+
+        # One pass over the day's fixes so distance costs a single query rather
+        # than one per engineer.
+        trails = {}
+        for ping in LocationPing.objects.filter(
+            engineer_id__in=ids, timestamp__date=target_date
+        ).order_by("timestamp"):
+            trails.setdefault(ping.engineer_id, []).append(ping)
+
+        now = timezone.now()
+        rows = []
+        for engineer in engineers:
+            session = sessions_by_engineer.get(engineer.id)
+            ping = latest_by_engineer.get(engineer.id)
+            trail = trails.get(engineer.id, [])
+
+            if session and session.ended_at is None:
+                state = "on_duty"
+            elif session:
+                state = "checked_out"
+            else:
+                state = "absent"
+
+            last_seen_minutes = (
+                int((now - ping.timestamp).total_seconds() // 60) if ping else None
+            )
+            rows.append(
+                {
+                    "engineer_id": engineer.id,
+                    "engineer_name": engineer.employee_name,
+                    "branch": engineer.branch,
+                    "state": state,
+                    "on_duty": state == "on_duty",
+                    "duty_started_at": session.started_at if session else None,
+                    "duty_ended_at": session.ended_at if session else None,
+                    "duty_minutes": session.duration_minutes() if session else 0,
+                    "auto_closed": bool(session.auto_closed) if session else False,
+                    "distance_km": _trail_km(trail),
+                    # Only meaningful while on duty; a checked-out engineer is
+                    # not expected to be reporting.
+                    "stale": state == "on_duty"
+                    and (ping is None or (now - ping.timestamp) > timedelta(minutes=LIVE_WINDOW_MINUTES)),
+                    "last_seen_minutes": last_seen_minutes,
+                    "latitude": ping.latitude if ping else None,
+                    "longitude": ping.longitude if ping else None,
+                    "accuracy": ping.accuracy if ping else None,
+                    "status": ping.status if ping else "",
+                    "timestamp": ping.timestamp if ping else None,
+                    "active_case_id": ping.case_id if ping else None,
+                    "active_case_number": ping.case.case_number if (ping and ping.case) else None,
+                }
+            )
+        return Response(rows)
+
+    @action(detail=False, methods=["get"])
     def day(self, request):
         """One engineer's whole day: the route, the distance, the time on duty,
         where they stood still and for how long, and a timeline of what happened.

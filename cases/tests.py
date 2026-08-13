@@ -796,6 +796,142 @@ class DutyAndLiveTrackingTests(TestCase):
         self.assertEqual(res.status_code, 403)
 
 
+class EngineerRosterTests(TestCase):
+    """The board you pick an engineer from. Unlike /live it holds EVERYONE, so
+    someone who has finished their shift can still be opened and reviewed."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            username="ops", password="x", role="admin", is_staff=True
+        )
+        self.client_admin = APIClient()
+        self.client_admin.force_authenticate(self.admin)
+
+        self.on_duty = self._engineer("On Duty Ravi", "Chennai")
+        self.checked_out = self._engineer("Checked Out Kumar", "Chennai")
+        self.absent = self._engineer("Absent Suresh", "Chennai")
+
+    def _engineer(self, name, branch):
+        user = User.objects.create_user(
+            username=name.replace(" ", "-").lower(), password="x", role="employee"
+        )
+        return Employee.objects.create(
+            user=user, employee_name=name, branch=branch, salary=0, status="active"
+        )
+
+    def _roster(self, **params):
+        res = self.client_admin.get("/api/tracking/roster/", params)
+        self.assertEqual(res.status_code, 200, res.data)
+        return {row["engineer_name"]: row for row in res.data}
+
+    def test_everyone_is_on_the_board_whatever_their_state(self):
+        DutySession.objects.create(engineer=self.on_duty)
+        closed = DutySession.objects.create(engineer=self.checked_out)
+        closed.ended_at = timezone.now()
+        closed.save(update_fields=["ended_at"])
+
+        roster = self._roster()
+        self.assertEqual(roster["On Duty Ravi"]["state"], "on_duty")
+        self.assertEqual(roster["Checked Out Kumar"]["state"], "checked_out")
+        self.assertEqual(roster["Absent Suresh"]["state"], "absent")
+        self.assertEqual(len(roster), 3, "nobody is left off the board")
+
+    def test_an_engineer_who_finished_their_shift_can_still_be_opened(self):
+        """The reason this endpoint exists: /live drops them, and then their day
+        is unreachable."""
+        session = DutySession.objects.create(engineer=self.checked_out)
+        session.ended_at = timezone.now()
+        session.save(update_fields=["ended_at"])
+
+        self.assertEqual(self.client_admin.get("/api/tracking/live/").data, [])
+        self.assertIn("Checked Out Kumar", self._roster())
+
+    def test_the_board_carries_the_numbers_needed_to_read_a_row(self):
+        session = DutySession.objects.create(engineer=self.checked_out)
+        session.started_at = timezone.now() - timedelta(hours=2)
+        session.ended_at = timezone.now()
+        session.save(update_fields=["started_at", "ended_at"])
+        for lat in (13.00, 13.09):
+            LocationPing.objects.create(
+                engineer=self.checked_out, latitude=lat, longitude=80.0, accuracy=10
+            )
+
+        row = self._roster()["Checked Out Kumar"]
+        self.assertGreaterEqual(row["duty_minutes"], 119)
+        self.assertGreater(row["distance_km"], 9)
+        self.assertIsNotNone(row["duty_ended_at"])
+        self.assertIsNotNone(row["latitude"], "their last known position")
+
+    def test_a_checked_out_engineer_is_never_flagged_as_no_signal(self):
+        """Nobody expects a phone to report after the shift ended."""
+        session = DutySession.objects.create(engineer=self.checked_out)
+        session.ended_at = timezone.now()
+        session.save(update_fields=["ended_at"])
+
+        self.assertFalse(self._roster()["Checked Out Kumar"]["stale"])
+
+    def test_an_on_duty_engineer_with_no_recent_fix_is_flagged(self):
+        DutySession.objects.create(engineer=self.on_duty)
+        ping = LocationPing.objects.create(
+            engineer=self.on_duty, latitude=13.0, longitude=80.0, accuracy=10
+        )
+        ping.timestamp = timezone.now() - timedelta(minutes=30)
+        ping.save(update_fields=["timestamp"])
+
+        row = self._roster()["On Duty Ravi"]
+        self.assertTrue(row["stale"])
+        self.assertGreaterEqual(row["last_seen_minutes"], 29)
+
+    def test_an_earlier_day_shows_that_day_state(self):
+        yesterday = timezone.localdate() - timedelta(days=1)
+        session = DutySession.objects.create(engineer=self.checked_out)
+        session.started_at = timezone.now() - timedelta(days=1, hours=3)
+        session.ended_at = timezone.now() - timedelta(days=1)
+        session.save(update_fields=["started_at", "ended_at"])
+
+        self.assertEqual(
+            self._roster(date=yesterday.isoformat())["Checked Out Kumar"]["state"], "checked_out"
+        )
+        self.assertEqual(self._roster()["Checked Out Kumar"]["state"], "absent")
+
+    def test_an_open_session_wins_over_an_earlier_finished_one(self):
+        first = DutySession.objects.create(engineer=self.on_duty)
+        first.started_at = timezone.now() - timedelta(hours=5)
+        first.ended_at = timezone.now() - timedelta(hours=4)
+        first.save(update_fields=["started_at", "ended_at"])
+        DutySession.objects.create(engineer=self.on_duty)  # back on duty now
+
+        self.assertEqual(self._roster()["On Duty Ravi"]["state"], "on_duty")
+
+    def test_branch_scoped_staff_see_only_their_branch(self):
+        other = self._engineer("Vellore Vishnu", "Vellore")
+        DutySession.objects.create(engineer=other)
+
+        scoped = User.objects.create_user(
+            username="vellore-hr",
+            password="x",
+            role="hr",
+            assigned_branch="Vellore",
+            allowed_sections={"attendance": ["Vellore"]},
+        )
+        client = APIClient()
+        client.force_authenticate(scoped)
+        res = client.get("/api/tracking/roster/")
+        self.assertEqual([r["engineer_name"] for r in res.data], ["Vellore Vishnu"])
+
+    def test_an_engineer_cannot_read_the_board(self):
+        client = APIClient()
+        client.force_authenticate(self.on_duty.user)
+        self.assertEqual(client.get("/api/tracking/roster/").status_code, 403)
+
+    def test_inactive_employees_are_left_off(self):
+        gone = self._engineer("Left The Company", "Chennai")
+        gone.status = "inactive"
+        gone.save(update_fields=["status"])
+
+        self.assertNotIn("Left The Company", self._roster())
+
+
 class EngineerDayViewTests(TestCase):
     """The "what did they actually do today" view: route, distance, time on duty,
     where they stood still and for how long, and a readable timeline."""
