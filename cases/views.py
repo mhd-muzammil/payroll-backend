@@ -946,24 +946,43 @@ class TrackingViewSet(viewsets.ViewSet):
 
         branches = get_allowed_branches(request.user, "attendance")
 
-        # Asked for by name (the caller's engineer register), or every active
-        # employee when no names are given.
-        requested_names = request.data.get("names") if request.method == "POST" else None
+        # Asked for by the caller's engineer register, or every active employee
+        # when nothing is named.
+        #
+        # Each entry may be a bare name or {name, email, phone}. The keys matter:
+        # email and phone are unique here and are what actually resolve a person,
+        # and the case dispatch always sends them. Asking by name alone made the
+        # board disagree with the cases — a ticket reached Praveen because his
+        # email matched, while the roster could not choose between the Praveens
+        # and reported nobody on duty while he was out on a call.
+        requested = request.data.get("engineers") if request.method == "POST" else None
+        if requested is None and request.method == "POST":
+            # Older callers send a plain list of names.
+            requested = request.data.get("names")
 
         # (employee, the name the caller asked under) — the caller's spelling is
         # echoed back so their board can label the row the way their users know it.
         resolved = []
         unmatched_names = []
-        if isinstance(requested_names, list):
+        if isinstance(requested, list):
             seen = set()
-            for raw_name in requested_names:
-                name = str(raw_name or "").strip()
+            for raw in requested:
+                if isinstance(raw, dict):
+                    name = str(raw.get("name") or "").strip()
+                    lookup = {
+                        "engineer_name": name,
+                        "engineer_email": raw.get("email"),
+                        "engineer_phone": raw.get("phone"),
+                    }
+                else:
+                    name = str(raw or "").strip()
+                    lookup = {"engineer_name": name}
                 if not name or name.lower() in seen:
                     continue
                 seen.add(name.lower())
-                # The SAME resolution the case dispatch uses, so an engineer who
-                # can receive a case can always be tracked, and vice versa.
-                employee = resolve_engineer({"engineer_name": name})
+                # The SAME resolution the case dispatch uses, with the same keys,
+                # so an engineer who can receive a case can always be tracked.
+                employee = resolve_engineer(lookup)
                 if employee and ("All" in branches or employee.branch in branches):
                     resolved.append((employee, name))
                 else:

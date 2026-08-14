@@ -899,6 +899,51 @@ class EngineerRosterTests(TestCase):
         self.assertEqual(res.status_code, 200, res.data)
         return {row["engineer_name"]: row for row in res.data}
 
+    def test_the_board_resolves_by_email_the_way_case_dispatch_does(self):
+        """The bug this exists for: a ticket reached the engineer because Payroll
+        matched their EMAIL, while the board asked by name only, could not choose
+        between the namesakes, and reported nobody on duty while they were out."""
+        self.on_duty.email = "ravi@example.com"
+        self.on_duty.phone = "9000012345"
+        self.on_duty.save(update_fields=["email", "phone"])
+        # A second person with the same first name makes the name alone useless.
+        self._engineer("On Duty Ravi Kumar", "Chennai")
+        DutySession.objects.create(engineer=self.on_duty)
+
+        by_name_only = self.client_admin.post(
+            "/api/tracking/roster/", {"names": ["On Duty"]}, format="json"
+        )
+        self.assertEqual(by_name_only.status_code, 200, by_name_only.data)
+        self.assertEqual(
+            [r["state"] for r in by_name_only.data],
+            ["unmatched"],
+            "the name alone cannot choose between the two, and must not guess",
+        )
+
+        with_keys = self.client_admin.post(
+            "/api/tracking/roster/",
+            {"engineers": [{"name": "On Duty", "email": "ravi@example.com"}]},
+            format="json",
+        )
+        self.assertEqual(with_keys.status_code, 200, with_keys.data)
+        row = with_keys.data[0]
+        self.assertEqual(row["payroll_name"], "On Duty Ravi")
+        self.assertEqual(row["state"], "on_duty", "the email resolves it, as it does for cases")
+        self.assertEqual(row["engineer_name"], "On Duty", "the caller's spelling is kept")
+
+    def test_the_board_resolves_by_phone_too(self):
+        self.on_duty.phone = "9000067890"
+        self.on_duty.save(update_fields=["phone"])
+        DutySession.objects.create(engineer=self.on_duty)
+
+        res = self.client_admin.post(
+            "/api/tracking/roster/",
+            {"engineers": [{"name": "Nobody By That Name", "phone": "9000067890"}]},
+            format="json",
+        )
+        self.assertEqual(res.data[0]["state"], "on_duty")
+        self.assertEqual(res.data[0]["payroll_name"], "On Duty Ravi")
+
     def test_everyone_is_on_the_board_whatever_their_state(self):
         DutySession.objects.create(engineer=self.on_duty)
         closed = DutySession.objects.create(engineer=self.checked_out)
