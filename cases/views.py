@@ -979,6 +979,37 @@ class TrackingViewSet(viewsets.ViewSet):
 
         ids = [e.id for e, _ in resolved]
 
+        # Every open duty session for the day, whether or not anybody asked about
+        # its engineer. When the board reads "0 on duty" and an engineer is
+        # plainly on duty in the app, this is the line that says which of the two
+        # possible reasons it is: no session exists at all, or a session exists
+        # against an employee that none of the requested names resolves to.
+        open_today = list(
+            DutySession.objects.filter(
+                ended_at__isnull=True, started_at__date=target_date
+            ).select_related("engineer")
+        )
+        if open_today:
+            asked_for = {e.id for e, _ in resolved}
+            logger.info(
+                "roster %s: open duty -> %s | asked about %d name(s), %d resolved",
+                target_date,
+                "; ".join(
+                    f"{s.engineer.employee_name} (id={s.engineer_id}, "
+                    f"{'asked about' if s.engineer_id in asked_for else 'NOT ASKED ABOUT'})"
+                    for s in open_today
+                ),
+                len(resolved) + len(unmatched_names),
+                len(resolved),
+            )
+        else:
+            logger.info(
+                "roster %s: no open duty session at all for this date (%d resolved, %d unmatched)",
+                target_date,
+                len(resolved),
+                len(unmatched_names),
+            )
+
         # That day's duty, per engineer: the open one if there is one, otherwise
         # the last that ended.
         sessions_by_engineer = {}
