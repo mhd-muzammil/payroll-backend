@@ -509,6 +509,81 @@ class CaseSyncTests(TestCase):
 
     # -- the count must equal OpenCall's Assigned column ----------------------
 
+    def _sync_for(self, tickets, plan_date):
+        """One sync tick that says which plan day it speaks for."""
+        res = self.bot_client.post(
+            "/api/cases/bulk_dispatch/",
+            {
+                "plan_date": plan_date.isoformat(),
+                "cases": [
+                    {
+                        "external_ref": t,
+                        "title": f"Service call ({t})",
+                        "engineer_name": "Praveen",
+                        "status": "assigned",
+                    }
+                    for t in tickets
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        return res.data
+
+    def test_only_todays_plan_reaches_the_engineer(self):
+        """Yesterday's calls must not sit on today's list."""
+        yesterday = timezone.localdate() - timedelta(days=1)
+        self._sync_for(["WO-OLD-1", "WO-OLD-2"], yesterday)
+        self.assertEqual(self._engineer_cases(), [], "yesterday's plan is not today's list")
+
+        self._sync_for(["WO-NEW-1"], timezone.localdate())
+        refs = {c["external_ref"] for c in self._engineer_cases()}
+        self.assertEqual(refs, {"WO-NEW-1"})
+
+    def test_a_call_carried_into_today_keeps_showing(self):
+        yesterday = timezone.localdate() - timedelta(days=1)
+        self._sync_for(["WO-CARRIED"], yesterday)
+        self.assertEqual(self._engineer_cases(), [])
+
+        # Still open, so today's plan carries it again.
+        self._sync_for(["WO-CARRIED"], timezone.localdate())
+        refs = {c["external_ref"] for c in self._engineer_cases()}
+        self.assertEqual(refs, {"WO-CARRIED"})
+
+    def test_yesterdays_calls_age_out_even_if_the_sync_stops(self):
+        """The date does the work, so a stopped sync cannot leave stale cases on
+        an engineer's screen — the mirror pass never has to run."""
+        yesterday = timezone.localdate() - timedelta(days=1)
+        self._sync_for(["WO-STALE"], yesterday)
+        case = Case.objects.get(external_ref="WO-STALE")
+        # Still flagged in-plan, because nothing ever retracted it.
+        self.assertTrue(case.in_current_plan)
+        self.assertEqual(self._engineer_cases(), [])
+
+    def test_a_case_created_in_payroll_by_hand_is_always_shown(self):
+        Case.objects.create(
+            customer_name="Walk-in",
+            title="Manual case",
+            assigned_to=self.engineer,
+            status="assigned",
+        )
+        refs = [c["title"] for c in self._engineer_cases()]
+        self.assertEqual(refs, ["Manual case"], "no plan owns it, so no date hides it")
+
+    def test_a_malformed_plan_date_does_not_lose_the_batch(self):
+        res = self.bot_client.post(
+            "/api/cases/bulk_dispatch/",
+            {
+                "plan_date": "2026-13-45",
+                "cases": [
+                    {"external_ref": "WO-1", "title": "a", "engineer_name": "Praveen", "status": "assigned"}
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["assigned"], 1)
+
     def _assert_parity(self, tickets):
         """The engineer sees exactly the pushed Assigned set — no more, no fewer."""
         seen = {c["external_ref"] for c in self._engineer_cases()}

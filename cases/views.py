@@ -253,15 +253,21 @@ class CaseViewSet(viewsets.ModelViewSet):
             employee = _get_employee(user)
             if not employee:
                 raise NoEmployeeProfile()
-            # EXACTLY the engineer's Assigned column, one case per ticket.
+            # EXACTLY the engineer's Assigned column for TODAY, one case per ticket.
             #
-            # Driven by in_current_plan, not by status: filtering on status made
-            # the count drift from what OpenCall shows — a call the engineer had
-            # completed dropped out of their list while OpenCall still counted it
-            # as assigned, so 5 upstream showed as 4 here. A ticket leaves this
-            # list only when it leaves the plan, which the mirror pass records.
-            return qs.filter(assigned_to=employee, in_current_plan=True).exclude(
-                status="cancelled"
+            # Driven by the plan, not by status: filtering on status made the count
+            # drift from what OpenCall shows — a call the engineer had completed
+            # dropped out of their list while OpenCall still counted it as
+            # assigned, so 5 upstream showed as 4 here.
+            #
+            # plan_date is what keeps yesterday out. The mirror pass also clears
+            # in_current_plan, but that only happens when a sync runs; the date
+            # means a stale ticket cannot outlive the day even if the sync stops.
+            # A case created by hand in Payroll has no plan and is always shown.
+            return (
+                qs.filter(assigned_to=employee, in_current_plan=True)
+                .filter(Q(plan_date=timezone.localdate()) | Q(plan_date__isnull=True))
+                .exclude(status="cancelled")
             )
 
         # Staff: branch-scoped by the assigned engineer's branch. Unassigned
@@ -405,6 +411,16 @@ class CaseViewSet(viewsets.ModelViewSet):
         mirror = request.data.get("mirror", True)
         assigned_refs = set()
 
+        # The plan day this batch speaks for, as the originating system counts
+        # days. Stamped on every case pushed, so the engineer's list can show
+        # today's plan and let yesterday's fall away on its own. A malformed value
+        # is ignored rather than fatal — losing the date costs a stale row for a
+        # day, refusing the batch costs every engineer their whole list.
+        try:
+            plan_date = parse_date((request.data.get("plan_date") or "").strip())
+        except (ValueError, TypeError):
+            plan_date = None
+
         valid_priorities = dict(Case.PRIORITY_CHOICES)
         created = updated = assigned = skipped = 0
         details = []
@@ -476,6 +492,8 @@ class CaseViewSet(viewsets.ModelViewSet):
             # Pushed in this batch, so it IS in the plan — including a ticket
             # coming back after having dropped out.
             case.in_current_plan = True
+            if plan_date:
+                case.plan_date = plan_date
             case.assigned_to = engineer
             case.assigned_by = request.user
             # Stamp on first assignment, and re-stamp when the ticket actually

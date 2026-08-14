@@ -23,6 +23,7 @@ class CaseSerializer(serializers.ModelSerializer):
             # count equal OpenCall's Assigned column, so a raw PATCH must not
             # move a case in or out of the plan.
             "in_current_plan",
+            "plan_date",
             # Mirrors the originating system's ticket row; only the sync writes it.
             "details",
             "assigned_to",

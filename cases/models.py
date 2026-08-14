@@ -81,6 +81,14 @@ class Case(models.Model):
     # (status) and whether it is still booked to them (this).
     in_current_plan = models.BooleanField(default=True, db_index=True)
 
+    # WHICH day's plan last carried this ticket, as the originating system counts
+    # days. The engineer's list shows today's only, so yesterday's calls fall off
+    # by themselves at midnight — no sweep has to run and no stale ticket can
+    # survive the sync stopping. A call still open today is pushed again today and
+    # keeps this current; one that has left the plan simply stops being renewed.
+    # Null for a case created by hand in Payroll, which no plan owns.
+    plan_date = models.DateField(null=True, blank=True, db_index=True)
+
     # Everything the originating system knows about the ticket — case id, WIP
     # aging, product and serial, account, contact, the postal address. Stored as
     # a bag rather than columns on purpose: OpenCall's report gains and renames
