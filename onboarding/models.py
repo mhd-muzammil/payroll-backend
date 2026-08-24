@@ -121,8 +121,35 @@ class Candidate(models.Model):
         return f"{self.name} - {self.segment} ({self.action})"
 
 
+import logging
+
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+
+logger = logging.getLogger(__name__)
+
+# Everything on Employee that onboarding writes and that CANNOT collide with
+# another row. email and phone are deliberately absent: they are unique, so they
+# are the only two that can ever fail, and they must not take the rest with them.
+_NON_UNIQUE_EMPLOYEE_FIELDS = [
+    "employee_name",
+    "emp_code",
+    "department",
+    "role",
+    "branch",
+    "date_of_joining",
+    "status",
+]
+
+
+def _identity_clashes(Employee, emp):
+    """Which unique field on this employee is already somebody else's."""
+    clashes = []
+    for field in ("email", "phone"):
+        wanted = getattr(emp, field, None)
+        if wanted and Employee.objects.filter(**{field: wanted}).exclude(pk=emp.pk).exists():
+            clashes.append(f"{field}={wanted!r}")
+    return clashes
 
 
 def _ensure_user_for_employee(emp):
@@ -212,7 +239,7 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
     """Automatically connects or creates corresponding Employee record upon Onboarding save."""
     from employees.models import Employee
     from decimal import Decimal
-    from django.db import IntegrityError
+    from django.db import IntegrityError, transaction
 
     valid_branches = ['Chennai', 'Vellore', 'Salem', 'Kanchipuram', 'Hosur']
     branch_name = 'Chennai'
@@ -278,13 +305,45 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
         # the next save of their onboarding row.
         emp.status = _employee_status_for(instance.employment_status)
         try:
-            emp.save()
+            # atomic() so a failure rolls back to a savepoint. Without it the
+            # broken statement poisons the whole transaction on PostgreSQL and
+            # every query after this one fails too.
+            with transaction.atomic():
+                emp.save()
         except IntegrityError:
-            pass
+            # email and phone are UNIQUE, and an onboarding form can carry one
+            # that already belongs to somebody else — usually a duplicate row for
+            # the same person. This used to swallow the ENTIRE update, so the
+            # hire date went with it: HR filled in a joining date, the onboarding
+            # record saved cleanly, and the Employees list showed a blank Joined
+            # column with nothing anywhere saying why.
+            #
+            # A hire date cannot collide with anything. Put the clashing identity
+            # back and write everything that is safe to write.
+            clashes = _identity_clashes(Employee, emp)
+            emp.refresh_from_db(fields=["email", "phone"])
+            try:
+                with transaction.atomic():
+                    emp.save(update_fields=_NON_UNIQUE_EMPLOYEE_FIELDS)
+                logger.warning(
+                    "onboarding %r: kept the hire date, but could not apply %s — "
+                    "already used by another employee row. Merge the duplicates.",
+                    instance.employee_name,
+                    ", ".join(clashes) or "an identity field",
+                )
+            except IntegrityError:
+                logger.warning(
+                    "onboarding %r: the employee row could not be updated at all (%s)",
+                    instance.employee_name,
+                    ", ".join(clashes) or "unknown conflict",
+                )
     else:
         # Create new Employee
         try:
-            emp = Employee.objects.create(
+            # See above: atomic() keeps a failed INSERT from poisoning the
+            # transaction, so the fallback lookup below can still run.
+            with transaction.atomic():
+                emp = Employee.objects.create(
                 employee_name=instance.employee_name.strip() if instance.employee_name else "New Employee",
                 emp_code=instance.employee_id.strip() if instance.employee_id else None,
                 email=instance.email_id.strip() if instance.email_id else None,
@@ -294,16 +353,33 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
                 branch=branch_name,
                 salary=Decimal('0.00'),
                 status=_employee_status_for(instance.employment_status),
-                date_of_joining=instance.date_of_joining,
-            )
+                    date_of_joining=instance.date_of_joining,
+                )
         except IntegrityError:
             emp = Employee.objects.filter(employee_name__iexact=instance.employee_name.strip()).first()
             if emp:
+                # Reached when the new row's email or phone is already taken. The
+                # hire date still belongs on whoever this is.
                 emp.status = _employee_status_for(instance.employment_status)
+                if instance.date_of_joining:
+                    emp.date_of_joining = instance.date_of_joining
                 try:
-                    emp.save()
+                    with transaction.atomic():
+                        emp.save(update_fields=["status", "date_of_joining"])
                 except Exception:
-                    pass
+                    logger.warning(
+                        "onboarding %r: could not create or update an employee row",
+                        instance.employee_name,
+                    )
+            else:
+                logger.warning(
+                    "onboarding %r: no employee row could be created (%s)",
+                    instance.employee_name,
+                    ", ".join(_identity_clashes(Employee, Employee(
+                        email=(instance.email_id or "").strip() or None,
+                        phone=(instance.mobile_number or "").strip() or None,
+                    ))) or "unknown conflict",
+                )
 
     # Ensure the employee has a linked login user, so onboarding auto-provisions
     # across all sections: the account shows in Users (with a shareable password),

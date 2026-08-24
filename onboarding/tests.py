@@ -2,13 +2,15 @@ import shutil
 import tempfile
 
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import override_settings
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
 from authentication.models import User
 from .models import Onboarding
+from decimal import Decimal
+from employees.models import Employee
 
 
 class ProtectedOnboardingDocumentTests(APITestCase):
@@ -206,3 +208,88 @@ class EmploymentStatusTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("employment_status", response.data)
+
+
+class OnboardingHireDateSurvivesConflictTests(TestCase):
+    """The hire date must reach the employee even when their identity cannot.
+
+    Employee.email and Employee.phone are UNIQUE. Onboarding is matched to an
+    employee by email first, so a phone number that belongs to a THIRD row is
+    only discovered when the update is written — as an IntegrityError. That used
+    to be swallowed by a bare `except IntegrityError: pass`, taking
+    date_of_joining down with it: HR filled in a joining date, the onboarding
+    record saved cleanly, and the Employees list showed a blank Joined column
+    with nothing anywhere saying why.
+
+    A hire date cannot collide with anything. It has no business being lost
+    because a phone number did.
+    """
+
+    def _onboard(self, **kwargs):
+        defaults = dict(
+            employee_name="Vishnu S",
+            department="General",
+            designation="Service engineer",
+            work_location="Vellore",
+            date_of_joining="2026-03-15",
+            mobile_number="9943150841",
+            email_id="mahavishnu6598@gmail.com",
+        )
+        defaults.update(kwargs)
+        return Onboarding.objects.create(**defaults)
+
+    def _employee(self, name, **kwargs):
+        return Employee.objects.create(
+            employee_name=name,
+            branch=kwargs.pop("branch", "Vellore"),
+            role=kwargs.pop("role", "service engineer"),
+            department=kwargs.pop("department", "General"),
+            salary=kwargs.pop("salary", Decimal("23456.00")),
+            **kwargs,
+        )
+
+    def test_hire_date_lands_even_when_the_phone_belongs_to_a_third_row(self):
+        # Matched on email, so the clash on phone only surfaces on save.
+        target = self._employee("Vishnu S", email="mahavishnu6598@gmail.com")
+        self._employee("Someone Else", phone="9943150841")
+
+        self._onboard()
+
+        target.refresh_from_db()
+        self.assertEqual(str(target.date_of_joining), "2026-03-15")
+        # The clashing number stays with whoever already had it.
+        self.assertIsNone(target.phone)
+
+    def test_the_rest_of_the_onboarding_details_land_too(self):
+        target = self._employee("Vishnu S", email="mahavishnu6598@gmail.com", role="old role")
+        self._employee("Someone Else", phone="9943150841")
+
+        self._onboard()
+
+        target.refresh_from_db()
+        self.assertEqual(target.role, "Service engineer")
+        self.assertEqual(target.department, "General")
+        self.assertEqual(str(target.date_of_joining), "2026-03-15")
+
+    def test_a_clean_onboarding_still_writes_everything(self):
+        target = self._employee("Vishnu S", role="old role")
+
+        self._onboard()
+
+        target.refresh_from_db()
+        self.assertEqual(str(target.date_of_joining), "2026-03-15")
+        self.assertEqual(target.email, "mahavishnu6598@gmail.com")
+        self.assertEqual(target.phone, "9943150841")
+        self.assertEqual(target.role, "Service engineer")
+
+    def test_the_conflict_is_reported_rather_than_swallowed(self):
+        self._employee("Vishnu S", email="mahavishnu6598@gmail.com")
+        self._employee("Someone Else", phone="9943150841")
+
+        with self.assertLogs("onboarding", level="WARNING") as captured:
+            self._onboard()
+
+        joined = " ".join(captured.output)
+        self.assertIn("Vishnu S", joined)
+        # Names the field that could not be written, so HR knows what to merge.
+        self.assertIn("phone", joined)
