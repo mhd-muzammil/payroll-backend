@@ -1363,3 +1363,132 @@ class EngineerDayViewTests(TestCase):
             ).status_code,
             400,
         )
+
+
+class SyncForAnotherDayLeavesTodayAloneTests(TestCase):
+    """A batch only speaks for its own day.
+
+    The auto-sync always sends today. The MANUAL sync endpoint takes its date
+    from whoever calls it — and the mirror sweep was scoped to no day at all, so
+    a re-sync of an earlier working date cleared in_current_plan on every synced
+    case in the table. Every engineer's list emptied at once while OpenCall still
+    showed their assignments, and nothing anywhere said why.
+    """
+
+    def setUp(self):
+        self.bot = User.objects.create_user(
+            username="opencall-bot", password="x", role="admin", is_staff=True
+        )
+        self.engineer_user = User.objects.create_user(
+            username="praveen", password="x", role="employee"
+        )
+        self.engineer = Employee.objects.create(
+            user=self.engineer_user,
+            employee_name="Praveen S",
+            branch="Chennai",
+            salary=0,
+        )
+        self.bot_client = APIClient()
+        self.bot_client.force_authenticate(self.bot)
+        self.engineer_client = APIClient()
+        self.engineer_client.force_authenticate(self.engineer_user)
+
+        self.today = timezone.localdate()
+        self.older = self.today - timedelta(days=11)
+
+    def _sync(self, tickets, plan_date):
+        body = {
+            "plan_date": plan_date.isoformat(),
+            "cases": [
+                {
+                    "external_ref": ticket,
+                    "title": f"Service call ({ticket})",
+                    "engineer_name": "Praveen",
+                    "status": "assigned",
+                }
+                for ticket in tickets
+            ],
+        }
+        res = self.bot_client.post("/api/cases/bulk_dispatch/", body, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        return res.data
+
+    def _engineer_sees(self):
+        res = self.engineer_client.get("/api/cases/")
+        self.assertEqual(res.status_code, 200, res.data)
+        data = res.data
+        rows = data["results"] if isinstance(data, dict) and "results" in data else data
+        return sorted(case["external_ref"] for case in rows)
+
+    def test_a_resync_of_an_older_day_does_not_empty_todays_list(self):
+        self._sync(["T-TODAY-1", "T-TODAY-2"], self.today)
+        self.assertEqual(self._engineer_sees(), ["T-TODAY-1", "T-TODAY-2"])
+
+        # The call that used to wipe the day.
+        self._sync(["T-OLD-1"], self.older)
+
+        self.assertEqual(self._engineer_sees(), ["T-TODAY-1", "T-TODAY-2"])
+
+    def test_an_older_batch_does_not_cancel_todays_calls(self):
+        self._sync(["T-TODAY-1"], self.today)
+        self._sync(["T-OLD-1"], self.older)
+
+        case = Case.objects.get(external_ref="T-TODAY-1")
+        self.assertTrue(case.in_current_plan)
+        self.assertNotEqual(case.status, "cancelled")
+
+    def test_the_older_batch_still_lands_it_is_simply_not_todays_plan(self):
+        self._sync(["T-OLD-1"], self.older)
+
+        case = Case.objects.get(external_ref="T-OLD-1")
+        self.assertEqual(case.assigned_to_id, self.engineer.id)
+        self.assertEqual(case.plan_date, self.older)
+        self.assertEqual(self._engineer_sees(), [])
+
+    def test_todays_sync_still_drops_a_ticket_that_left_todays_plan(self):
+        self._sync(["T-A", "T-B"], self.today)
+        self._sync(["T-A"], self.today)
+
+        self.assertEqual(self._engineer_sees(), ["T-A"])
+        dropped = Case.objects.get(external_ref="T-B")
+        self.assertFalse(dropped.in_current_plan)
+        self.assertEqual(dropped.status, "cancelled")
+
+    def test_todays_sweep_never_reaches_back_into_an_earlier_day(self):
+        self._sync(["T-OLD-1"], self.older)
+        self._sync(["T-TODAY-1"], self.today)
+
+        old_case = Case.objects.get(external_ref="T-OLD-1")
+        self.assertTrue(old_case.in_current_plan)
+        self.assertNotEqual(old_case.status, "cancelled")
+
+    def test_a_list_already_wiped_comes_back_on_the_next_normal_sync(self):
+        """What production is sitting in right now, and whether it self-heals.
+
+        The bad sweep left today's cases with in_current_plan False and their
+        status rewritten to cancelled, so the engineer sees nothing. No repair
+        script should be needed: the auto-sync re-sends the same Assigned set
+        every two minutes, and that has to be enough to bring them back.
+        """
+        self._sync(["T-TODAY-1", "T-TODAY-2"], self.today)
+        # Reproduce the damage exactly as the old sweep left it.
+        Case.objects.filter(external_ref__in=["T-TODAY-1", "T-TODAY-2"]).update(
+            in_current_plan=False, status="cancelled"
+        )
+        self.assertEqual(self._engineer_sees(), [])
+
+        # One ordinary tick of the auto-sync.
+        self._sync(["T-TODAY-1", "T-TODAY-2"], self.today)
+
+        self.assertEqual(self._engineer_sees(), ["T-TODAY-1", "T-TODAY-2"])
+        for ref in ["T-TODAY-1", "T-TODAY-2"]:
+            case = Case.objects.get(external_ref=ref)
+            self.assertTrue(case.in_current_plan)
+            self.assertEqual(case.status, "assigned")
+            self.assertEqual(case.plan_date, self.today)
+
+    def test_the_skipped_sweep_is_written_down(self):
+        self._sync(["T-TODAY-1"], self.today)
+        with self.assertLogs("cases", level="INFO") as captured:
+            self._sync(["T-OLD-1"], self.older)
+        self.assertIn("plan sweep skipped", " ".join(captured.output))

@@ -548,15 +548,35 @@ class CaseViewSet(viewsets.ModelViewSet):
         # (external_ref set) are ever touched, never manually-created ones.
         # Guarded: full-access (All-branch) caller + at least one assignment, so
         # an empty/failed sync never cancels anything.
-        if mirror and assigned_refs and "All" in get_allowed_branches(request.user, "attendance"):
-            # Out of the plan: drop the flag on EVERY synced case that is no
+        # A batch only speaks for its own day. The auto-sync always sends today,
+        # but the manual sync endpoint takes the date from its caller — so a
+        # re-sync of last Tuesday used to sweep EVERY synced case in the table,
+        # clear in_current_plan on everything pushed today, and empty every
+        # engineer's list at once while OpenCall still showed their assignments.
+        # Nothing in the sweep was scoped to a day.
+        today = timezone.localdate()
+        speaks_for_today = plan_date is None or plan_date == today
+        if (
+            mirror
+            and speaks_for_today
+            and assigned_refs
+            and "All" in get_allowed_branches(request.user, "attendance")
+        ):
+            # Out of the plan: drop the flag on every synced case that is no
             # longer pushed, completed ones included — that is what keeps the
             # engineer's count equal to the Assigned column. The status is left
             # alone here, so a completed call keeps saying completed.
+            #
+            # Scoped to TODAY's plan (and to cases that never had a plan date, so
+            # rows dispatched before plan_date existed still age out). An earlier
+            # day's rows are already invisible to the engineer through the date
+            # filter on their queryset; sweeping them as well only risked
+            # rewriting history this batch knows nothing about.
             left_plan = (
                 Case.objects.exclude(external_ref="")
                 .exclude(external_ref__in=assigned_refs)
                 .filter(in_current_plan=True)
+                .filter(Q(plan_date=today) | Q(plan_date__isnull=True))
             )
             cancelled_refs = sorted(left_plan.values_list("external_ref", flat=True))
             cancelled = len(cancelled_refs)
@@ -564,9 +584,20 @@ class CaseViewSet(viewsets.ModelViewSet):
 
             # A call that never reached a terminal state and has left the plan is
             # cancelled, as before — a real outcome (completed) is never rewritten.
-            Case.objects.exclude(external_ref="").filter(
-                in_current_plan=False, status__in=ACTIVE_STATUSES
-            ).update(status="cancelled")
+            # Limited to the tickets THIS sweep just dropped: it used to re-run
+            # over every out-of-plan case in the table, so any push could cancel
+            # calls from days it had no business touching.
+            if cancelled_refs:
+                Case.objects.filter(
+                    external_ref__in=cancelled_refs, status__in=ACTIVE_STATUSES
+                ).update(status="cancelled")
+        elif mirror and not speaks_for_today:
+            # Worth a line: this is the call that used to wipe the day.
+            logger.info(
+                "bulk_dispatch: batch is for %s, not today (%s) - plan sweep skipped",
+                plan_date,
+                today,
+            )
 
         # ASCII only: these lines get read in a Docker/Dokploy log tail.
         if unmatched_engineers:
