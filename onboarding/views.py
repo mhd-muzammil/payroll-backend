@@ -116,15 +116,25 @@ class CandidateViewSet(viewsets.ModelViewSet):
         # Which of them we already hold, so the preview can say "new" honestly
         # rather than promising a count that de-duplication will cut down.
         phones = [c["phone_number"] for c in report.candidates]
-        already = set(
-            Candidate.objects.filter(phone_number__in=phones).values_list(
-                "phone_number", flat=True
-            )
-        )
-        fresh = [c for c in report.candidates if c["phone_number"] not in already]
-        payload["already_in_portal"] = len(already)
+        existing = {
+            candidate.phone_number: candidate
+            for candidate in Candidate.objects.filter(phone_number__in=phones)
+        }
+        fresh = [c for c in report.candidates if c["phone_number"] not in existing]
+        payload["already_in_portal"] = len(existing)
         payload["new"] = len(fresh)
         payload["sample"] = fresh[:5]
+
+        # Re-importing a corrected sheet is the normal way a gap gets filled: half
+        # the rows in a college list arrive with no location, HR types them in,
+        # and sends the file again. Skipping everyone already here meant that
+        # second file did nothing at all.
+        update_existing = str(request.data.get("update_existing", "")).lower() in {
+            "1", "true", "yes", "on"
+        }
+        fills = self._blank_fills(report.candidates, existing) if update_existing else []
+        payload["will_fill"] = len(fills)
+        payload["fill_fields"] = sorted({field for _, field, _ in fills})
 
         commit = str(request.data.get("commit", "")).lower() in {"1", "true", "yes", "on"}
         if not commit:
@@ -134,7 +144,53 @@ class CandidateViewSet(viewsets.ModelViewSet):
         created = Candidate.objects.bulk_create(
             [Candidate(**c) for c in fresh], batch_size=200
         )
+
+        touched = set()
+        for candidate, field, value in fills:
+            setattr(candidate, field, value)
+            touched.add(candidate.pk)
+        if fills:
+            Candidate.objects.bulk_update(
+                [c for c in existing.values() if c.pk in touched],
+                sorted({field for _, field, _ in fills}),
+                batch_size=200,
+            )
+
         payload["committed"] = True
         payload["created"] = len(created)
+        payload["updated"] = len(touched)
         payload.pop("sample", None)
         return Response(payload, status=201)
+
+    # Only ever FILLS a blank. A sheet is a snapshot and the portal is worked in
+    # daily — a re-import that overwrote a location HR had corrected by hand, or
+    # a stage they had moved someone to, would lose real work. So a value in the
+    # portal always wins, and the sheet only supplies what is missing.
+    FILLABLE_TEXT_FIELDS = (
+        "email",
+        "qualification",
+        "present_address",
+        "permanent_address",
+        "previous_company",
+        "remarks",
+        "source",
+    )
+    FILLABLE_NUMBER_FIELDS = ("years_of_experience", "last_salary", "expecting_salary")
+
+    @classmethod
+    def _blank_fills(cls, parsed, existing):
+        """(candidate, field, value) for every blank a re-imported sheet can fill."""
+        fills = []
+        for row in parsed:
+            candidate = existing.get(row["phone_number"])
+            if candidate is None:
+                continue
+            for field in cls.FILLABLE_TEXT_FIELDS:
+                incoming = row.get(field)
+                if incoming and not (getattr(candidate, field) or "").strip():
+                    fills.append((candidate, field, incoming))
+            for field in cls.FILLABLE_NUMBER_FIELDS:
+                incoming = row.get(field) or 0
+                if incoming and not float(getattr(candidate, field) or 0):
+                    fills.append((candidate, field, incoming))
+        return fills

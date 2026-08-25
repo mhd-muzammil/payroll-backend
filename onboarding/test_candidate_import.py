@@ -287,3 +287,112 @@ class ImportEndpointTests(APITestCase):
             User.objects.create_user(username="eng", password="x", role="employee")
         )
         self.assertIn(self._upload(self.ROWS).status_code, (401, 403))
+
+
+class ReimportFillsBlanksTests(APITestCase):
+    """Re-importing a corrected sheet is how a gap actually gets filled.
+
+    Half the rows in the college list arrived with no location. HR types them
+    into the spreadsheet and sends it again — and until now that second file did
+    nothing at all, because everyone in it was already in the portal and got
+    skipped.
+
+    It fills blanks ONLY. A sheet is a snapshot; the portal is worked in every
+    day. A re-import that overwrote a location someone had corrected by hand, or
+    a stage they had moved a candidate to, would destroy real work.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="hr", password="test-password", role="hr"
+        )
+        self.client.force_authenticate(self.user)
+        self.url = reverse("candidate-import-file")
+
+    def _post(self, rows, **extra):
+        payload = {"file": SimpleUploadedFile("sheet.csv", csv_bytes(rows), "text/csv")}
+        payload.update(extra)
+        return self.client.post(self.url, payload, format="multipart")
+
+    WITHOUT_LOCATION = [["NAME", "PH", "Location"], ["Hari", "8428531800", ""]]
+    WITH_LOCATION = [["NAME", "PH", "Location"], ["Hari", "8428531800", "Tambaram"]]
+
+    def test_the_second_sheet_fills_the_location_that_was_missing(self):
+        self._post(self.WITHOUT_LOCATION, commit="true")
+        self.assertIsNone(Candidate.objects.get().present_address)
+
+        response = self._post(self.WITH_LOCATION, commit="true", update_existing="true")
+        self.assertEqual(response.data["created"], 0)
+        self.assertEqual(response.data["updated"], 1)
+        self.assertEqual(Candidate.objects.get().present_address, "Tambaram")
+
+    def test_without_the_flag_a_re_import_still_changes_nothing(self):
+        self._post(self.WITHOUT_LOCATION, commit="true")
+        response = self._post(self.WITH_LOCATION, commit="true")
+        self.assertEqual(response.data["created"], 0)
+        self.assertEqual(response.data["updated"], 0)
+        self.assertIsNone(Candidate.objects.get().present_address)
+
+    def test_it_never_overwrites_what_somebody_typed(self):
+        self._post(self.WITH_LOCATION, commit="true")
+        candidate = Candidate.objects.get()
+        candidate.present_address = "Corrected By HR"
+        candidate.save()
+
+        response = self._post(self.WITH_LOCATION, commit="true", update_existing="true")
+        self.assertEqual(response.data["updated"], 0)
+        self.assertEqual(Candidate.objects.get().present_address, "Corrected By HR")
+
+    def test_a_stage_the_portal_has_moved_on_is_left_alone(self):
+        self._post([["NAME", "PH"], ["Hari", "8428531800"]], commit="true")
+        candidate = Candidate.objects.get()
+        candidate.action = "Offer Shared"
+        candidate.save()
+
+        self._post(
+            [["NAME", "PH", "Status"], ["Hari", "8428531800", "NOT INTRESTED"]],
+            commit="true",
+            update_existing="true",
+        )
+        self.assertEqual(Candidate.objects.get().action, "Offer Shared")
+
+    def test_a_zero_salary_counts_as_blank_and_a_real_one_does_not(self):
+        self._post([["NAME", "PH", "Current Salary"], ["Hari", "8428531800", ""]], commit="true")
+        self._post(
+            [["NAME", "PH", "Current Salary"], ["Hari", "8428531800", "18000"]],
+            commit="true",
+            update_existing="true",
+        )
+        self.assertEqual(float(Candidate.objects.get().last_salary), 18000.0)
+
+        self._post(
+            [["NAME", "PH", "Current Salary"], ["Hari", "8428531800", "25000"]],
+            commit="true",
+            update_existing="true",
+        )
+        self.assertEqual(float(Candidate.objects.get().last_salary), 18000.0)
+
+    def test_the_preview_says_how_many_blanks_it_would_fill(self):
+        self._post(self.WITHOUT_LOCATION, commit="true")
+        response = self._post(self.WITH_LOCATION, update_existing="true")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["committed"])
+        self.assertEqual(response.data["will_fill"], 1)
+        self.assertIn("present_address", response.data["fill_fields"])
+        # And nothing was written by the preview.
+        self.assertIsNone(Candidate.objects.get().present_address)
+
+    def test_new_people_in_the_corrected_sheet_are_still_added(self):
+        self._post(self.WITHOUT_LOCATION, commit="true")
+        response = self._post(
+            [
+                ["NAME", "PH", "Location"],
+                ["Hari", "8428531800", "Tambaram"],
+                ["New Person", "9876543210", "Salem"],
+            ],
+            commit="true",
+            update_existing="true",
+        )
+        self.assertEqual(response.data["created"], 1)
+        self.assertEqual(response.data["updated"], 1)
+        self.assertEqual(Candidate.objects.count(), 2)
