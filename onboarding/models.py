@@ -97,6 +97,16 @@ class Candidate(models.Model):
 
     name = models.CharField(max_length=255)
     phone_number = models.CharField(max_length=20)
+    # Every lead sheet we import carries an email and the portal had nowhere to
+    # put it, so 600-odd contactable candidates would have arrived with only a
+    # phone number. Not unique: the same person can be in two lead sheets, and
+    # the phone is what we de-duplicate on.
+    email = models.EmailField(max_length=255, blank=True, null=True)
+    # Where this candidate came from — "FB Leads Aug 2026", "Prince College",
+    # "WorkIndia". Without it an import of several hundred paid leads and a
+    # college list become one undifferentiated pile that cannot be worked
+    # through or reported on separately.
+    source = models.CharField(max_length=120, blank=True, default="", db_index=True)
     qualification = models.CharField(max_length=100, blank=True, null=True)
     permanent_address = models.CharField(max_length=255, blank=True, null=True)
     present_address = models.CharField(max_length=255, blank=True, null=True)
