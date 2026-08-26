@@ -26,7 +26,16 @@ class Case(models.Model):
     )
 
     # Human-friendly reference (e.g. OC-000042). Filled in save() on first save.
-    case_number = models.CharField(max_length=20, unique=True, blank=True, db_index=True)
+    # Nullable ON PURPOSE, and never the empty string. The number is built from
+    # the pk, so it cannot be known until the row exists; save() therefore
+    # inserts a placeholder and fills it in immediately afterwards. A unique
+    # column accepts any number of NULLs but only ONE empty string, so with ""
+    # as the placeholder two cases created in the same instant collided on it —
+    # which is how a whole day of syncing died with
+    # "duplicate key value violates unique constraint ... Key (case_number)=()".
+    case_number = models.CharField(
+        max_length=20, unique=True, blank=True, null=True, db_index=True
+    )
 
     # Reference from the originating system (e.g. OpenCall ticket id). Used to
     # make dispatch idempotent so re-assigning/re-scheduling the same ticket
@@ -103,8 +112,13 @@ class Case(models.Model):
 
     def save(self, *args, **kwargs):
         creating = self._state.adding
+        # Blank means "not numbered yet", and that has to reach the database as
+        # NULL rather than "" — see the field. Applied on every save, so a form
+        # or admin edit that clears the box cannot reintroduce the collision.
+        if not self.case_number:
+            self.case_number = None
         super().save(*args, **kwargs)
-        # Generate a stable, readable case number from the PK after the first save.
+        # A stable, readable number from the pk, which only exists now.
         if creating and not self.case_number:
             self.case_number = f"OC-{self.pk:06d}"
             super().save(update_fields=["case_number"])

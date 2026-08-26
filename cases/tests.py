@@ -1492,3 +1492,89 @@ class SyncForAnotherDayLeavesTodayAloneTests(TestCase):
         with self.assertLogs("cases", level="INFO") as captured:
             self._sync(["T-OLD-1"], self.older)
         self.assertIn("plan sweep skipped", " ".join(captured.output))
+
+
+class CaseNumberPlaceholderTests(TestCase):
+    """A blank case number must never block the next case from being created.
+
+    case_number is unique and is built from the pk, so it cannot be known until
+    the row exists: save() inserts a placeholder and fills it in immediately
+    afterwards. The placeholder used to be the EMPTY STRING — and a unique column
+    accepts exactly ONE of those.
+
+    So a single case left holding it, from a crash or a rolled-back request, made
+    every later insert fail with
+
+        duplicate key value violates unique constraint "cases_case_case_number_key"
+        DETAIL:  Key (case_number)=() already exists.
+
+    which is what took the whole OpenCall sync down: every tick 500ed and no
+    engineer's list could be refreshed at all.
+    """
+
+    def test_a_case_gets_a_readable_number(self):
+        case = Case.objects.create(title="Service call", customer_name="Pradeep")
+        self.assertEqual(case.case_number, f"OC-{case.pk:06d}")
+
+    def test_a_case_stuck_on_the_placeholder_does_not_block_the_next_one(self):
+        stuck = Case.objects.create(title="Stuck", customer_name="A")
+        # Exactly the state production was in: numbered row forced back to blank
+        # without going through save().
+        Case.objects.filter(pk=stuck.pk).update(case_number="")
+
+        # This is the insert that used to 500 and take the sync with it.
+        fresh = Case.objects.create(title="Next", customer_name="B")
+        self.assertEqual(fresh.case_number, f"OC-{fresh.pk:06d}")
+
+    def test_two_cases_never_share_a_number(self):
+        numbers = {Case.objects.create(title=f"C{i}", customer_name="X").case_number
+                   for i in range(25)}
+        self.assertEqual(len(numbers), 25)
+        self.assertNotIn("", numbers)
+        self.assertNotIn(None, numbers)
+
+    def test_clearing_the_number_by_hand_stores_null_not_blank(self):
+        # An admin edit that empties the box must not reintroduce the collision.
+        case = Case.objects.create(title="Service call", customer_name="Pradeep")
+        case.case_number = ""
+        case.save()
+        case.refresh_from_db()
+        self.assertIsNone(case.case_number)
+
+        # And the next case is still fine.
+        other = Case.objects.create(title="Another", customer_name="Q")
+        self.assertEqual(other.case_number, f"OC-{other.pk:06d}")
+
+    def test_a_dispatch_still_works_with_a_blank_row_in_the_table(self):
+        """The end-to-end version: the sync itself must survive it."""
+        bot = User.objects.create_user(
+            username="opencall-bot", password="x", role="admin", is_staff=True
+        )
+        engineer_user = User.objects.create_user(
+            username="praveen", password="x", role="employee"
+        )
+        Employee.objects.create(
+            user=engineer_user, employee_name="Praveen S", branch="Chennai", salary=0
+        )
+        stuck = Case.objects.create(title="Stuck", customer_name="A")
+        Case.objects.filter(pk=stuck.pk).update(case_number="")
+
+        client = APIClient()
+        client.force_authenticate(bot)
+        res = client.post(
+            "/api/cases/bulk_dispatch/",
+            {
+                "plan_date": timezone.localdate().isoformat(),
+                "cases": [
+                    {
+                        "external_ref": "T-1",
+                        "title": "Service call (T-1)",
+                        "engineer_name": "Praveen",
+                        "status": "assigned",
+                    }
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["assigned"], 1)
