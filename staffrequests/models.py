@@ -15,16 +15,20 @@ class EmployeeRequest(models.Model):
     SALARY_ADVANCE = "salary_advance"
     PETROL_ADVANCE = "petrol_advance"
     OTHER_AMOUNT = "other_amount"
+    EXPENSE = "expense"
     REPORT = "report"
 
     TYPE_CHOICES = (
         (SALARY_ADVANCE, "Salary advance"),
         (PETROL_ADVANCE, "Petrol advance"),
+        (EXPENSE, "Expense claim"),
         (OTHER_AMOUNT, "Other amount"),
         (REPORT, "Report / message"),
     )
-    # The three types above ask for money; a report is raised to be read.
-    AMOUNT_TYPES = (SALARY_ADVANCE, PETROL_ADVANCE, OTHER_AMOUNT)
+    # An advance is money asked for before it is spent; an expense is money
+    # already out of the engineer's own pocket, claimed back. Both carry a
+    # figure, so both are validated the same way. A report is raised to be read.
+    AMOUNT_TYPES = (SALARY_ADVANCE, PETROL_ADVANCE, EXPENSE, OTHER_AMOUNT)
 
     STATUS_CHOICES = (
         ("Pending", "Pending"),

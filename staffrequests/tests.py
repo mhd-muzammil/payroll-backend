@@ -59,10 +59,60 @@ class EmployeeRequestTests(TestCase):
         self.assertEqual(Decimal(res.data["amount"]), Decimal("5000.00"))
 
     def test_petrol_and_other_amount_types_work_the_same_way(self):
-        for kind in (EmployeeRequest.PETROL_ADVANCE, EmployeeRequest.OTHER_AMOUNT):
+        for kind in (
+            EmployeeRequest.PETROL_ADVANCE,
+            EmployeeRequest.EXPENSE,
+            EmployeeRequest.OTHER_AMOUNT,
+        ):
             res = self._raise(request_type=kind, amount="1200.00", reason="Site visits this week")
             self.assertEqual(res.status_code, 201, res.data)
             self.assertEqual(Decimal(res.data["amount"]), Decimal("1200.00"))
+
+    def test_an_engineer_can_claim_an_expense_they_already_paid_for(self):
+        res = self._raise(
+            request_type=EmployeeRequest.EXPENSE,
+            amount="340.00",
+            reason="Bus fare to the Coimbatore site",
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["request_type"], "expense")
+        self.assertEqual(res.data["request_type_label"], "Expense claim")
+        self.assertEqual(Decimal(res.data["amount"]), Decimal("340.00"))
+        self.assertEqual(res.data["status"], "Pending")
+
+    def test_an_expense_claim_with_no_figure_is_rejected(self):
+        res = self._raise(request_type=EmployeeRequest.EXPENSE, amount=None, reason="Bus fare")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("amount", res.data)
+
+    def test_an_expense_carries_the_same_two_way_conversation(self):
+        """The point of putting expenses here: the claim and the questions about
+        it live in one thread, and each side is told when the other has spoken."""
+        claim = self._raise(
+            request_type=EmployeeRequest.EXPENSE, amount="340.00", reason="Bus fare"
+        ).data["id"]
+
+        # Office asks. The engineer is told; the office has nothing waiting.
+        self.hr.post(detail(claim, "messages/"), {"body": "Do you have the ticket?"}, format="json")
+        self.assertEqual(self.eng.get(f"{LIST}summary/").data["unread_messages"], 1)
+        self.assertEqual(self.hr.get(f"{LIST}summary/").data["unread_messages"], 0)
+
+        # Engineer reads it, which clears their side only, then answers.
+        self.eng.get(detail(claim, "messages/"))
+        self.assertEqual(self.eng.get(f"{LIST}summary/").data["unread_messages"], 0)
+        reply = self.eng.post(
+            detail(claim, "messages/"), {"body": "Yes, attaching it"}, format="json"
+        )
+        self.assertEqual(reply.status_code, 201, reply.data)
+        self.assertTrue(reply.data["from_employee"])
+
+        # Now it is the office that is told, and both see the whole exchange.
+        self.assertEqual(self.hr.get(f"{LIST}summary/").data["unread_messages"], 1)
+        for side in (self.eng, self.hr):
+            thread = side.get(detail(claim, "messages/")).data
+            self.assertEqual(
+                [m["body"] for m in thread], ["Do you have the ticket?", "Yes, attaching it"]
+            )
 
     def test_a_money_request_without_an_amount_is_rejected(self):
         res = self._raise(amount=None)
