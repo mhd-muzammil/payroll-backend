@@ -9,9 +9,12 @@ from decimal import Decimal, ROUND_HALF_UP
 import calendar
 import datetime
 
-# Casual leave: employees earn 1 CL per month once they have completed 6 months
-# of service (probation), capped per calendar year.
-CASUAL_LEAVE_ANNUAL_CAP = 12
+# Casual leave: one paid day a month, once six months' service (probation) is
+# behind them. It does not accumulate — a month is worth one day, and a month
+# where none was taken carries nothing into the next. So the most any single
+# payslip can ever pay as casual leave is one day, however long the employee has
+# been here and however many days they were absent.
+CASUAL_LEAVE_DAYS_PER_MONTH = Decimal(1)
 CASUAL_LEAVE_ELIGIBILITY_MONTHS = 6
 
 
@@ -26,32 +29,25 @@ def _months_of_service(doj, as_of):
 
 
 def casual_leave_available(emp, year, month):
-    """CL balance available to offset LOP for this employee's payslip period.
+    """The casual leave this employee can be paid on this month's payslip.
 
-    Entitlement = 1 CL for each month of the calendar `year` (up to `month`) in
-    which the employee had completed >= 6 months of service, capped at the annual
-    cap. Balance = entitlement minus CL already used earlier in the same year.
-    Returns 0 for employees with no real date_of_joining (feature is opt-in per
-    employee, so existing employees are unaffected until HR sets their DOJ).
+    One day, if six months' service was complete by the end of the month. Not a
+    running balance: each month stands on its own, so an employee who has been
+    here two years and was absent three days is paid for one of them, the same
+    as an employee who qualified last month. Nothing is carried forward and
+    nothing is owed at year end.
+
+    Returns 0 for employees with no real date_of_joining — the feature is opt-in
+    per employee, so nobody is given leave off a date nobody has entered.
     """
     doj = emp.date_of_joining
     if not doj:
         return Decimal(0)
-    earned = 0
-    for m in range(1, month + 1):
-        last_day = calendar.monthrange(year, m)[1]
-        as_of = datetime.date(year, m, last_day)
-        if _months_of_service(doj, as_of) >= CASUAL_LEAVE_ELIGIBILITY_MONTHS:
-            earned += 1
-    earned = min(earned, CASUAL_LEAVE_ANNUAL_CAP)
-    # Subtract CL used in every OTHER month of the year (exclude the current
-    # month so regenerating this slip doesn't double-count). Excluding only
-    # earlier months would let out-of-order generation blow past the annual cap.
-    used_other = Payslip.objects.filter(employee=emp, year=year).exclude(
-        month=month
-    ).aggregate(s=Sum("casual_leave_used"))["s"] or Decimal(0)
-    avail = Decimal(earned) - Decimal(used_other)
-    return avail if avail > 0 else Decimal(0)
+    last_day = calendar.monthrange(year, month)[1]
+    as_of = datetime.date(year, month, last_day)
+    if _months_of_service(doj, as_of) < CASUAL_LEAVE_ELIGIBILITY_MONTHS:
+        return Decimal(0)
+    return CASUAL_LEAVE_DAYS_PER_MONTH
 
 from .models import Payslip, BranchFinancial
 from .serializer import PayslipSerializer, BranchFinancialSerializer

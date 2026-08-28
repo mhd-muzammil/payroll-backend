@@ -25,6 +25,7 @@ from employees.models import Employee
 
 from .models import Payslip
 from .views import (
+    CASUAL_LEAVE_DAYS_PER_MONTH,
     CASUAL_LEAVE_ELIGIBILITY_MONTHS,
     _months_of_service,
     casual_leave_available,
@@ -69,34 +70,48 @@ class MonthsOfServiceTests(TestCase):
 
 
 class CasualLeaveAccrualTests(TestCase):
-    def test_one_day_accrues_for_each_month_after_the_qualifying_period(self):
-        # Joined Oct 2025, so six months' service completes on 1 Apr 2026:
-        # April through August is five qualifying months in 2026.
-        employee = make_employee("Long Server", datetime.date(2025, 10, 1))
-        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(5))
+    def test_a_qualified_month_is_worth_exactly_one_day(self):
+        employee = make_employee("Qualified", datetime.date(2026, 2, 1))
+        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(1))
+
+    def test_it_is_still_one_day_after_years_of_service(self):
+        """It does not accumulate. Someone here since 2020 gets the same single
+        day as someone who qualified last month."""
+        employee = make_employee("Long Server", datetime.date(2020, 1, 1))
+        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(1))
 
     def test_nothing_accrues_before_the_qualifying_period(self):
         employee = make_employee("New Joiner", datetime.date(2026, 6, 1))
         self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(0))
 
+    def test_the_month_service_completes_in_is_the_first_that_counts(self):
+        # Joined 5 Jan 2026: six months are up on 5 July, so July qualifies and
+        # June does not.
+        employee = make_employee("Boundary", datetime.date(2026, 1, 5))
+        self.assertEqual(casual_leave_available(employee, 2026, 6), Decimal(0))
+        self.assertEqual(casual_leave_available(employee, 2026, 7), Decimal(1))
+
     def test_an_employee_with_no_joining_date_earns_nothing(self):
         employee = make_employee("No DOJ", None)
         self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(0))
 
-    def test_leave_already_taken_this_year_is_deducted_from_the_balance(self):
+    def test_leave_taken_in_another_month_does_not_touch_this_one(self):
+        """Each month stands alone: nothing is carried forward and nothing is
+        owed back."""
         employee = make_employee("Spender", datetime.date(2025, 10, 1))
-        Payslip.objects.create(
-            employee=employee, month=5, year=2026, casual_leave_used=Decimal(2)
-        )
-        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(3))
+        for month in (3, 4, 5, 6, 7):
+            Payslip.objects.create(
+                employee=employee, month=month, year=2026, casual_leave_used=Decimal(1)
+            )
+        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(1))
 
-    def test_this_months_own_usage_is_not_counted_against_it(self):
-        """Otherwise saving the same slip twice would spend the balance twice."""
+    def test_this_months_own_usage_does_not_reduce_it_either(self):
+        """Otherwise saving the same slip twice would spend the day twice."""
         employee = make_employee("Resaver", datetime.date(2025, 10, 1))
         Payslip.objects.create(
             employee=employee, month=8, year=2026, casual_leave_used=Decimal(1)
         )
-        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(5))
+        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(1))
 
 
 class ComputePayslipFieldsTests(TestCase):
@@ -212,20 +227,18 @@ class RecalculateKeepsEarnedLeaveTests(APITestCase):
         # than the same absence with no leave behind it.
         self.assertEqual(slip.net_salary, uncovered["net_salary"] + DAY)
 
-    def test_a_saved_up_balance_covers_more_than_one_day(self):
-        """Leave accrues monthly and accumulates, so someone who has not taken
-        any can have several absent days covered at once."""
-        employee = make_employee("Saver", datetime.date(2025, 10, 1))
-        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(5))
-
+    def test_only_one_day_is_ever_covered_however_long_they_have_been_here(self):
+        """The leave does not accumulate: three days absent still costs two,
+        for a long-serving employee exactly as for a newly qualified one."""
+        employee = make_employee("Saver", datetime.date(2020, 1, 1))
         slip = self._slip(employee)
         self._save_lop(slip, 3)
 
         slip.refresh_from_db()
         self.assertEqual(slip.lop_days, Decimal(3))
         self.assertEqual(slip.paid_days, Decimal(27))
-        self.assertEqual(slip.casual_leave_used, Decimal(3))
-        self.assertEqual(slip.casual_leave_pay, DAY * 3)
+        self.assertEqual(slip.casual_leave_used, Decimal(1))
+        self.assertEqual(slip.casual_leave_pay, DAY)
 
     def test_an_employee_short_of_the_qualifying_period_gets_nothing(self):
         employee = make_employee("Too New", datetime.date(2026, 6, 1))
@@ -268,10 +281,9 @@ class RecalculateKeepsEarnedLeaveTests(APITestCase):
         self.assertEqual(slip.casual_leave_used, Decimal(1))
         self.assertEqual(slip.casual_leave_pay, DAY)
 
-    def test_a_balance_already_spent_this_year_is_not_handed_out_again(self):
-        employee = make_employee("Spent Up", datetime.date(2025, 10, 1))
-        # Five days earned by August, all five already taken in earlier months.
-        for month in (3, 4, 5, 6, 7):
+    def test_last_months_leave_does_not_use_up_this_months(self):
+        employee = make_employee("Regular", datetime.date(2025, 10, 1))
+        for month in (5, 6, 7):
             Payslip.objects.create(
                 employee=employee, month=month, year=2026, casual_leave_used=Decimal(1)
             )
@@ -279,8 +291,8 @@ class RecalculateKeepsEarnedLeaveTests(APITestCase):
         self._save_lop(slip, 3)
 
         slip.refresh_from_db()
-        self.assertEqual(slip.casual_leave_used, Decimal(0))
-        self.assertEqual(slip.casual_leave_pay, Decimal("0.00"))
+        self.assertEqual(slip.casual_leave_used, Decimal(1))
+        self.assertEqual(slip.casual_leave_pay, DAY)
 
     def test_an_explicit_figure_from_the_operator_still_wins(self):
         employee = make_employee("Overridden", datetime.date(2025, 10, 1))
@@ -365,7 +377,13 @@ class RevertMatchesGenerationTests(APITestCase):
         self.assertEqual(slip.lop_days, Decimal(0))  # no absence recorded
 
 
-class EligibilityConstantTests(TestCase):
+class PolicyConstantTests(TestCase):
+    """The office's policy, in the two numbers that decide what people are paid.
+    A change to either changes payroll, so it should be a deliberate edit here
+    and not a side effect of something else."""
+
     def test_the_qualifying_period_is_six_months(self):
-        # Stated in the policy the office works to; a change here changes pay.
         self.assertEqual(CASUAL_LEAVE_ELIGIBILITY_MONTHS, 6)
+
+    def test_a_month_is_worth_one_day(self):
+        self.assertEqual(CASUAL_LEAVE_DAYS_PER_MONTH, Decimal(1))
