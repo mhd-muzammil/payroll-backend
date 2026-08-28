@@ -17,8 +17,12 @@ class Payslip(models.Model):
     lop_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     off_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     # Absent days paid via the employee's earned casual-leave balance this period.
-    # Like off_days, these offset LOP so they are NOT deducted.
+    # Unlike off_days these do NOT offset LOP: the day counts stay exactly what
+    # HR entered, and the leave is paid as its own line instead.
     casual_leave_used = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
+    # What those days are worth, at one day of gross per day taken. Added to the
+    # net after deductions, and shown as its own row on the slip.
+    casual_leave_pay = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     paid_days = models.DecimalField(max_digits=5, decimal_places=2, default=30.0)
     
     # Gross Salary Components (Defined in Structure)

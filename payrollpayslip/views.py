@@ -75,6 +75,9 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
 
     `off_days` are paid non-working days (weekly offs / holidays). They offset
     LOP so they are NOT deducted: effective unpaid days = max(0, lop - off).
+    `casual_leave_days` are paid too, but they do NOT offset LOP: the day count
+    on the slip stays exactly what HR entered, and the leave is paid as its own
+    line (`casual_leave_pay`) added to the net.
     `other_deduction_override`, when not None, replaces the "Other Deduction"
     line with an operator-supplied amount (the rest of the math is unchanged).
 
@@ -92,8 +95,7 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         off_days = Decimal(0)
     if off_days > lop_days:
         off_days = lop_days
-    # Casual leave (paid) offsets the LOP that remains after off-days, capped so
-    # off + casual can never exceed the LOP being offset.
+    # Casual leave is capped by the absence it covers, after off-days.
     if casual_leave_days < 0:
         casual_leave_days = Decimal(0)
     if casual_leave_days > (lop_days - off_days):
@@ -101,9 +103,14 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
     if casual_leave_days < 0:
         casual_leave_days = Decimal(0)
 
-    # Off days and casual leave are paid, so they cancel out an equal number of
-    # LOP days.
-    effective_lop = lop_days - off_days - casual_leave_days
+    # Off days are paid, so they cancel out an equal number of LOP days.
+    #
+    # Casual leave deliberately does NOT: the days HR enters are what the office
+    # counted, and the payslip has to keep saying so. Three days absent stays
+    # three days absent, and "No of Days" stays the figure HR arrived at. The
+    # leave is paid as its own line further down instead, so the slip shows both
+    # the absence and the leave that covered a day of it.
+    effective_lop = lop_days - off_days
     if effective_lop < 0:
         effective_lop = Decimal(0)
 
@@ -210,14 +217,22 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
 
     gross_deductions = deduction_epf + deduction_esi + deduction_prof_tax + deduction_lwf + deduction_staff_advance + deduction_tds + deduction_other + deduction_insurance
 
+    # 5b. Casual leave, paid as its own line at one day's gross per day taken.
+    # Computed off gross_salary and total_days — never off the pro-rated
+    # earnings — so a month with absence pays the same rate for a leave day as a
+    # month without. Deductions are left on the worked-days basis above: the
+    # leave is added after them, exactly as the slip displays it.
+    casual_leave_pay = q(gross_salary * casual_leave_days / total_days) if total_days > 0 else Decimal('0.00')
+
     # 6. Net Take Home (kept accurate to the paisa; no whole-rupee rounding)
-    net_rounded = q(gross_earnings - gross_deductions)
+    net_rounded = q(gross_earnings + casual_leave_pay - gross_deductions)
 
     return {
         'total_days': int(total_days),
         'lop_days': lop_days,
         'off_days': off_days,
         'casual_leave_used': casual_leave_days,
+        'casual_leave_pay': casual_leave_pay,
         'paid_days': paid_days,
 
         'gross_basic': gross_basic,
@@ -461,14 +476,28 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 lop_days = Decimal(payslip.lop_days or 0)
 
             # Casual leave: when an absolute paid_days is supplied that figure is
-            # final, so CL must not further reduce LOP. Otherwise preserve the
-            # slip's current CL (auto-applied at generation) unless overridden.
+            # final, so CL must not further reduce LOP. An explicit
+            # casual_leave_used still wins. Otherwise the entitlement is worked
+            # out again against the LOP now being set.
+            #
+            # This used to carry the slip's stored CL forward instead, and that
+            # is how earned leave went unpaid: generation reads LOP from the
+            # Attendance table, so a month with no 'Absent' row generated with
+            # LOP 0 and therefore CL 0. HR then typed the real LOP in by hand —
+            # which is how leave actually reaches payroll here — and the zero
+            # was preserved, so the employee's casual leave was never applied.
+            # Re-deriving is safe to repeat: casual_leave_available() excludes
+            # this month's own casual_leave_used from the year's tally, so
+            # saving the same slip twice cannot spend the balance twice.
             if request.data.get('paid_days') is not None:
                 cl_days = Decimal(0)
             elif request.data.get('casual_leave_used') is not None:
                 cl_days = to_decimal(request.data.get('casual_leave_used'), 'casual_leave_used')
             else:
-                cl_days = Decimal(payslip.casual_leave_used or 0)
+                cl_days = min(
+                    casual_leave_available(payslip.employee, payslip.year, payslip.month),
+                    max(lop_days, Decimal(0)),
+                )
 
             # Optional other-deduction override.
             other_override = None
@@ -544,7 +573,15 @@ class PayslipViewSet(viewsets.ModelViewSet):
             status='Absent'
         ).count())
 
-        defaults = compute_payslip_fields(payslip.employee, total_days, lop_days)
+        # Same casual-leave offset bulk generation applies, so "revert to what
+        # generation would produce" actually produces it. Without this, Undo
+        # Edits quietly stripped an employee's earned casual leave and handed
+        # back a smaller net than a fresh generation of the same month.
+        cl_apply = min(casual_leave_available(payslip.employee, year, month), lop_days)
+
+        defaults = compute_payslip_fields(
+            payslip.employee, total_days, lop_days, casual_leave_days=cl_apply
+        )
         defaults['status'] = 'Generated'
         for field, value in defaults.items():
             setattr(payslip, field, value)
