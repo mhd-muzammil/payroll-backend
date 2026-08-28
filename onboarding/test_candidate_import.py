@@ -17,12 +17,14 @@ from rest_framework.test import APITestCase
 from authentication.models import User
 
 from .candidate_import import (
+    UnreadableUpload,
     build_candidates,
     detect_header,
     map_action,
     normalise_phone,
     parse_experience,
     parse_money,
+    read_rows,
 )
 from .models import Candidate
 
@@ -396,3 +398,179 @@ class ReimportFillsBlanksTests(APITestCase):
         self.assertEqual(response.data["created"], 1)
         self.assertEqual(response.data["updated"], 1)
         self.assertEqual(Candidate.objects.count(), 2)
+
+
+# The headings of the two job-board exports HR now works from, copied exactly.
+APNA_HEADINGS = [
+    "Matched Candidate", "Candidate Name", "Phone number", "Email ID",
+    "Job Applied For", "Job city", "Job Area", "Recruiter Name", "Gender", "Age",
+    "Applied on", "Candidate city", "Candidate Area", "Education",
+    "Highest Degree", "Institute", "Experience", "Current Job role",
+    "Current Company", "Department", "Sub Department", "Industry",
+    "Open to Relocate", "Candidate Job Interest", "English Level", "Assets",
+    "Your Notes", "Candidate Status", "Connection Status", "Call Status",
+    "Resume, Skills etc", "Source", "Matched Data", "Job id",
+]
+
+WORKINDIA_HEADINGS = [
+    "Sr. No.", "Full Name", "Mobile No.", "City", "Location", "Qualification",
+    "Level Of Experience", "Relevant Experience", "Gender", "Resume Link",
+    "Profile Link", "Languages known", "Skills", "Candidate Status", "Remarks",
+    "Unlocked At", "Current Salary", "English Speaking", "Age", "Course",
+    "Specialization", "College Name", "Course Start Time", "Course End Time",
+    "Previous Designation", "Previous Company Name", "Last Active",
+]
+
+
+def apna_row(**over):
+    """One row of the Bengaluru sheet, with its real values."""
+    values = {
+        "Matched Candidate": "Matched", "Candidate Name": "Rajan",
+        "Phone number": "9840323779", "Email ID": "itechsystems04@gmail.com",
+        "Job Applied For": "Service Engineer", "Job city": "Hosur",
+        "Job Area": "Hosur", "Recruiter Name": "Logeswari", "Gender": "m",
+        "Age": "43", "Applied on": "2026-02-08 20:16:07",
+        "Candidate city": "Chennai", "Candidate Area": "Thiruvanmiyur",
+        "Education": "Graduate", "Highest Degree": "BBA",
+        "Institute": "Madras University", "Experience": "17yrs 4mos",
+        "Current Job role": "Laptop Hardware Technician",
+        "Current Company": "j k system", "Department": "Not Available",
+        "Sub Department": "Laptop Technician", "Industry": "Hardware & Networking",
+        "Open to Relocate": "Willing to Relocate",
+        "Candidate Job Interest": "Field Job", "English Level": "good",
+        "Assets": "Bike", "Your Notes": "Not Available",
+        "Candidate Status": "interview_fixed",
+        "Connection Status": "Application Reviewed", "Call Status": "Not Available",
+        "Resume, Skills etc": "https://employer.apna.co/jobs/1", "Source": "Apna",
+        "Matched Data": "work_experience", "Job id": "313202485",
+    }
+    values.update(over)
+    return [values[h] for h in APNA_HEADINGS]
+
+
+class ApnaSheetTests(TestCase):
+    """The four job-board sheets HR uploaded, which the importer read as zero
+    candidates and one of which it filed under the wrong town."""
+
+    def _one(self, **over):
+        report = build_candidates(
+            csv_bytes([APNA_HEADINGS, apna_row(**over)]), "apna.csv", "Apna"
+        )
+        self.assertEqual(report.rejected, [])
+        self.assertEqual(len(report.candidates), 1, report.as_dict())
+        return report.candidates[0]
+
+    def test_the_candidates_own_city_is_their_address_not_the_jobs(self):
+        # The vacancy is in Hosur; Rajan lives in Chennai. Whichever column came
+        # first used to win, and "Job city" comes first.
+        self.assertEqual(self._one()["present_address"], "Chennai")
+
+    def test_the_jobs_town_is_still_written_down_as_the_jobs(self):
+        self.assertIn("Job city: Hosur", self._one()["remarks"])
+
+    def test_months_are_months(self):
+        # "8mos" read as 8 years is the difference between a fresher and a
+        # senior hire, on a sheet where most rows are written this way.
+        self.assertEqual(float(self._one(**{"Experience": "8mos"})["years_of_experience"]), 0.7)
+        self.assertEqual(float(self._one()["years_of_experience"]), 17.3)
+
+    def test_not_available_is_a_blank_not_a_value(self):
+        candidate = self._one(**{"Current Company": "Not Available"})
+        self.assertIsNone(candidate["previous_company"])
+        self.assertNotIn("Not Available", candidate["remarks"])
+
+    def test_the_stage_the_board_reports_is_kept_even_though_we_have_no_such_stage(self):
+        # The portal has no "interview fixed"; inventing one would move 71
+        # people to a stage nobody worked them to. The wording is kept instead.
+        candidate = self._one()
+        self.assertEqual(candidate["action"], "In Progress")
+        self.assertIn("Status in sheet: interview_fixed", candidate["remarks"])
+
+    def test_the_boards_bookkeeping_is_not_carried_into_remarks(self):
+        remarks = self._one()["remarks"]
+        for noise in ("Matched Candidate:", "Matched Data:", "Job id:"):
+            self.assertNotIn(noise, remarks)
+
+    def test_the_resume_link_survives(self):
+        self.assertIn("employer.apna.co", self._one()["remarks"])
+
+
+class WorkIndiaSheetTests(TestCase):
+    def test_the_export_with_no_extension_in_its_name_is_read(self):
+        # It downloads as "Workindia Profile vv" — no dot, no extension. The
+        # importer used to hand it to openpyxl and get BadZipFile.
+        row = ["1", "Arunkumar V", "9952991367", "chennai", "Arumbakkam",
+               "Graduate", "Experienced", "", "Male", "", "", "english, tamil",
+               "", "", "", "04-08-2026 12:23", "20000", "Fluent English", "22",
+               "be", "Electronics", "Meenakshi Sundararajan", "2024-12",
+               "2024-12", "Service Engineer", "In4 solution", "26-07-2026"]
+        report = build_candidates(
+            csv_bytes([WORKINDIA_HEADINGS, row]), "Workindia Profile vv", "WorkIndia"
+        )
+        self.assertEqual(len(report.candidates), 1, report.as_dict())
+        candidate = report.candidates[0]
+        self.assertEqual(candidate["name"], "Arunkumar V")
+        self.assertEqual(candidate["phone_number"], "9952991367")
+        self.assertEqual(candidate["present_address"], "chennai")
+        self.assertEqual(float(candidate["last_salary"]), 20000.0)
+        self.assertEqual(candidate["previous_company"], "In4 solution")
+
+
+class UploadShapeTests(TestCase):
+    """What the importer will and will not take, decided by content."""
+
+    @staticmethod
+    def _workbook(dimension=None):
+        """A real .xlsx, optionally lying about how big its sheet is.
+
+        Sheets exported by job boards declare <dimension ref="A1"/>. openpyxl's
+        read-only mode believes it and hands back one cell, which is how 332
+        candidates arrived as "not a candidate list".
+        """
+        import re
+        import zipfile
+
+        import openpyxl
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.append(["Candidate Name", "Phone number"])
+        sheet.append(["Rajan", "9840323779"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        if dimension is None:
+            return buffer.getvalue()
+
+        source = zipfile.ZipFile(io.BytesIO(buffer.getvalue()))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target:
+            for item in source.namelist():
+                blob = source.read(item)
+                if item.endswith("sheet1.xml"):
+                    blob = re.sub(rb"<dimension[^/]*/>", dimension.encode(), blob)
+                target.writestr(item, blob)
+        return out.getvalue()
+
+    def test_a_sheet_that_understates_its_own_size_is_still_read_in_full(self):
+        data = self._workbook(dimension='<dimension ref="A1"/>')
+        report = build_candidates(data, "export.xlsx", "Apna")
+        self.assertEqual([c["name"] for c in report.candidates], ["Rajan"])
+
+    def test_an_ordinary_workbook_still_reads(self):
+        report = build_candidates(self._workbook(), "export.xlsx", "Apna")
+        self.assertEqual([c["name"] for c in report.candidates], ["Rajan"])
+
+    def test_a_csv_renamed_to_xlsx_is_read_as_the_csv_it_is(self):
+        data = csv_bytes([["Name", "Phone"], ["Rajan", "9840323779"]])
+        report = build_candidates(data, "leads.xlsx", "Apna")
+        self.assertEqual([c["name"] for c in report.candidates], ["Rajan"])
+
+    def test_an_old_binary_xls_is_refused_with_what_to_do_about_it(self):
+        with self.assertRaises(UnreadableUpload) as caught:
+            read_rows(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"padding" * 8, "old.xls")
+        self.assertIn("Save As .xlsx", str(caught.exception))
+
+    def test_a_resume_dropped_on_the_dialog_is_refused(self):
+        with self.assertRaises(UnreadableUpload) as caught:
+            read_rows(b"%PDF-1.4 and the rest of a CV", "cv.pdf")
+        self.assertIn("PDF", str(caught.exception))

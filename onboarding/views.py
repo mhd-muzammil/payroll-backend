@@ -10,7 +10,7 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from authentication.permissions import IsHRStaff
-from .candidate_import import build_candidates
+from .candidate_import import build_candidates, UnreadableUpload
 from .models import Onboarding, Candidate
 from .serializers import DOCUMENT_FIELDS, OnboardingSerializer, CandidateSerializer
 
@@ -92,11 +92,11 @@ class CandidateViewSet(viewsets.ModelViewSet):
                 status=400,
             )
 
+        # No extension check: the WorkIndia export downloads as
+        # "Workindia Profile vv" with no extension at all, and a perfectly good
+        # CSV was turned away at the door. build_candidates decides from the
+        # bytes, and says so in words if it cannot read them.
         name = upload.name or "upload"
-        if not name.lower().endswith((".xlsx", ".xlsm", ".csv", ".txt")):
-            return Response(
-                {"detail": "Upload an .xlsx or .csv file."}, status=400
-            )
 
         # Where these people came from. Defaults to the file's own name, which is
         # how HR already labels them ("600 FB_Leads_Updated_02Aug2026").
@@ -104,6 +104,9 @@ class CandidateViewSet(viewsets.ModelViewSet):
 
         try:
             report = build_candidates(upload.read(), name, source)
+        except UnreadableUpload as exc:
+            # Written for HR: it says what to do, not what broke.
+            return Response({"detail": str(exc)}, status=400)
         except Exception as exc:  # a corrupt or password-protected workbook
             return Response(
                 {"detail": f"Could not read that file: {exc.__class__.__name__}."}, status=400

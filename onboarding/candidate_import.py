@@ -39,7 +39,8 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "present_address": (
         "location", "city", "preferredlocation", "presentaddress", "area",
         "whichworklocationdoyouprefer", "joininglocation", "currentaddress",
-        "currentaddresslocation",
+        "currentaddresslocation", "candidatecity", "candidatearea",
+        "candidatelocation",
     ),
     "permanent_address": ("permanentaddress", "nativeplace", "homeaddress"),
     "years_of_experience": (
@@ -57,7 +58,7 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "remarks": (
         "remark", "remarks", "reason", "note", "notes", "reviewnotes", "comment",
-        "comments", "afterinterview",
+        "comments", "afterinterview", "yournotes",
     ),
     "action": ("action", "status", "candidatestatus", "currentstatus", "respond"),
 }
@@ -85,12 +86,26 @@ ACTION_HINTS: tuple[tuple[str, str], ...] = (
     ("waiting for joining", "Waiting For Joining Date"),
 )
 
+# Columns about the vacancy, not the person sitting in front of it. "Job city"
+# is where the role is; "Candidate city" is where they live, and on the Bengaluru
+# sheet those are Hosur and Bangalore. Mapping by first-come would have filed
+# every candidate's address as the job's town, so these are held back from the
+# field mapping and reach remarks instead, where they read as what they are.
+JOB_HEADINGS = frozenset({
+    "jobcity", "jobarea", "joblocation", "jobappliedfor", "jobid", "jobtitle",
+    "jobrole", "recruitername",
+})
+
 # Bookkeeping columns. They are neither mapped nor worth keeping: a row number
 # and a spreadsheet's own validation helpers tell HR nothing, and in remarks they
 # push the actual notes out of view.
 NOISE_HEADINGS = frozenset({
     "sno", "slno", "srno", "serialno", "sl", "sr", "no", "id",
     "phonecheck", "emailcheck", "duplicateflag", "rawdigitshelper",
+    # Apna's own bookkeeping. "Matched Candidate" reads "Matched" on every row
+    # of every file, and the job id and match reasons are its internals. Three
+    # lines of nothing at the top of remarks push the real notes out of view.
+    "matchedcandidate", "matcheddata", "jobid",
 })
 
 DEFAULT_ACTION = "In Progress"
@@ -126,7 +141,13 @@ def _clean(value) -> str:
     # openpyxl hands back floats for whole numbers typed as numbers.
     if text.endswith(".0") and text[:-2].isdigit():
         text = text[:-2]
-    return "" if text.lower() in {"nan", "none", "-", "--", "n/a", "na"} else text
+    # Apna writes "Not Available" in every cell it has nothing for. Stored as
+    # written it becomes a company called Not Available and eleven lines of it
+    # in remarks, so it is read as the blank it stands for.
+    return "" if text.lower() in {
+        "nan", "none", "-", "--", "n/a", "na", "not available", "notavailable",
+        "not specified", "not mentioned", "nil",
+    } else text
 
 
 @dataclass
@@ -197,19 +218,46 @@ def normalise_phone(raw) -> tuple[str, list[str]]:
     return (found[0], found[1:]) if found else ("", [])
 
 
+# "8mos", "2yrs 1mos", "17yrs 4mos" — Apna writes a duration, not a number of
+# years. Longest unit first so "mos" is not eaten by the "m" alternative.
+_DURATION = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(years|year|yrs|yr|y|months|month|mons|mos|mo|m)\b",
+    re.IGNORECASE,
+)
+
+
 def parse_experience(raw) -> tuple[float, str]:
     """Years as a number, plus the original wording when it was not one.
 
     "Fresher", "Experienced" and "Fresher in telecalling" all appear where a
     number is expected. Anything we cannot read becomes 0 and keeps its wording
     in remarks, so "Experienced" is never silently filed as no experience.
+
+    A unit is honoured when the sheet gives one: "8mos" is eight MONTHS. Taking
+    the first number and calling it years turned eight months of experience into
+    eight years, which is the difference between a fresher and a senior hire.
     """
     text = _clean(raw)
     if not text:
         return 0.0, ""
+
+    total = 0.0
+    matched = False
+    for amount, unit in _DURATION.findall(text):
+        try:
+            value = float(amount)
+        except ValueError:
+            continue
+        matched = True
+        total += value / 12 if unit.lower().startswith("m") else value
+    if matched:
+        # The rounded figure loses the odd month, so the wording is kept.
+        return min(round(total, 1), 999.9), text
+
     match = re.search(r"\d+(?:\.\d+)?", text)
     if match:
         try:
+            # No unit given, so the sheet means years.
             years = float(match.group(0))
             # 4 digits, 1 decimal on the model.
             return (min(years, 999.9), "" if text == match.group(0) else text)
@@ -218,6 +266,7 @@ def parse_experience(raw) -> tuple[float, str]:
     if "fresher" in text.lower():
         return 0.0, "" if text.strip().lower() == "fresher" else text
     return 0.0, text
+
 
 
 def parse_money(raw) -> tuple[float, bool]:
@@ -269,6 +318,9 @@ def detect_header(rows: list[list], look_ahead: int = 12) -> tuple[int, dict[int
             key = _key(cell)
             if not key:
                 continue
+            if key in JOB_HEADINGS:
+                unknown.append(str(cell).strip())
+                continue
             for target, aliases in COLUMN_ALIASES.items():
                 if key in aliases:
                     # First column to claim a field keeps it. A second column
@@ -289,30 +341,76 @@ def detect_header(rows: list[list], look_ahead: int = 12) -> tuple[int, dict[int
     return best
 
 
-def read_rows(data: bytes, filename: str) -> list[tuple[str, list[list]]]:
-    """(sheet name, rows) for a .xlsx or .csv upload."""
-    lower = filename.lower()
-    if lower.endswith(".csv") or lower.endswith(".txt"):
-        text = data.decode("utf-8-sig", errors="replace")
-        sample = text[:4096]
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-        except csv.Error:
-            dialect = csv.excel
-        return [("CSV", [list(r) for r in csv.reader(io.StringIO(text), dialect)])]
+ZIP_MAGIC = b"PK\x03\x04"                            # .xlsx and .xlsm are zips
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # the old binary .xls
 
+
+# A resume dropped on the import dialog by mistake must be refused, not read as
+# a one-row sheet and reported back as an import of nobody.
+NOT_A_SPREADSHEET: tuple[tuple[bytes, str], ...] = (
+    (b"%PDF-", "a PDF"),
+    (b"\x89PNG", "an image"),
+    (b"\xff\xd8\xff", "an image"),
+    (b"GIF8", "an image"),
+    (b"{\\rtf", "an RTF document"),
+    (b"\x1f\x8b", "a gzip archive"),
+)
+
+
+class UnreadableUpload(ValueError):
+    """Not a spreadsheet we can read. The message is written for HR to act on."""
+
+
+def read_rows(data: bytes, filename: str) -> list[tuple[str, list[list]]]:
+    """(sheet name, rows), deciding the format from what is IN the file.
+
+    Not from its name: the WorkIndia export downloads as "Workindia Profile vv"
+    with no extension at all, and a name-based check refused a perfectly good
+    CSV at the door. A sheet someone renamed is the same file it always was.
+    """
+    if data[:4] == ZIP_MAGIC:
+        return _read_xlsx(data)
+    if data[:8] == OLE_MAGIC:
+        raise UnreadableUpload(
+            "That is an old .xls workbook. Open it, Save As .xlsx or CSV, then upload again."
+        )
+    for magic, what in NOT_A_SPREADSHEET:
+        if data.startswith(magic):
+            raise UnreadableUpload(
+                f"That looks like {what}, not a spreadsheet. Upload an .xlsx or a CSV."
+            )
+    if b"\x00" in data[:4096]:
+        raise UnreadableUpload("That file is not a spreadsheet. Upload an .xlsx or a CSV.")
+
+    text = data.decode("utf-8-sig", errors="replace")
+    sample = text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    return [("CSV", [list(r) for r in csv.reader(io.StringIO(text), dialect)])]
+
+
+def _read_xlsx(data: bytes) -> list[tuple[str, list[list]]]:
     import openpyxl  # imported here so a CSV upload never needs it
 
     workbook = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     sheets = []
     try:
         for worksheet in workbook.worksheets:
+            # Sheets exported by job boards declare <dimension ref="A1"/>, and
+            # read-only mode believes it: 332 candidates arrived as one cell and
+            # the file was skipped as "not a candidate list". Recomputing the
+            # extent from the rows themselves is what makes it readable at all.
+            if hasattr(worksheet, "reset_dimensions"):
+                worksheet.reset_dimensions()
             sheets.append(
                 (worksheet.title, [list(r) for r in worksheet.iter_rows(values_only=True)])
             )
     finally:
         workbook.close()
     return sheets
+
 
 
 def build_candidates(data: bytes, filename: str, source: str) -> ImportReport:
