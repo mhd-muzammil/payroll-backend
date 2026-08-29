@@ -403,19 +403,14 @@ class PayslipViewSet(viewsets.ModelViewSet):
             cl_available = casual_leave_available(emp, year, month)
             cl_apply = min(cl_available, lop_days)
 
-            # 2c. Special work is a fact about the month that only HR knows, and
-            # generating over a slip must not forget it. Attendance cannot say a
-            # day was extra rather than ordinary, so regenerating with 0 would
-            # silently take back pay someone had already been granted.
-            prior = Payslip.objects.filter(employee=emp, month=month, year=year).first()
-            special_days = Decimal(prior.special_work_days or 0) if prior else Decimal(0)
+            # 2c. Special work is a manual entry, and Regenerate means start
+            # over: it comes back at 0, the same as Undo Edits leaves it. The
+            # two buttons sit beside each other on the same slip, so one of them
+            # keeping a figure the other clears is worse than either rule alone.
+            # HR re-enters the extra days after a regeneration.
 
             # 3-6. All earnings/deductions/net math lives in one shared helper.
-            defaults = compute_payslip_fields(
-                emp, total_days, lop_days,
-                casual_leave_days=cl_apply,
-                special_work_days=special_days,
-            )
+            defaults = compute_payslip_fields(emp, total_days, lop_days, casual_leave_days=cl_apply)
             defaults['status'] = 'Generated'
 
             # Save / Update Record
@@ -619,14 +614,14 @@ class PayslipViewSet(viewsets.ModelViewSet):
         # back a smaller net than a fresh generation of the same month.
         cl_apply = min(casual_leave_available(payslip.employee, year, month), lop_days)
 
-        # Undo Edits resets the CALCULATION, not the record of what happened.
-        # Special work is the latter: days someone actually worked, which no
-        # regeneration could ever recover. Clearing it here would quietly take
-        # back pay, and HR can still zero the box by hand if it was wrong.
+        # Special work is a manual entry, so Undo Edits takes it back with the
+        # rest of them: the button promises the slip as generation left it, and
+        # generation never puts special work on a slip. Keeping it made Undo
+        # look like it had not worked.
         defaults = compute_payslip_fields(
             payslip.employee, total_days, lop_days,
             casual_leave_days=cl_apply,
-            special_work_days=Decimal(payslip.special_work_days or 0),
+            special_work_days=Decimal(0),
         )
         defaults['status'] = 'Generated'
         for field, value in defaults.items():

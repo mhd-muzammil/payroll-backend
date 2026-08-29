@@ -513,18 +513,50 @@ class SpecialWorkEndpointTests(APITestCase):
         self.slip.refresh_from_db()
         self.assertEqual(self.slip.special_work_days, Decimal(0))
 
-    def test_undoing_edits_keeps_the_days_someone_actually_worked(self):
-        """Undo resets the calculation, not the record of what happened — no
-        regeneration could ever recover it."""
+    def test_undoing_edits_takes_the_special_work_back_too(self):
+        """Undo Edits promises the slip as generation left it, and generation
+        never puts special work on one. Keeping it made the button look
+        broken — the figure HR had just entered was still sitting there."""
         self._post(lop_days=0, special_work_days=2)
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.special_work_days, Decimal(2))
+
         response = self.client.post(f"/api/payslips/{self.slip.id}/revert/", {}, format="json")
         self.assertEqual(response.status_code, 200, response.data)
         self.slip.refresh_from_db()
-        self.assertEqual(self.slip.special_work_days, Decimal(2))
-        # Revert recomputes on the real 25th-to-24th cycle, so the day rate is
-        # that cycle's. What matters is that two days are still being paid.
-        cycle = Decimal(self.slip.total_days)
-        self.assertEqual(
-            self.slip.special_work_pay,
-            (SALARY * 2 / cycle).quantize(Decimal("0.01")),
+        self.assertEqual(self.slip.special_work_days, Decimal(0))
+        self.assertEqual(self.slip.special_work_pay, Decimal("0.00"))
+
+
+class StartingOverClearsSpecialWorkTests(APITestCase):
+    """Undo Edits and Regenerate both mean start over, so both come back with
+    the special work at zero. One of them keeping a figure the other clears is
+    what made Undo look broken in the first place."""
+
+    def setUp(self):
+        self.hr = User.objects.create_user(username="hr4", password="x", role="hr")
+        self.client.force_authenticate(self.hr)
+        self.employee = make_employee("Starter", datetime.date(2025, 1, 1))
+        self.slip = Payslip.objects.create(
+            employee=self.employee, month=8, year=2026,
+            **compute_payslip_fields(self.employee, PERIOD, 0, special_work_days=3),
         )
+
+    def test_undo_edits_clears_it(self):
+        self.assertEqual(self.slip.special_work_days, Decimal(3))
+        self.client.post(f"/api/payslips/{self.slip.id}/revert/", {}, format="json")
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.special_work_days, Decimal(0))
+        self.assertEqual(self.slip.special_work_pay, Decimal("0.00"))
+
+    def test_regenerating_clears_it_the_same_way(self):
+        self.assertEqual(self.slip.special_work_days, Decimal(3))
+        response = self.client.post(
+            "/api/payslips/generate_all/",
+            {"month": 8, "year": 2026, "employee_id": self.employee.id},
+            format="json",
+        )
+        self.assertIn(response.status_code, (200, 201), response.data)
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.special_work_days, Decimal(0))
+        self.assertEqual(self.slip.special_work_pay, Decimal("0.00"))
