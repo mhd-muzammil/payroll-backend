@@ -387,3 +387,144 @@ class PolicyConstantTests(TestCase):
 
     def test_a_month_is_worth_one_day(self):
         self.assertEqual(CASUAL_LEAVE_DAYS_PER_MONTH, Decimal(1))
+
+
+class SpecialWorkTests(TestCase):
+    """Days worked beyond the cycle, entered by HR and paid on top.
+
+    Shaped like casual leave — its own days figure, its own paid line — but
+    ruled differently: nothing about it is earned, capped by absence, or tied
+    to leave. Two days entered is two days' pay, added.
+    """
+
+    def setUp(self):
+        self.employee = make_employee("Extra", datetime.date(2025, 1, 1))
+
+    def _fields(self, **over):
+        args = {"total_days": PERIOD, "lop_days": 0}
+        args.update(over)
+        return compute_payslip_fields(self.employee, **args)
+
+    def test_two_days_entered_pays_two_days(self):
+        fields = self._fields(special_work_days=2)
+        self.assertEqual(fields["special_work_days"], Decimal(2))
+        self.assertEqual(fields["special_work_pay"], DAY * 2)
+
+    def test_it_reaches_the_employee_in_the_net(self):
+        without = self._fields()
+        with_extra = self._fields(special_work_days=2)
+        self.assertEqual(with_extra["net_salary"] - without["net_salary"], DAY * 2)
+
+    def test_it_leaves_the_day_counts_and_the_earnings_alone(self):
+        without = self._fields(lop_days=3)
+        with_extra = self._fields(lop_days=3, special_work_days=2)
+        for fields in (without, with_extra):
+            self.assertEqual(fields["total_days"], PERIOD)
+            self.assertEqual(fields["lop_days"], Decimal(3))
+            self.assertEqual(fields["paid_days"], Decimal(27))
+        self.assertEqual(with_extra["gross_earnings"], without["gross_earnings"])
+
+    def test_none_entered_means_no_line_and_no_change(self):
+        fields = self._fields(lop_days=3)
+        self.assertEqual(fields["special_work_days"], Decimal(0))
+        self.assertEqual(fields["special_work_pay"], Decimal("0.00"))
+
+    def test_absence_does_not_cap_it_the_way_it_caps_leave(self):
+        """A Sunday call-out is worth a day whether or not they were also away
+        that week. Capping this by absence would swallow work that was done."""
+        fields = self._fields(lop_days=0, special_work_days=3)
+        self.assertEqual(fields["special_work_days"], Decimal(3))
+        self.assertEqual(fields["special_work_pay"], DAY * 3)
+
+    def test_a_day_worked_is_a_full_day_even_in_a_month_with_absence(self):
+        light = self._fields(lop_days=1, special_work_days=1)
+        heavy = self._fields(lop_days=20, special_work_days=1)
+        self.assertEqual(light["special_work_pay"], DAY)
+        self.assertEqual(heavy["special_work_pay"], DAY)
+
+    def test_it_cannot_exceed_the_cycle(self):
+        """A slipped keystroke should not pay out a year."""
+        fields = self._fields(special_work_days=500)
+        self.assertEqual(fields["special_work_days"], Decimal(PERIOD))
+
+    def test_a_negative_figure_is_nothing(self):
+        fields = self._fields(special_work_days=-3)
+        self.assertEqual(fields["special_work_days"], Decimal(0))
+        self.assertEqual(fields["special_work_pay"], Decimal("0.00"))
+
+    def test_leave_and_special_work_are_independent_and_both_paid(self):
+        fields = self._fields(lop_days=3, casual_leave_days=1, special_work_days=2)
+        self.assertEqual(fields["lop_days"], Decimal(3))
+        self.assertEqual(fields["paid_days"], Decimal(27))
+        self.assertEqual(fields["casual_leave_pay"], DAY)
+        self.assertEqual(fields["special_work_pay"], DAY * 2)
+        plain = self._fields(lop_days=3)
+        self.assertEqual(fields["net_salary"] - plain["net_salary"], DAY * 3)
+
+
+class SpecialWorkEndpointTests(APITestCase):
+    def setUp(self):
+        self.hr = User.objects.create_user(username="hr3", password="x", role="hr")
+        self.client.force_authenticate(self.hr)
+        self.employee = make_employee("Extra API", datetime.date(2025, 1, 1))
+        self.slip = Payslip.objects.create(
+            employee=self.employee, month=8, year=2026,
+            **compute_payslip_fields(self.employee, PERIOD, 0),
+        )
+
+    def _post(self, **payload):
+        body = {"total_days": PERIOD}
+        body.update(payload)
+        return self.client.post(f"/api/payslips/{self.slip.id}/recalculate/", body, format="json")
+
+    def test_hr_enters_two_days_and_two_days_are_paid(self):
+        before = self.slip.net_salary
+        response = self._post(lop_days=0, special_work_days=2)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.special_work_days, Decimal(2))
+        self.assertEqual(self.slip.special_work_pay, DAY * 2)
+        # Two days better off, and nothing else moved.
+        self.assertEqual(self.slip.net_salary - before, DAY * 2)
+        self.assertEqual(self.slip.lop_days, Decimal(0))
+        self.assertEqual(self.slip.paid_days, Decimal(PERIOD))
+
+    def test_editing_another_box_does_not_wipe_it(self):
+        """The reason it is read separately: saving LOP must not default the
+        special work away and take back pay that was already granted."""
+        self._post(lop_days=0, special_work_days=2)
+        self._post(lop_days=3)  # HR now types the month's absence in
+
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.lop_days, Decimal(3))
+        self.assertEqual(self.slip.special_work_days, Decimal(2))
+        self.assertEqual(self.slip.special_work_pay, DAY * 2)
+
+    def test_hr_can_take_it_back_by_entering_zero(self):
+        self._post(lop_days=0, special_work_days=2)
+        self._post(lop_days=0, special_work_days=0)
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.special_work_days, Decimal(0))
+        self.assertEqual(self.slip.special_work_pay, Decimal("0.00"))
+
+    def test_out_of_range_is_refused_rather_than_clamped_at_the_endpoint(self):
+        response = self._post(lop_days=0, special_work_days=PERIOD + 1)
+        self.assertEqual(response.status_code, 400)
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.special_work_days, Decimal(0))
+
+    def test_undoing_edits_keeps_the_days_someone_actually_worked(self):
+        """Undo resets the calculation, not the record of what happened — no
+        regeneration could ever recover it."""
+        self._post(lop_days=0, special_work_days=2)
+        response = self.client.post(f"/api/payslips/{self.slip.id}/revert/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.special_work_days, Decimal(2))
+        # Revert recomputes on the real 25th-to-24th cycle, so the day rate is
+        # that cycle's. What matters is that two days are still being paid.
+        cycle = Decimal(self.slip.total_days)
+        self.assertEqual(
+            self.slip.special_work_pay,
+            (SALARY * 2 / cycle).quantize(Decimal("0.01")),
+        )

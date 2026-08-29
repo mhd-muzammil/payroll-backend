@@ -23,6 +23,13 @@ class Payslip(models.Model):
     # What those days are worth, at one day of gross per day taken. Added to the
     # net after deductions, and shown as its own row on the slip.
     casual_leave_pay = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    # Days worked beyond the normal cycle — a Sunday call-out, a festival shift.
+    # Entered by HR, since nothing in attendance records that a day was extra
+    # rather than ordinary. Purely additive: it has nothing to do with leave or
+    # absence, so LOP, off days and the day counts are all untouched by it.
+    special_work_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
+    # What those days are worth, at one day of gross each, added to the net.
+    special_work_pay = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     paid_days = models.DecimalField(max_digits=5, decimal_places=2, default=30.0)
     
     # Gross Salary Components (Defined in Structure)

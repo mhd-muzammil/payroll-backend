@@ -60,7 +60,7 @@ def _q(val):
     return Decimal(val).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
-def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=None, off_days=0, casual_leave_days=0):
+def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=None, off_days=0, casual_leave_days=0, special_work_days=0):
     """Compute every earnings/deduction/net field for one employee given the
     period length, LOP (loss-of-pay) days and paid off-days.
 
@@ -74,6 +74,12 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
     `casual_leave_days` are paid too, but they do NOT offset LOP: the day count
     on the slip stays exactly what HR entered, and the leave is paid as its own
     line (`casual_leave_pay`) added to the net.
+    `special_work_days` are extra days worked beyond the cycle, entered by HR.
+    They are paid on top at one day of gross each (`special_work_pay`) and touch
+    nothing else: not LOP, not off days, not the day counts. Unlike casual leave
+    they are not capped by absence — someone can work extra in a month they were
+    also away — only by the length of the cycle, so a slipped keystroke cannot
+    pay out a year.
     `other_deduction_override`, when not None, replaces the "Other Deduction"
     line with an operator-supplied amount (the rest of the math is unchanged).
 
@@ -83,6 +89,7 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
     lop_days = Decimal(lop_days)
     off_days = Decimal(off_days)
     casual_leave_days = Decimal(casual_leave_days)
+    special_work_days = Decimal(special_work_days)
     if lop_days < 0:
         lop_days = Decimal(0)
     if lop_days > total_days:
@@ -98,6 +105,13 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         casual_leave_days = lop_days - off_days
     if casual_leave_days < 0:
         casual_leave_days = Decimal(0)
+    # Special work is bounded by the cycle only. Not by absence: a day worked on
+    # a Sunday is worth a day whether or not the employee was also away in the
+    # week, and pairing the two would silently swallow work that was done.
+    if special_work_days < 0:
+        special_work_days = Decimal(0)
+    if special_work_days > total_days:
+        special_work_days = total_days
 
     # Off days are paid, so they cancel out an equal number of LOP days.
     #
@@ -219,9 +233,12 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
     # month without. Deductions are left on the worked-days basis above: the
     # leave is added after them, exactly as the slip displays it.
     casual_leave_pay = q(gross_salary * casual_leave_days / total_days) if total_days > 0 else Decimal('0.00')
+    # Same day-rate as the leave line: gross over the cycle, never the pro-rated
+    # earnings, so a month with absence in it does not cheapen a day worked.
+    special_work_pay = q(gross_salary * special_work_days / total_days) if total_days > 0 else Decimal('0.00')
 
     # 6. Net Take Home (kept accurate to the paisa; no whole-rupee rounding)
-    net_rounded = q(gross_earnings + casual_leave_pay - gross_deductions)
+    net_rounded = q(gross_earnings + casual_leave_pay + special_work_pay - gross_deductions)
 
     return {
         'total_days': int(total_days),
@@ -229,6 +246,8 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         'off_days': off_days,
         'casual_leave_used': casual_leave_days,
         'casual_leave_pay': casual_leave_pay,
+        'special_work_days': special_work_days,
+        'special_work_pay': special_work_pay,
         'paid_days': paid_days,
 
         'gross_basic': gross_basic,
@@ -384,8 +403,19 @@ class PayslipViewSet(viewsets.ModelViewSet):
             cl_available = casual_leave_available(emp, year, month)
             cl_apply = min(cl_available, lop_days)
 
+            # 2c. Special work is a fact about the month that only HR knows, and
+            # generating over a slip must not forget it. Attendance cannot say a
+            # day was extra rather than ordinary, so regenerating with 0 would
+            # silently take back pay someone had already been granted.
+            prior = Payslip.objects.filter(employee=emp, month=month, year=year).first()
+            special_days = Decimal(prior.special_work_days or 0) if prior else Decimal(0)
+
             # 3-6. All earnings/deductions/net math lives in one shared helper.
-            defaults = compute_payslip_fields(emp, total_days, lop_days, casual_leave_days=cl_apply)
+            defaults = compute_payslip_fields(
+                emp, total_days, lop_days,
+                casual_leave_days=cl_apply,
+                special_work_days=special_days,
+            )
             defaults['status'] = 'Generated'
 
             # Save / Update Record
@@ -495,6 +525,14 @@ class PayslipViewSet(viewsets.ModelViewSet):
                     max(lop_days, Decimal(0)),
                 )
 
+            # Special work stands on its own: it is not derived from anything,
+            # so an edit to any other box must carry it forward untouched rather
+            # than default it away.
+            if request.data.get('special_work_days') is not None:
+                special_days = to_decimal(request.data.get('special_work_days'), 'special_work_days')
+            else:
+                special_days = Decimal(payslip.special_work_days or 0)
+
             # Optional other-deduction override.
             other_override = None
             if request.data.get('other_deduction') is not None:
@@ -515,12 +553,18 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 {"error": f"Off days are out of range for a {total_days}-day cycle."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if special_days < 0 or special_days > total_days:
+            return Response(
+                {"error": f"Special work days are out of range for a {total_days}-day cycle."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         defaults = compute_payslip_fields(
             payslip.employee, total_days, lop_days,
             other_deduction_override=other_override,
             off_days=off_days,
             casual_leave_days=cl_days,
+            special_work_days=special_days,
         )
         for field, value in defaults.items():
             setattr(payslip, field, value)
@@ -575,8 +619,14 @@ class PayslipViewSet(viewsets.ModelViewSet):
         # back a smaller net than a fresh generation of the same month.
         cl_apply = min(casual_leave_available(payslip.employee, year, month), lop_days)
 
+        # Undo Edits resets the CALCULATION, not the record of what happened.
+        # Special work is the latter: days someone actually worked, which no
+        # regeneration could ever recover. Clearing it here would quietly take
+        # back pay, and HR can still zero the box by hand if it was wrong.
         defaults = compute_payslip_fields(
-            payslip.employee, total_days, lop_days, casual_leave_days=cl_apply
+            payslip.employee, total_days, lop_days,
+            casual_leave_days=cl_apply,
+            special_work_days=Decimal(payslip.special_work_days or 0),
         )
         defaults['status'] = 'Generated'
         for field, value in defaults.items():
