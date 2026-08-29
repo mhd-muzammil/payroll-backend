@@ -108,7 +108,13 @@ class ProtectedOnboardingDocumentTests(APITestCase):
 class EmploymentStatusTests(APITestCase):
     """Active / Inactive / Relieved is one dimension covering everyone exactly
     once, and it drives the linked Employee record so a person who has left
-    stops appearing in attendance and payroll."""
+    stops appearing in attendance and payroll.
+
+    All three map straight across to Employee.status. Relieved used to be
+    flattened into 'inactive', which left no way to tell someone who had LEFT
+    from someone temporarily off the roster — and only the first should vanish
+    from the screens. See onboarding/test_relieved.py for what that vanishing
+    does and does not take with it."""
 
     def setUp(self):
         self.user = User.objects.create_user(username="hr", password="x", role="admin")
@@ -157,7 +163,7 @@ class EmploymentStatusTests(APITestCase):
         self.assertEqual(sum(counts.values()), len(rows), "every record lands in exactly one bucket")
         self.assertEqual(a.employment_status, "Active")
 
-    def test_relieving_someone_deactivates_their_employee_record(self):
+    def test_relieving_someone_marks_their_employee_record_relieved(self):
         record = self._onboard("Gone Away", "gone@example.com", "9000000002")
         self.assertEqual(self._employee_for(record).status, "active")
 
@@ -168,7 +174,9 @@ class EmploymentStatusTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertEqual(response.data["employment_status"], "Relieved")
-        self.assertEqual(self._employee_for(record).status, "inactive")
+        # Relieved is its own state now, not a second name for inactive: only
+        # this one drops off the working screens and closes the login.
+        self.assertEqual(self._employee_for(record).status, "relieved")
 
     def test_marking_inactive_also_deactivates_the_employee(self):
         record = self._onboard("On Hold", "hold@example.com", "9000000003")
@@ -182,18 +190,18 @@ class EmploymentStatusTests(APITestCase):
         record = self._onboard("Left Us", "left@example.com", "9000000004")
         record.employment_status = "Relieved"
         record.save()
-        self.assertEqual(self._employee_for(record).status, "inactive")
+        self.assertEqual(self._employee_for(record).status, "relieved")
 
         record.designation = "Senior Service engineer"
         record.save()
 
-        self.assertEqual(self._employee_for(record).status, "inactive")
+        self.assertEqual(self._employee_for(record).status, "relieved")
 
     def test_bringing_someone_back_reactivates_them(self):
         record = self._onboard("Rejoined", "rejoin@example.com", "9000000005")
         record.employment_status = "Relieved"
         record.save()
-        self.assertEqual(self._employee_for(record).status, "inactive")
+        self.assertEqual(self._employee_for(record).status, "relieved")
 
         record.employment_status = "Active"
         record.save()

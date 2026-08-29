@@ -8,6 +8,11 @@ class Employee(models.Model):
         ('active', 'Active'),
         ('inactive', 'Inactive'),
         ('onleave', 'On Leave'),
+        # Left the company. Distinct from 'inactive', which is someone still on
+        # the books who is not working at the moment: only 'relieved' drops off
+        # the working screens and stops the login. Nothing of theirs is deleted,
+        # so setting them back to Active in onboarding restores everything.
+        ('relieved', 'Relieved'),
     )
     BRANCH_CHOICES = (
         ('Chennai', 'Chennai'),

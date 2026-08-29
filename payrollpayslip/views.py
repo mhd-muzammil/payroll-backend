@@ -303,6 +303,13 @@ class PayslipViewSet(viewsets.ModelViewSet):
             if "All" not in branches:
                 queryset = queryset.filter(employee__branch__in=branches)
         
+        # Somebody who has left comes off the payslip and payroll screens.
+        # Their slips are NOT deleted — every month they were paid is still in
+        # the table, and setting them back to Active in onboarding shows the
+        # lot again. Payslip generation already skips them: it only ever picks
+        # up status='active'.
+        queryset = queryset.exclude(employee__status="relieved")
+
         month = self.request.query_params.get('month')
         year = self.request.query_params.get('year')
         if month:

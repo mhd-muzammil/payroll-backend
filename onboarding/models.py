@@ -233,15 +233,38 @@ def _ensure_user_for_employee(emp):
         pass
 
 
+def _sync_login_access(emp):
+    """Close or reopen the login belonging to this employee record.
+
+    Relieving someone has to stop them signing in, and nothing else does it:
+    the lists can hide them and their existing token would still work.
+    is_active is the one lever simplejwt already honours, so it is the one we
+    turn — and we turn it back on when they are not relieved, so an accidental
+    relief is undone by setting them Active again rather than by an admin going
+    hunting through the user list.
+    """
+    user = getattr(emp, 'user', None)
+    if user is None:
+        return
+    should_be_active = emp.status != 'relieved'
+    if user.is_active != should_be_active:
+        user.is_active = should_be_active
+        user.save(update_fields=['is_active'])
+
+
 def _employee_status_for(employment_status):
     """Onboarding's employment status -> the Employee record's status.
 
-    Employee has no 'relieved' of its own, and someone who has left must not
-    stay active: they would keep showing up in attendance, payroll and the
-    payslip run. Both Inactive and Relieved therefore land on 'inactive';
-    which of the two it was stays readable on the onboarding record.
+    All three map straight across. Relieved used to be flattened into
+    'inactive' because Employee had nowhere else to put it, which left no way
+    to tell someone who had LEFT from someone temporarily off the roster — and
+    only the first should disappear from the working screens.
     """
-    return 'active' if employment_status == 'Active' else 'inactive'
+    if employment_status == 'Active':
+        return 'active'
+    if employment_status == 'Relieved':
+        return 'relieved'
+    return 'inactive'
 
 
 @receiver(post_save, sender=Onboarding)
@@ -396,3 +419,7 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
     # the person can check in for Attendance, and they are picked up by Payroll.
     if emp:
         _ensure_user_for_employee(emp)
+        # Last, because the login may have only just been created above: a
+        # relieved employee must not walk away with a working account, and
+        # nothing else in the system closes one.
+        _sync_login_access(emp)

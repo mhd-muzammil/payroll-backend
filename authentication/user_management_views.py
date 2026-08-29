@@ -25,6 +25,13 @@ class UserManagementViewSet(viewsets.ModelViewSet):
                     Q(assigned_branch=assigned) | Q(assigned_branch__isnull=True)
                 )
 
+        # A relieved employee's login is deactivated by the onboarding sync, and
+        # it comes off this list too — otherwise an account is plainly sitting
+        # here and nobody can say why it will not sign in. Logins with no
+        # employee record behind them (office admins, service accounts) are
+        # untouched: the exclusion only bites when the join finds a relieved one.
+        queryset = queryset.exclude(employee_profile__status="relieved")
+
         q = self.request.query_params.get("q")
         role = self.request.query_params.get("role")
         is_active = self.request.query_params.get("is_active")

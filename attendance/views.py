@@ -910,6 +910,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             if "All" not in branches:
                 queryset = queryset.filter(employee__branch__in=branches)
 
+        # People who have left come off the attendance list. The rows survive —
+        # they are what past payroll was calculated from — they just stop being
+        # part of today's working view.
+        queryset = queryset.exclude(employee__status="relieved")
+
         # Optional, non-breaking filters on `intime`. When none are supplied the
         # full list is returned exactly as before. The frontend opts in to a
         # smaller payload by sending any of these query params. Malformed values
@@ -1054,7 +1059,8 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         branches = get_allowed_branches(user, "leaves")
         if "All" not in branches:
             queryset = queryset.filter(employee__branch__in=branches)
-        return queryset
+        # Same rule as attendance: gone from the list, kept in the table.
+        return queryset.exclude(employee__status="relieved")
 
     def perform_create(self, serializer):
         user = self.request.user

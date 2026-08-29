@@ -33,6 +33,12 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         branches = get_allowed_branches(user, "employees")
         if "All" not in branches:
             queryset = queryset.filter(branch__in=branches)
+        # Someone marked Relieved in onboarding has left, so they drop off the
+        # working list. Their record and everything hanging off it is still
+        # here — ?include_relieved=1 shows them, and setting them back to
+        # Active in onboarding brings them back for good.
+        if self.request.query_params.get("include_relieved") not in ("1", "true", "True"):
+            queryset = queryset.exclude(status="relieved")
         return queryset
 
     def _guard_write(self):
