@@ -224,7 +224,13 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         employer_epf = q(earned_basic * Decimal('0.13'))
         employer_esi = Decimal('0.00')
         employer_insurance = Decimal('0.00')
-        petrol_allowance = Decimal('0.00')
+        # Read off the employee here too. This branch synthesises a salary
+        # SPLIT for employees who have no detailed structure — it has no
+        # business discarding a figure HR typed in. Hardcoding it to zero was
+        # the same bug as pro-rating it, and worse: the slip showed a dash
+        # where the employee record plainly said 3,000. Most employees are on
+        # this branch, so it is the likelier one to be hit.
+        petrol_allowance = emp.petrol_allowance
 
     # Optional manual override of the "Other Deduction" line.
     if other_deduction_override is not None:

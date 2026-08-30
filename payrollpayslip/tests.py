@@ -428,6 +428,20 @@ class FlatBenefitsTests(TestCase):
         self.assertEqual(full["employer_epf"], Decimal("1950.00"))
         self.assertEqual(half["employer_epf"], Decimal("975.00"))
 
+    def test_the_allowance_survives_the_legacy_salary_structure_too(self):
+        """Most employees have no detailed breakdown, so compute_payslip_fields
+        synthesises one from their salary. That branch used to hardcode the
+        allowance to zero: the slip printed a dash where the employee record
+        said 3,000. It is the same bug as pro-rating it, on the path more
+        people are actually on."""
+        legacy = make_employee(
+            "Legacy", datetime.date(2024, 1, 1), petrol_allowance=Decimal("3000")
+        )
+        self.assertEqual(legacy.basic, Decimal(0))  # the branch under test
+
+        fields = compute_payslip_fields(legacy, PERIOD, 6)
+        self.assertEqual(fields["petrol_allowance"], Decimal("3000"))
+
     def test_the_allowance_is_not_money_in_the_net(self):
         """It is reimbursed against travel, not paid: it belongs on the slip as
         a line to read and nowhere in what reaches the bank."""
