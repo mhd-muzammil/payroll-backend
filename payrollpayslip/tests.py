@@ -377,6 +377,69 @@ class RevertMatchesGenerationTests(APITestCase):
         self.assertEqual(slip.lop_days, Decimal(0))  # no absence recorded
 
 
+class FlatBenefitsTests(TestCase):
+    """The benefits block holds two different kinds of number and the slip has
+    to keep them apart: a percentage of what was actually earned, which falls
+    when earnings fall, and a flat monthly figure HR typed on the employee,
+    which does not."""
+
+    def _employee(self, **extra):
+        # basic > 0 puts compute_payslip_fields on the detailed structure, which
+        # is the branch that reads the benefits off the employee at all.
+        fields = dict(
+            basic=Decimal("15000"),
+            hra=Decimal("7500"),
+            conveyance=Decimal("1600"),
+            child_edu=Decimal("200"),
+            personal_allowance=Decimal("5700"),
+            petrol_allowance=Decimal("3000"),
+            employer_epf=Decimal("1950"),
+            employer_insurance=Decimal("500"),
+        )
+        fields.update(extra)
+        return make_employee("Benefits", datetime.date(2024, 1, 1), **fields)
+
+    def test_a_flat_allowance_survives_a_month_of_absence(self):
+        """The reported bug. 3,000 entered on the employee came out as 1,645.16
+        on a slip with absence in it, because the allowance was being pro-rated
+        like a salary component. The slip then disagreed with the employee
+        record it was generated from."""
+        employee = self._employee()
+        full = compute_payslip_fields(employee, PERIOD, 0)
+        short = compute_payslip_fields(employee, PERIOD, 14)
+
+        self.assertEqual(full["petrol_allowance"], Decimal("3000"))
+        self.assertEqual(short["petrol_allowance"], Decimal("3000"))
+
+    def test_insurance_is_flat_in_the_same_way(self):
+        employee = self._employee()
+        self.assertEqual(
+            compute_payslip_fields(employee, PERIOD, 14)["employer_insurance"],
+            Decimal("500"),
+        )
+
+    def test_employer_epf_still_follows_what_was_earned(self):
+        """The other side of it, so the fix cannot quietly go too far: a
+        contribution worked out from earnings SHOULD fall when earnings fall."""
+        employee = self._employee()
+        full = compute_payslip_fields(employee, PERIOD, 0)
+        half = compute_payslip_fields(employee, PERIOD, PERIOD // 2)
+
+        self.assertEqual(full["employer_epf"], Decimal("1950.00"))
+        self.assertEqual(half["employer_epf"], Decimal("975.00"))
+
+    def test_the_allowance_is_not_money_in_the_net(self):
+        """It is reimbursed against travel, not paid: it belongs on the slip as
+        a line to read and nowhere in what reaches the bank."""
+        employee = self._employee()
+        with_allowance = compute_payslip_fields(employee, PERIOD, 3)
+        employee.petrol_allowance = Decimal("0")
+        without = compute_payslip_fields(employee, PERIOD, 3)
+
+        self.assertEqual(with_allowance["net_salary"], without["net_salary"])
+        self.assertEqual(with_allowance["gross_earnings"], without["gross_earnings"])
+
+
 class PolicyConstantTests(TestCase):
     """The office's policy, in the two numbers that decide what people are paid.
     A change to either changes payroll, so it should be a deliberate edit here

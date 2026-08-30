@@ -205,7 +205,12 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         employer_epf = q(emp.employer_epf * multiplier)
         employer_esi = q(emp.employer_esi * multiplier)
         employer_insurance = emp.employer_insurance
-        petrol_allowance = q(emp.petrol_allowance * multiplier)
+        # A flat monthly allowance, carried across as set — like the insurance
+        # line above it, and unlike the EPF/ESI contributions, which are a
+        # percentage of what was actually earned. Pro-rating it turned the
+        # 3,000 HR had entered into 1,645.16 on a month with absence in it, so
+        # the slip disagreed with the employee record it came from.
+        petrol_allowance = emp.petrol_allowance
     else:
         deduction_epf = q(earned_basic * Decimal('0.12'))
         deduction_prof_tax = Decimal('208.30') if gross_salary > 12000 else Decimal('0.00')
