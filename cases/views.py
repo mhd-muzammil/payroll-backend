@@ -14,6 +14,7 @@ from rest_framework.response import Response
 
 from .models import Case, DutySession, EngineerAlias, LocationPing
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
+from .pings import MAX_BATCH, PingRejected, build_ping, ingest_batch
 from .tracks import snapped_trail
 from employees.models import Employee
 from authentication.models import get_allowed_branches
@@ -38,6 +39,12 @@ MAX_ACCURACY_METERS = 100
 # indoors drifts tens of metres), and the duration has to exceed a traffic light
 # or a slow junction — otherwise every red signal on the ride would read as a
 # visit to a customer.
+# A fix that reached us this much later than it was taken spent time queued on
+# the phone: the phone was offline and has since caught up. Two minutes is
+# comfortably past the 30-second cadence plus ordinary latency, so it does not
+# fire for a fix that was merely slow.
+QUEUED_THRESHOLD_MINUTES = 2
+
 STOP_RADIUS_METERS = 120
 STOP_MIN_MINUTES = 8
 
@@ -199,6 +206,44 @@ def _role(user):
 
 def _is_staff_role(user):
     return _role(user) in ("superadmin", "admin", "hr")
+
+
+def _queued_minutes(ping):
+    """How long this fix waited on the phone before it could be sent.
+
+    None when we cannot tell — a row from before received_at existed, or no fix
+    at all. 0 for one that arrived when it was taken, the ordinary case. The two
+    mean different things and the row should not claim to know what it does not.
+    """
+    if ping is None or ping.received_at is None:
+        return None
+    delay = (ping.received_at - ping.timestamp).total_seconds() / 60
+    return 0 if delay < QUEUED_THRESHOLD_MINUTES else int(delay)
+
+
+# What the phone had left, and whether it had been offline. Together these make
+# "no signal" answerable: a last fix at 4% says the phone died, one at 80% says
+# the signal went, and a non-zero queued_minutes says it has since caught up.
+def _phone_state(ping):
+    return {
+        "battery_level": ping.battery_level if ping else None,
+        "is_charging": ping.is_charging if ping else None,
+        "queued_minutes": _queued_minutes(ping),
+    }
+
+
+def _case_for(case_id):
+    """The case a fix is tagged with, or None.
+
+    A non-numeric id is tolerated rather than fatal: losing which case a fix
+    belonged to is a small loss, losing the fix itself is not.
+    """
+    if not case_id:
+        return None
+    try:
+        return Case.objects.filter(pk=case_id).first()
+    except (ValueError, TypeError):
+        return None
 
 
 def _get_employee(user):
@@ -804,43 +849,43 @@ class TrackingViewSet(viewsets.ViewSet):
         if not employee:
             return Response({"detail": "No employee profile linked to this user."}, status=400)
 
-        lat = request.data.get("latitude")
-        lon = request.data.get("longitude")
-        if lat is None or lon is None:
-            return Response({"detail": "latitude and longitude are required."}, status=400)
+        try:
+            ping = build_ping(employee, request.data, _case_for)
+        except PingRejected as exc:
+            return Response({"detail": str(exc)}, status=400)
+
+        # A phone re-sending a fix it already delivered is ordinary, not an
+        # error: it timed out waiting for an answer it never saw. Hand back the
+        # one we hold rather than storing the trail twice.
+        if ping.client_key:
+            existing = LocationPing.objects.filter(
+                engineer=employee, client_key=ping.client_key
+            ).first()
+            if existing:
+                return Response(LocationPingSerializer(existing).data, status=200)
+
+        ping.save()
+        return Response(LocationPingSerializer(ping).data, status=201)
+
+    @action(detail=False, methods=["post"], url_path="ping/batch")
+    def ping_batch(self, request):
+        """A backlog of fixes the phone could not send when it took them.
+
+        The phone keeps going while it is offline — the GPS does not need a
+        network — and posts what it collected once the signal is back. Each fix
+        keeps the time it was TAKEN, so the route is drawn in the order the
+        engineer travelled rather than the order the network delivered.
+        """
+        employee = _get_employee(request.user)
+        if not employee:
+            return Response({"detail": "No employee profile linked to this user."}, status=400)
 
         try:
-            lat = float(lat)
-            lon = float(lon)
-        except (TypeError, ValueError):
-            return Response({"detail": "Invalid coordinates."}, status=400)
+            result = ingest_batch(employee, request.data.get("pings"), _case_for)
+        except PingRejected as exc:
+            return Response({"detail": str(exc), "max_batch": MAX_BATCH}, status=400)
 
-        case = None
-        case_id = request.data.get("case_id")
-        if case_id:
-            # Tolerate a bad case_id (non-numeric) — just record the ping with no
-            # case rather than 500-ing on the pk lookup.
-            try:
-                case = Case.objects.filter(pk=case_id).first()
-            except (ValueError, TypeError):
-                case = None
-
-        def _num(v):
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return None
-
-        ping = LocationPing.objects.create(
-            engineer=employee,
-            case=case,
-            latitude=lat,
-            longitude=lon,
-            accuracy=_num(request.data.get("accuracy")),
-            speed=_num(request.data.get("speed")),
-            status=request.data.get("status", ""),
-        )
-        return Response(LocationPingSerializer(ping).data, status=201)
+        return Response(result, status=201)
 
     @action(detail=False, methods=["get"])
     def live(self, request):
@@ -924,6 +969,7 @@ class TrackingViewSet(viewsets.ViewSet):
                     "timestamp": ping.timestamp if ping else None,
                     "active_case_id": ping.case_id if ping else None,
                     "active_case_number": ping.case.case_number if (ping and ping.case) else None,
+                    **_phone_state(ping),
                 }
             )
         return Response(LiveEngineerSerializer(rows, many=True).data)
@@ -1203,6 +1249,7 @@ class TrackingViewSet(viewsets.ViewSet):
                     "timestamp": ping.timestamp if ping else None,
                     "active_case_id": ping.case_id if ping else None,
                     "active_case_number": ping.case.case_number if (ping and ping.case) else None,
+                    **_phone_state(ping),
                 }
             )
 
@@ -1233,6 +1280,7 @@ class TrackingViewSet(viewsets.ViewSet):
                     "timestamp": None,
                     "active_case_id": None,
                     "active_case_number": None,
+                    **_phone_state(None),
                 }
             )
         rows.sort(key=lambda r: r["engineer_name"].lower())

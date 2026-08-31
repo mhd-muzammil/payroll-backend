@@ -236,12 +236,41 @@ class LocationPing(models.Model):
     speed = models.FloatField(null=True, blank=True, help_text="Reported speed in m/s")
     # Free-form working status the engineer's app reports alongside the location.
     status = models.CharField(max_length=20, blank=True, default="")
+
+    # How much charge the phone had. Null when the app is too old to report it.
+    # This is what turns "no signal" from a shrug into an answer: a last fix at
+    # 4% says the phone died, one at 80% says the signal went.
+    battery_level = models.IntegerField(
+        null=True, blank=True, help_text="Percent, 0-100, as the phone reported it"
+    )
+    is_charging = models.BooleanField(null=True, blank=True)
+
+    # WHEN THIS HAPPENED, as the phone says. The phone keeps fixes it could not
+    # send and posts them when the signal comes back, so this is not the same as
+    # when we received it — and the route has to be drawn in the order the
+    # engineer travelled, not the order the network delivered.
     timestamp = models.DateTimeField(default=timezone.now, db_index=True)
+    # WHEN WE GOT IT. Ours, not the phone's, so a phone with a wrong clock or a
+    # bad actor cannot rewrite history: a gap between the two is what identifies
+    # a fix that spent time queued on the phone. Null on rows that predate this.
+    received_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # The phone's own id for this fix, so replaying a batch it already sent (a
+    # retry after a timeout it never saw the answer to) does not double the
+    # trail. Null from an app that does not send one.
+    client_key = models.CharField(max_length=64, null=True, blank=True)
 
     class Meta:
         ordering = ["-timestamp"]
         indexes = [
             models.Index(fields=["engineer", "timestamp"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["engineer", "client_key"],
+                condition=models.Q(client_key__isnull=False),
+                name="one_ping_per_client_key",
+            )
         ]
 
     def __str__(self):

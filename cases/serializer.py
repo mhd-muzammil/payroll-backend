@@ -81,3 +81,11 @@ class LiveEngineerSerializer(serializers.Serializer):
     timestamp = serializers.DateTimeField(allow_null=True)
     active_case_id = serializers.IntegerField(allow_null=True)
     active_case_number = serializers.CharField(allow_null=True)
+
+    # The phone itself. battery_level answers what "no signal" means — a last
+    # fix at 4% says it died, one at 80% says the signal went. queued_minutes
+    # says the phone had been offline and has posted its backlog: 0 is live,
+    # null is "we cannot tell" (an app too old to report, or no fix at all).
+    battery_level = serializers.IntegerField(allow_null=True)
+    is_charging = serializers.BooleanField(allow_null=True)
+    queued_minutes = serializers.IntegerField(allow_null=True)
