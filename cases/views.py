@@ -41,6 +41,23 @@ MAX_ACCURACY_METERS = 100
 STOP_RADIUS_METERS = 120
 STOP_MIN_MINUTES = 8
 
+# The shortest gap between two fixes that counts as having gone somewhere.
+#
+# A parked phone does not report the same position twice: it wanders a few metres
+# every ping. Summing every gap therefore turned standing still into distance —
+# four minutes at one spot came out as 0.05 km, and a two-hour customer visit
+# would have read as 1.4 km travelled without the engineer moving at all.
+#
+# 20 m over a 30-second ping is 2.4 km/h, slower than walking, so nothing an
+# engineer actually does falls under it. The floor is raised by the two fixes'
+# own reported accuracy, because a pair of +/-15 m fixes can differ by 30 m
+# while sitting in one place.
+#
+# The trade: a genuine crawl of under 20 m per ping — a long traffic jam — is not
+# counted. Under-reporting a jam is a smaller lie than inventing a kilometre of
+# travel for someone who never left the building.
+MIN_STEP_METERS = 20.0
+
 
 def haversine_km(lat1, lon1, lat2, lon2):
     """Great-circle distance between two points, in kilometers."""
@@ -69,16 +86,43 @@ class NoEmployeeProfile(APIException):
     default_code = "no_employee_profile"
 
 
+def _moving_trail(pings):
+    """The trail with GPS wander taken out: every point is a real move from the
+    one before it.
+
+    Walks forward keeping a point only when it is far enough from the last KEPT
+    point — not from its immediate predecessor, which would let a parked phone
+    creep across a car park in 6 m steps that each looked like nothing.
+
+    Used for distance and for the road-snapped line. NOT used for the points
+    list itself: stop detection needs the stationary fixes, since a cluster of
+    them sitting in one place is exactly what a stop IS.
+    """
+    clean = _usable_pings(pings)
+    if not clean:
+        return []
+
+    kept = [clean[0]]
+    for ping in clean[1:]:
+        last = kept[-1]
+        metres = haversine_km(last.latitude, last.longitude, ping.latitude, ping.longitude) * 1000
+        floor = max(MIN_STEP_METERS, (last.accuracy or 0) + (ping.accuracy or 0))
+        if metres >= floor:
+            kept.append(ping)
+    return kept
+
+
 def _trail_km(pings):
     """Total distance along an ordered trail, in km.
 
-    Low-accuracy fixes are dropped first so one stray jump across town does not
-    inflate the day's kilometres. Shared by /live and /path so the number an
-    engineer's row shows is computed exactly the same way as their detail view.
+    Low-accuracy fixes are dropped, and so is wander: standing still is 0.00,
+    not the sum of however many metres the GPS drifted while nobody moved.
+    Shared by /live, /path and /day so the number on an engineer's row is
+    computed exactly the same way as the one in their detail view.
     """
-    clean = [p for p in pings if p.accuracy is None or p.accuracy <= MAX_ACCURACY_METERS]
+    moving = _moving_trail(pings)
     total = 0.0
-    for prev, cur in zip(clean, clean[1:]):
+    for prev, cur in zip(moving, moving[1:]):
         total += haversine_km(prev.latitude, prev.longitude, cur.latitude, cur.longitude)
     return round(total, 2)
 
@@ -956,7 +1000,7 @@ class TrackingViewSet(viewsets.ViewSet):
             # Feeding them different point sets would interleave two versions of
             # the same route in one stored polyline.
             payload["road_path"] = snapped_trail(
-                int(effective_engineer), target_date, _usable_pings(pings)
+                int(effective_engineer), target_date, _moving_trail(pings)
             )
 
         return Response(payload)
@@ -1311,7 +1355,7 @@ class TrackingViewSet(viewsets.ViewSet):
                 # The same route put onto roads, so the line follows the street
                 # the engineer was on instead of cutting between fixes. Sits
                 # beside `points`, which is unchanged.
-                "road_path": snapped_trail(engineer.id, target_date, clean),
+                "road_path": snapped_trail(engineer.id, target_date, _moving_trail(pings)),
                 # The route, thinned of noise so the line drawn matches the km.
                 "points": [
                     {
