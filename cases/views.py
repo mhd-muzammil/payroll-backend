@@ -14,6 +14,7 @@ from rest_framework.response import Response
 
 from .models import Case, DutySession, EngineerAlias, LocationPing
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
+from .tracks import snapped_trail
 from employees.models import Employee
 from authentication.models import get_allowed_branches
 
@@ -918,6 +919,7 @@ class TrackingViewSet(viewsets.ViewSet):
                 return Response({"detail": "Permission denied."}, status=403)
             qs = qs.filter(engineer=employee)
 
+        target_date = None
         date_str = request.query_params.get("date")
         if date_str:
             # parse_date raises ValueError on a format-valid but impossible date
@@ -931,13 +933,33 @@ class TrackingViewSet(viewsets.ViewSet):
 
         pings = list(qs.order_by("timestamp"))
 
-        return Response(
-            {
-                "count": len(pings),
-                "total_km": _trail_km(pings),
-                "points": LocationPingSerializer(pings, many=True).data,
-            }
-        )
+        payload = {
+            "count": len(pings),
+            "total_km": _trail_km(pings),
+            "points": LocationPingSerializer(pings, many=True).data,
+        }
+
+        # The same trail, put onto roads. Added alongside `points` rather than
+        # replacing it: every existing caller keeps the raw fixes it already
+        # reads, and a map can draw the road version when it is there.
+        #
+        # Only for one engineer on one dated day — that is the unit the snapped
+        # trail is cached by. A case's pings can span engineers and days, so
+        # there is nothing coherent to cache them under.
+        effective_engineer = engineer_id
+        if not effective_engineer and not case_id:
+            own = _get_employee(user)
+            effective_engineer = own.id if own else None
+        if effective_engineer and target_date:
+            # _usable_pings, not the raw list: /day snaps the same filtered
+            # trail, and both write to the one cached track per engineer-day.
+            # Feeding them different point sets would interleave two versions of
+            # the same route in one stored polyline.
+            payload["road_path"] = snapped_trail(
+                int(effective_engineer), target_date, _usable_pings(pings)
+            )
+
+        return Response(payload)
 
     @action(detail=False, methods=["get", "post"])
     def roster(self, request):
@@ -1286,6 +1308,10 @@ class TrackingViewSet(viewsets.ViewSet):
                 "stop_count": len(stops),
                 "stops": stops,
                 "events": events,
+                # The same route put onto roads, so the line follows the street
+                # the engineer was on instead of cutting between fixes. Sits
+                # beside `points`, which is unchanged.
+                "road_path": snapped_trail(engineer.id, target_date, clean),
                 # The route, thinned of noise so the line drawn matches the km.
                 "points": [
                     {

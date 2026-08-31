@@ -305,3 +305,10 @@ EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER)
 
+
+# --- Ola Maps -----------------------------------------------------------------
+# Used server-side only, to put an engineer's GPS trail onto real roads. It is
+# read here so it is configured in one place, and it must never be serialised
+# into an API response or reach a browser: a leaked key is somebody else's free
+# quota. Empty is a supported state — tracking falls back to the raw trail.
+OLA_MAPS_API_KEY = os.environ.get("OLA_MAPS_API_KEY", "")

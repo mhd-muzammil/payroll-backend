@@ -246,3 +246,47 @@ class LocationPing(models.Model):
 
     def __str__(self):
         return f"{self.engineer.employee_name} @ {self.timestamp:%Y-%m-%d %H:%M}"
+
+
+class SnappedTrack(models.Model):
+    """One engineer's day, with every fix already moved onto a road.
+
+    Snapping is a paid call to Ola, so a fix is snapped exactly ONCE and the
+    result kept. Without this the trail would be re-snapped on every read, and
+    the tracking board polls every 30 seconds: one board left open for an hour
+    would spend an hour's quota on one engineer.
+
+    `last_ping_id` is how "once" is enforced. Only fixes newer than it are sent,
+    and their snapped positions are appended, so the cost over a month is
+    (fixes / 50) requests no matter how often anyone looks.
+    """
+
+    engineer = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="snapped_tracks",
+    )
+    # The IST calendar day this trail belongs to, matching how the board asks
+    # for it (?date=YYYY-MM-DD).
+    day = models.DateField(db_index=True)
+    # [[lat, lon], ...] in travel order. A list rather than an encoded polyline
+    # so the map can read it without a decoder, and so a partial append is a
+    # plain list concatenation.
+    points = models.JSONField(default=list, blank=True)
+    # The highest LocationPing id already represented in `points`. 0 means
+    # nothing has been snapped yet.
+    last_ping_id = models.BigIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["engineer", "day"], name="one_snapped_track_per_engineer_day"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["engineer", "day"]),
+        ]
+
+    def __str__(self):
+        return f"{self.engineer.employee_name} {self.day} ({len(self.points)} pts)"
