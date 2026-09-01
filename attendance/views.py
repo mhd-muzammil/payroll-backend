@@ -29,6 +29,62 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c * 1000  # returns distance in meters
 
+
+# How close to the registered work location an employee has to stand. It was
+# written as a bare 50 in two endpoints and in the two messages they return, so
+# a change meant finding four of them.
+GEOFENCE_METERS = 50
+
+
+def geofence_refusal(employee, request, trailing=""):
+    """A Response refusing this punch on location grounds, or None to allow it.
+
+    Both check_in and check_out ask the same question and must answer it the
+    same way; they had two copies of it. `trailing` is the tail of the
+    too-far message, which differs between them.
+
+    An employee marked flexible_location is not tied to a place at all, so
+    there is nothing here to refuse them by -- including the "no work location
+    set" refusal, which would otherwise stop them before a distance is even
+    measured. That refusal is the usual reason a field engineer cannot mark
+    attendance: nobody ever set an office for someone who has no office.
+    """
+    if employee.flexible_location:
+        return None
+
+    allowed_lat = employee.work_lat
+    allowed_lon = employee.work_lon
+    if allowed_lat is None or allowed_lon is None:
+        return Response(
+            {"detail": "Allowed location not set for this employee. Please contact HR."},
+            status=400,
+        )
+
+    user_lat = request.data.get("latitude")
+    user_lon = request.data.get("longitude")
+    if user_lat is None or user_lon is None:
+        return Response({"detail": "Latitude and Longitude are required."}, status=400)
+
+    try:
+        distance = haversine_distance(
+            float(user_lat), float(user_lon), float(allowed_lat), float(allowed_lon)
+        )
+    except (ValueError, TypeError):
+        return Response({"detail": "Invalid coordinates provided."}, status=400)
+
+    if distance > GEOFENCE_METERS:
+        return Response(
+            {
+                "detail": (
+                    f"You are too far from the office ({round(distance)}m). "
+                    f"Must be within {GEOFENCE_METERS}m{trailing}."
+                )
+            },
+            status=403,
+        )
+
+    return None
+
 class AttendanceViewSet(viewsets.ModelViewSet):
     serializer_class = AttendanceSerializer
     permission_classes = [IsAuthenticated]
@@ -958,28 +1014,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         except AttributeError:
             return Response({"detail": "Employee profile not found for this user."}, status=400)
 
-        # Fetch dynamically configured work location per user
-        allowed_lat = employee.work_lat
-        allowed_lon = employee.work_lon
-
-        if allowed_lat is None or allowed_lon is None:
-             return Response({"detail": "Allowed location not set for this employee. Please contact HR."}, status=400)
-
-        user_lat = request.data.get("latitude")
-        user_lon = request.data.get("longitude")
-
-        if user_lat is None or user_lon is None:
-            return Response({"detail": "Latitude and Longitude are required."}, status=400)
-
-        try:
-            distance = haversine_distance(float(user_lat), float(user_lon), float(allowed_lat), float(allowed_lon))
-        except (ValueError, TypeError):
-            return Response({"detail": "Invalid coordinates provided."}, status=400)
-
-        if distance > 50:
-            return Response({
-                "detail": f"You are too far from the office ({round(distance)}m). Must be within 50m."
-            }, status=403)
+        refusal = geofence_refusal(employee, request)
+        if refusal is not None:
+            return refusal
 
         # Check if already checked in today
         today = timezone.localdate()
@@ -1009,27 +1046,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         except AttributeError:
             return Response({"detail": "Employee profile not found for this user."}, status=400)
 
-        allowed_lat = employee.work_lat
-        allowed_lon = employee.work_lon
-
-        if allowed_lat is None or allowed_lon is None:
-             return Response({"detail": "Allowed location not set for this employee. Please contact HR."}, status=400)
-
-        user_lat = request.data.get("latitude")
-        user_lon = request.data.get("longitude")
-
-        if user_lat is None or user_lon is None:
-            return Response({"detail": "Latitude and Longitude are required."}, status=400)
-
-        try:
-            distance = haversine_distance(float(user_lat), float(user_lon), float(allowed_lat), float(allowed_lon))
-        except (ValueError, TypeError):
-            return Response({"detail": "Invalid coordinates provided."}, status=400)
-
-        if distance > 50:
-            return Response({
-                "detail": f"You are too far from the office ({round(distance)}m). Must be within 50m to clock out."
-            }, status=403)
+        refusal = geofence_refusal(employee, request, trailing=" to clock out")
+        if refusal is not None:
+            return refusal
 
         today = timezone.localdate()
         existing = Attendance.objects.filter(employee=employee, intime__date=today).first()

@@ -61,6 +61,14 @@ class Employee(models.Model):
 
     work_lat = models.FloatField(null=True, blank=True, help_text="Allowed work location latitude")
     work_lon = models.FloatField(null=True, blank=True, help_text="Allowed work location longitude")
+    # Not everyone works from a fixed place. A field engineer is legitimately
+    # somewhere different every day, and for them the work location above is not
+    # a lax rule to be widened -- it is the wrong question. This turns the
+    # distance test off for one employee rather than for everybody.
+    flexible_location = models.BooleanField(
+        default=False,
+        help_text="Let this employee mark attendance from anywhere, ignoring the work location",
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
     # `joining_date` is auto-stamped at record creation and is NOT the real hire
     # date. `date_of_joining` is the real hire date (editable, from onboarding or
