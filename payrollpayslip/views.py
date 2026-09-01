@@ -2,12 +2,15 @@ from django.db.models import Q, Sum
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 from decimal import Decimal, ROUND_HALF_UP
 import calendar
 import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Casual leave: one paid day a month, once six months' service (probation) is
 # behind them. It does not accumulate — a month is worth one day, and a month
@@ -916,6 +919,99 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 "avgPayout": fmt_dashboard(avg_salary_raw)
             }
         }, status=status.HTTP_200_OK)
+
+    # ---------------------------------------------------------------- PDF
+    # The Download button used to call window.print() on a hidden iframe. That
+    # does nothing whatsoever inside an Android WebView, and neither does an
+    # <a download> with a blob, because Capacitor registers no DownloadListener
+    # -- so in the app the button was inert. What Capacitor DOES do is hand any
+    # URL on a different host to the system browser, and the API is on a
+    # different host from the site. So: a URL that returns application/pdf.
+    #
+    # A plain navigation cannot carry an Authorization header, so it cannot be
+    # the JWT that authorises it. Instead the app asks for a signed ticket over
+    # the authenticated channel it already has, and spends it within five
+    # minutes. The ticket names one payslip and one user, is signed with
+    # SECRET_KEY, and is useless for anything else.
+    PDF_TICKET_SALT = "payslip.pdf.download"
+    PDF_TICKET_MAX_AGE = 300  # seconds
+
+    @action(detail=True, methods=['get'], url_path='pdf_ticket')
+    def pdf_ticket(self, request, pk=None):
+        """A short-lived ticket the app can put in a URL to fetch the PDF."""
+        from django.core import signing
+
+        # get_object() applies get_queryset(), so this is the same scoping that
+        # decides whether they may see the payslip at all: an employee only
+        # ever reaches their own, and branch limits still apply to staff.
+        payslip = self.get_object()
+
+        ticket = signing.dumps(
+            {"payslip": payslip.id, "user": request.user.id},
+            salt=self.PDF_TICKET_SALT,
+        )
+        return Response({
+            "ticket": ticket,
+            "path": f"/api/payslips/{payslip.id}/pdf/?t={ticket}",
+            "expires_in": self.PDF_TICKET_MAX_AGE,
+        })
+
+    @action(
+        detail=True,
+        methods=['get'],
+        url_path='pdf',
+        permission_classes=[AllowAny],
+        authentication_classes=[],
+    )
+    def pdf(self, request, pk=None):
+        """The payslip as a PDF, authorised by the ticket above.
+
+        AllowAny because the browser this opens in has no JWT -- the ticket is
+        the credential, and it was minted for this payslip by someone who was
+        allowed to see it.
+        """
+        from django.core import signing
+        from django.http import HttpResponse
+
+        from .payslip_pdf import payslip_filename, render_payslip_pdf
+
+        ticket = request.query_params.get("t") or ""
+        try:
+            payload = signing.loads(
+                ticket, salt=self.PDF_TICKET_SALT, max_age=self.PDF_TICKET_MAX_AGE
+            )
+        except signing.SignatureExpired:
+            return Response(
+                {"detail": "This download link has expired. Please try again."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except signing.BadSignature:
+            return Response({"detail": "Invalid download link."}, status=status.HTTP_403_FORBIDDEN)
+
+        # The ticket names its payslip. Trusting the URL instead would let one
+        # valid ticket fetch every payslip in the table.
+        if str(payload.get("payslip")) != str(pk):
+            return Response({"detail": "Invalid download link."}, status=status.HTTP_403_FORBIDDEN)
+
+        payslip = Payslip.objects.select_related("employee").filter(pk=pk).first()
+        if payslip is None:
+            return Response({"detail": "Payslip not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            pdf_bytes = render_payslip_pdf(payslip)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller below
+            logger.exception("payslip PDF render failed for %s", pk)
+            return Response(
+                {"detail": f"Could not build the PDF: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        response = HttpResponse(pdf_bytes, content_type="application/pdf")
+        # attachment, not inline: the point of the whole exercise is a file the
+        # engineer keeps, not a tab they lose.
+        response["Content-Disposition"] = f'attachment; filename="{payslip_filename(payslip)}"'
+        response["Content-Length"] = str(len(pdf_bytes))
+        return response
 
     @action(detail=True, methods=['post'])
     def email_payslip(self, request, pk=None):
