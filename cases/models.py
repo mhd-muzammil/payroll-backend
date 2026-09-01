@@ -79,6 +79,22 @@ class Case(models.Model):
     reached_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
+    # WHERE the engineer punched in and out of this call.
+    #
+    # reached_at and completed_at already say WHEN; these say where they were
+    # standing when they said it. Without them "reached 2:40pm" is a claim with
+    # nothing behind it — the office could see the trail passing nearby but not
+    # that the engineer was at the customer when they marked the work started.
+    #
+    # Null on every case that predates the punch buttons, and on any case moved
+    # by the older accept/start_travel/reached actions, which are still there.
+    punch_in_lat = models.FloatField(null=True, blank=True)
+    punch_in_lon = models.FloatField(null=True, blank=True)
+    punch_in_accuracy = models.FloatField(null=True, blank=True, help_text="Metres, as the phone reported")
+    punch_out_lat = models.FloatField(null=True, blank=True)
+    punch_out_lon = models.FloatField(null=True, blank=True)
+    punch_out_accuracy = models.FloatField(null=True, blank=True, help_text="Metres, as the phone reported")
+
     resolution_notes = models.TextField(blank=True, default="")
 
     # Is this ticket in the originating system's CURRENT plan for its engineer?

@@ -14,7 +14,7 @@ from rest_framework.response import Response
 
 from .models import Case, DutySession, EngineerAlias, LocationPing
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
-from .pings import MAX_BATCH, PingRejected, build_ping, ingest_batch
+from .pings import MAX_BATCH, PingRejected, build_ping, coerce_number, ingest_batch
 from .tracks import snapped_trail
 from employees.models import Employee
 from authentication.models import get_allowed_branches
@@ -741,6 +741,62 @@ class CaseViewSet(viewsets.ModelViewSet):
                 setattr(case, k, v)
         case.save()
         return Response(self.get_serializer(case).data)
+
+    def _punch_coords(self, request, prefix):
+        """The position the phone reported at the moment of the punch.
+
+        Silently absent when the phone had no fix — a punch must never fail for
+        want of GPS, because the alternative is an engineer standing at a
+        customer unable to record that they are there. A punch with no
+        coordinates still records the time; it just cannot be placed.
+        """
+        lat = coerce_number(request.data.get("latitude"))
+        lon = coerce_number(request.data.get("longitude"))
+        if lat is None or lon is None:
+            return {}
+        return {
+            f"{prefix}_lat": lat,
+            f"{prefix}_lon": lon,
+            f"{prefix}_accuracy": coerce_number(request.data.get("accuracy")),
+        }
+
+    @action(detail=True, methods=["post"])
+    def punch_in(self, request, pk=None):
+        """The engineer is at the customer and starting work.
+
+        One button in place of Accept, Start Travel, Reached and Start Work: an
+        engineer with gloves on outside a customer's premises was being asked to
+        drive a four-step workflow, and the office only ever needed to know two
+        things — that they got there, and that they finished.
+
+        Lands on `working` because that is the status the rest of the system,
+        OpenCall included, already understands as "in progress". The older
+        transitions still exist; this is a shorter road to the same place.
+        """
+        return self._engineer_transition(
+            request,
+            pk,
+            ["assigned", "accepted", "on_the_way", "reached"],
+            "working",
+            stamp_field="reached_at",
+            extra=self._punch_coords(request, "punch_in") or None,
+        )
+
+    @action(detail=True, methods=["post"])
+    def punch_out(self, request, pk=None):
+        """The work is done and the engineer is leaving."""
+        notes = request.data.get("resolution_notes", "")
+        extra = self._punch_coords(request, "punch_out")
+        if notes:
+            extra["resolution_notes"] = notes
+        return self._engineer_transition(
+            request,
+            pk,
+            ["working", "reached", "on_the_way"],
+            "completed",
+            stamp_field="completed_at",
+            extra=extra or None,
+        )
 
     @action(detail=True, methods=["post"])
     def accept(self, request, pk=None):

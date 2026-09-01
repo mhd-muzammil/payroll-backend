@@ -55,7 +55,12 @@ def _coord(value, name):
         raise PingRejected("Invalid %s." % name)
 
 
-def _number(value):
+def coerce_number(value):
+    """A float, or None when the value is missing or not a number.
+
+    Public because the case punch endpoints need the same leniency: a phone with
+    no fix sends nothing, and that must read as "no position", not as an error.
+    """
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -136,8 +141,8 @@ def build_ping(employee, payload, case_lookup, now=None):
         case=case_lookup(payload.get("case_id")),
         latitude=latitude,
         longitude=longitude,
-        accuracy=_number(payload.get("accuracy")),
-        speed=_number(payload.get("speed")),
+        accuracy=coerce_number(payload.get("accuracy")),
+        speed=coerce_number(payload.get("speed")),
         status=str(payload.get("status") or "")[:20],
         battery_level=battery_percent(payload.get("battery_level")),
         is_charging=_flag(payload.get("is_charging")),
