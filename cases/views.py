@@ -200,6 +200,46 @@ def _detect_stops(pings):
     return stops
 
 
+def _punches_for_day(engineer, day):
+    """Every call this engineer punched in or out of on `day`, with where.
+
+    Read from the cases rather than derived from the trail: these are the
+    moments the engineer themselves marked, and the coordinates are the ones
+    their phone reported at the instant they pressed the button.
+
+    A punch whose position was never captured — no fix at the time — is still
+    returned, so the timeline is complete; it simply cannot be drawn.
+    """
+    cases = Case.objects.filter(assigned_to=engineer).only(
+        "case_number", "title", "reached_at", "completed_at",
+        "punch_in_lat", "punch_in_lon", "punch_in_accuracy",
+        "punch_out_lat", "punch_out_lon", "punch_out_accuracy",
+    )
+
+    out = []
+    for case in cases:
+        for kind, at, lat, lon, accuracy in (
+            ("in", case.reached_at, case.punch_in_lat, case.punch_in_lon, case.punch_in_accuracy),
+            ("out", case.completed_at, case.punch_out_lat, case.punch_out_lon, case.punch_out_accuracy),
+        ):
+            if not at or timezone.localtime(at).date() != day:
+                continue
+            out.append(
+                {
+                    "kind": kind,
+                    "at": at,
+                    "case_id": case.id,
+                    "case_number": case.case_number,
+                    "title": case.title,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "accuracy": accuracy,
+                }
+            )
+    out.sort(key=lambda p: p["at"])
+    return out
+
+
 def _role(user):
     return "superadmin" if user.is_superuser else getattr(user, "role", "employee")
 
@@ -858,11 +898,21 @@ class TrackingViewSet(viewsets.ViewSet):
 
     def _duty_payload(self, employee):
         session = self._open_session(employee)
+        # Today's distance, carried on the state the app already polls rather
+        # than a request of its own. Computed by _trail_km, the same helper the
+        # office's board uses — so an engineer asking "how far have I gone" and
+        # a manager asking the same about them cannot get two answers.
+        today = timezone.localdate()
+        pings = list(
+            LocationPing.objects.filter(engineer=employee, timestamp__date=today)
+            .order_by("timestamp")
+        )
         return {
             "on_duty": session is not None,
             "session_id": session.id if session else None,
             "started_at": session.started_at if session else None,
             "duration_minutes": session.duration_minutes() if session else 0,
+            "today_km": _trail_km(pings),
         }
 
     @action(detail=False, methods=["get"])
@@ -1388,6 +1438,7 @@ class TrackingViewSet(viewsets.ViewSet):
             )
         )
         stops = _detect_stops(pings)
+        punches = _punches_for_day(engineer, target_date)
 
         # A timeline the office can read top to bottom, the way the day happened.
         events = []
@@ -1455,6 +1506,12 @@ class TrackingViewSet(viewsets.ViewSet):
                 "last_seen": clean[-1].timestamp if clean else None,
                 "stop_count": len(stops),
                 "stops": stops,
+                # Where the engineer SAID they arrived and left, as against the
+                # stops above, which are inferred from the trail standing still.
+                # A stop is our guess; a punch is their word, and the two are
+                # worth being able to compare on the same map — a punch with no
+                # stop under it is somebody who marked a call done from the road.
+                "punches": punches,
                 "events": events,
                 # The same route put onto roads, so the line follows the street
                 # the engineer was on instead of cutting between fixes. Sits
