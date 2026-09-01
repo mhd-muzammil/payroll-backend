@@ -12,7 +12,7 @@ from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Case, DutySession, EngineerAlias, LocationPing
+from .models import Case, DutySession, EngineerAlias, EngineerScorecard, LocationPing
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
 from .pings import MAX_BATCH, PingRejected, build_ping, coerce_number, ingest_batch
 from .tracks import snapped_trail
@@ -286,6 +286,15 @@ def _case_for(case_id):
         return None
 
 
+def _as_count(value):
+    """A non-negative whole number, or 0. Counts arrive over HTTP as anything."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, number)
+
+
 def _get_employee(user):
     return getattr(user, "employee_profile", None)
 
@@ -510,6 +519,108 @@ class CaseViewSet(viewsets.ModelViewSet):
         "open": "assigned",
         "scheduled": "assigned",
     }
+
+    # ------------------------------------------------- productivity numbers
+    # OpenCall's Engineer Productivity page decides Assigned / Attended / Closed
+    # in one function, and the case sync already reuses that same function to
+    # pick the tickets it pushes here. These two endpoints carry the resulting
+    # counts across the same bridge rather than deriving a second set, because
+    # an engineer reading their phone and a manager reading the dashboard
+    # showing different figures for the same day is worse than showing none.
+
+    @action(detail=False, methods=["post"], url_path="scorecards")
+    def scorecards(self, request):
+        """Receive today's per-engineer counts from OpenCall.
+
+        Body: {"as_of": "YYYY-MM-DD", "daily_target": 7, "monthly_target": 175,
+               "rows": [ {engineer_name?/engineer_email?/engineer_phone?/engineer_id?,
+                          assigned, attended, closed, month_closed}, ... ]}
+
+        One row per engineer, replaced in place. An unmatched engineer is
+        reported and skipped rather than failing the batch — the same rule
+        bulk_dispatch uses, and for the same reason: one unrecognised name must
+        not cost every other engineer their numbers.
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Only admin/HR can push scorecards."}, status=403)
+
+        rows = request.data.get("rows")
+        if not isinstance(rows, list):
+            return Response({"detail": 'Body must be {"rows": [ ... ]}.'}, status=400)
+
+        as_of = parse_date(str(request.data.get("as_of") or "")) or timezone.localdate()
+        daily_target = _as_count(request.data.get("daily_target"))
+        monthly_target = _as_count(request.data.get("monthly_target"))
+
+        saved = 0
+        skipped = []
+        seen = set()
+
+        for raw in rows:
+            if not isinstance(raw, dict):
+                skipped.append({"engineer_name": None, "reason": "not an object"})
+                continue
+
+            employee = resolve_engineer(raw)
+            if employee is None:
+                skipped.append({
+                    "engineer_name": (raw.get("engineer_name") or "").strip() or None,
+                    "reason": "engineer not matched",
+                })
+                continue
+
+            EngineerScorecard.objects.update_or_create(
+                engineer=employee,
+                defaults={
+                    "as_of": as_of,
+                    "assigned": _as_count(raw.get("assigned")),
+                    "attended": _as_count(raw.get("attended")),
+                    "closed": _as_count(raw.get("closed")),
+                    "month_closed": _as_count(raw.get("month_closed")),
+                    "daily_target": daily_target,
+                    "monthly_target": monthly_target,
+                },
+            )
+            seen.add(employee.id)
+            saved += 1
+
+        # An engineer who dropped off today's plan keeps a card, zeroed rather
+        # than left showing yesterday's figures. Only ever touches rows already
+        # stamped with an older day, so a partial push cannot blank a colleague
+        # who simply was not in this batch.
+        stale = EngineerScorecard.objects.filter(as_of__lt=as_of).exclude(engineer_id__in=seen)
+        zeroed = stale.update(
+            as_of=as_of, assigned=0, attended=0, closed=0, month_closed=0,
+            daily_target=daily_target, monthly_target=monthly_target,
+        )
+
+        return Response({"saved": saved, "zeroed": zeroed, "skipped": skipped})
+
+    @action(detail=False, methods=["get"], url_path="my_scorecard")
+    def my_scorecard(self, request):
+        """The caller's own numbers, for the card on their Cases screen."""
+        employee = _get_employee(request.user)
+        if not employee:
+            raise NoEmployeeProfile()
+
+        card = EngineerScorecard.objects.filter(engineer=employee).first()
+        today = timezone.localdate()
+
+        # Yesterday's numbers wearing today's label would be a lie the engineer
+        # cannot detect. If the sync has stopped, say so by showing nothing.
+        fresh = card is not None and card.as_of == today
+
+        return Response({
+            "as_of": card.as_of if card else None,
+            "stale": bool(card) and not fresh,
+            "assigned": card.assigned if fresh else 0,
+            "attended": card.attended if fresh else 0,
+            "closed": card.closed if fresh else 0,
+            "month_closed": card.month_closed if fresh else 0,
+            "daily_target": card.daily_target if card else 0,
+            "monthly_target": card.monthly_target if card else 0,
+            "updated_at": card.updated_at if card else None,
+        })
 
     @action(detail=False, methods=["post"])
     def bulk_dispatch(self, request):

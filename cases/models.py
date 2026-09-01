@@ -335,3 +335,52 @@ class SnappedTrack(models.Model):
 
     def __str__(self):
         return f"{self.engineer.employee_name} {self.day} ({len(self.points)} pts)"
+
+
+class EngineerScorecard(models.Model):
+    """What OpenCall's Engineer Productivity page says about one engineer, today.
+
+    Not computed here. Assigned / Attended / Closed are decided by one function
+    in OpenCall (`computeEngineerProductivity`), and the whole point of carrying
+    the numbers across rather than deriving our own is that an engineer reading
+    their phone and a manager reading the dashboard must never see two different
+    figures for the same day. The existing case sync already reuses that same
+    function, so these ride the bridge that is already right.
+
+    ONE row per engineer, replaced in place every sync. Deliberately not a
+    per-day history table: an append-only table that nothing prunes is exactly
+    what silently rotted the OpenCall dispatch query until it timed out, and
+    nothing here needs yesterday.
+    """
+
+    engineer = models.OneToOneField(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="scorecard",
+    )
+    # The IST day the today-figures belong to. A stale card is worse than no
+    # card, so the reader compares this against today and shows zeros if the
+    # sync has stopped rather than yesterday's numbers dressed as today's.
+    as_of = models.DateField()
+
+    assigned = models.IntegerField(default=0)
+    attended = models.IntegerField(default=0)
+    closed = models.IntegerField(default=0)
+
+    # Closes since the 1st of the month, for the month-to-date target.
+    month_closed = models.IntegerField(default=0)
+    # Carried from OpenCall rather than hard-coded, so changing the target there
+    # changes it here without a deploy on this side.
+    daily_target = models.IntegerField(default=0)
+    monthly_target = models.IntegerField(default=0)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["as_of"])]
+
+    def __str__(self):
+        return (
+            f"{self.engineer.employee_name} {self.as_of}: "
+            f"{self.assigned}/{self.attended}/{self.closed}"
+        )
