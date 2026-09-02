@@ -149,6 +149,14 @@ def build_ping(employee, payload, case_lookup, now=None):
         timestamp=resolve_timestamp(payload.get("timestamp"), now),
         received_at=now,
         client_key=key,
+        # The phone telling us it had stopped tracking before this fix. Trusted
+        # because it is the only thing that can know, and because getting it
+        # wrong costs the engineer distance rather than earning them any.
+        # bool(), not _flag() alone: _flag returns None for anything it does not
+        # recognise, and this column is NOT NULL. Every ping from an app that
+        # predates the flag omits it entirely, so None is the ORDINARY case and
+        # storing it would 500 the whole tracking endpoint.
+        after_gap=bool(_flag(payload.get("after_gap"))),
     )
 
 

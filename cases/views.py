@@ -122,14 +122,41 @@ def _moving_trail(pings):
 def _trail_km(pings):
     """Total distance along an ordered trail, in km.
 
+    Three things are deliberately NOT counted.
+
     Low-accuracy fixes are dropped, and so is wander: standing still is 0.00,
     not the sum of however many metres the GPS drifted while nobody moved.
+
+    And travel nobody measured. A fix carrying `after_gap` is the first one
+    after the phone stopped tracking -- its location switched off, its
+    permission withdrawn -- so whatever happened between the fix before it and
+    this one was never seen. Joining them would charge a straight line across
+    it: shorter than the road they drove, invented either way. That one segment
+    is skipped; everything on both sides of it still counts in full.
+
+    Deliberately NOT inferred from the time gap. An engineer standing still
+    produces no new rows either, so a 40-minute hole is either 40 minutes of
+    untracked driving or 40 minutes of work at one customer, and guessing threw
+    away the journey after every long stop. Only the phone knows, so the phone
+    says.
+
     Shared by /live, /path and /day so the number on an engineer's row is
     computed exactly the same way as the one in their detail view.
     """
+    # The times tracking came back, taken from ALL the fixes rather than from
+    # the ones that survive filtering. The first fix after the GPS wakes up is
+    # routinely the noisiest of the day, so it is exactly the one the accuracy
+    # filter drops -- and reading the flag only off the kept points would lose
+    # it there and quietly count the straight line anyway.
+    resumed_at = [
+        ping.timestamp for ping in pings if getattr(ping, "after_gap", False)
+    ]
+
     moving = _moving_trail(pings)
     total = 0.0
     for prev, cur in zip(moving, moving[1:]):
+        if any(prev.timestamp < when <= cur.timestamp for when in resumed_at):
+            continue
         total += haversine_km(prev.latitude, prev.longitude, cur.latitude, cur.longitude)
     return round(total, 2)
 

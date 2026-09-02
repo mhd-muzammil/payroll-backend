@@ -275,6 +275,19 @@ class LocationPing(models.Model):
     # retry after a timeout it never saw the answer to) does not double the
     # trail. Null from an app that does not send one.
     client_key = models.CharField(max_length=64, null=True, blank=True)
+    # True when the phone had STOPPED tracking before this fix -- its location
+    # was switched off, or the permission was withdrawn -- and this is the first
+    # fix after it came back.
+    #
+    # Why a flag and not a time gap. A hole in the trail has two completely
+    # different meanings and they must be treated oppositely: an engineer
+    # standing still produces no new rows either (the native watcher only fires
+    # after 10m of movement, and the 30s re-send of an unchanged fix is deduped
+    # on client_key), so a 40-minute hole is either 40 minutes of untracked
+    # driving or 40 minutes of work at one customer. Guessing from the gap alone
+    # threw away the journey after every long stop. Only the phone knows which
+    # it was, so the phone says.
+    after_gap = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["-timestamp"]
