@@ -1,6 +1,8 @@
 from django.db.models import Q
 from rest_framework import viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
 from .models import Employee, Task, Performance, Asset
 from .serializer import EmployeeSerializer, SimpleEmployeeSerializer
@@ -20,6 +22,75 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         if role == "employee" and self.action == 'list':
             return SimpleEmployeeSerializer
         return EmployeeSerializer
+
+    @action(detail=False, methods=["get"], url_path="app_usage")
+    def app_usage(self, request):
+        """Who has started using the phone app, and who has not.
+
+        There is no way to know who DOWNLOADED the APK -- it is passed around
+        as a file and never touches this server. What is knowable is who has
+        signed in from it, which is the question worth answering anyway: the
+        list HR needs is the people to chase, and somebody who installed it and
+        never opened it needs chasing just the same.
+
+        Employee-centric, not user-centric, on purpose. The Users table only
+        holds login accounts, and an employee with no account is precisely
+        somebody who CANNOT use the app -- the most important row on the page,
+        and the one a list of users would leave out entirely.
+
+        Read-only, and staff-only: this says when each person last used their
+        phone, which is not something one engineer should see about another.
+        """
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, "role", "employee")
+        if role not in ("superadmin", "admin", "hr"):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        employees = (
+            Employee.objects.select_related("user")
+            .exclude(status="relieved")
+            .order_by("employee_name")
+        )
+
+        branches = get_allowed_branches(user, "employees")
+        if "All" not in branches:
+            employees = employees.filter(branch__in=branches)
+
+        rows = []
+        for employee in employees:
+            account = employee.user
+            rows.append({
+                "employee_id": employee.id,
+                "employee_name": employee.employee_name,
+                "branch": employee.branch,
+                "role": employee.role,
+                "username": account.username if account else None,
+                # Three states, not two. "No account" is a different problem
+                # from "has an account and has not opened the app", and they
+                # need different actions from HR.
+                "has_login": account is not None,
+                "last_login": account.last_login if account else None,
+                "first_app_login_at": account.first_app_login_at if account else None,
+                "last_app_login_at": account.last_app_login_at if account else None,
+                "uses_app": bool(account and account.last_app_login_at),
+            })
+
+        using = [r for r in rows if r["uses_app"]]
+        no_account = [r for r in rows if not r["has_login"]]
+        # Signed in from a browser but never from the app -- they have the
+        # credentials and have not installed it, which is a nudge, not a setup job.
+        browser_only = [
+            r for r in rows if r["has_login"] and not r["uses_app"] and r["last_login"]
+        ]
+
+        return Response({
+            "total": len(rows),
+            "using_app": len(using),
+            "not_using_app": len(rows) - len(using),
+            "no_login_account": len(no_account),
+            "browser_only": len(browser_only),
+            "rows": rows,
+        })
 
     def get_queryset(self):
         user = self.request.user

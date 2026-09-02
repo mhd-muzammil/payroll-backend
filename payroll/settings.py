@@ -213,6 +213,10 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
+    # Django only stamps last_login on its own session login, which this API
+    # never uses -- so before this, not one of 77 accounts had ever recorded a
+    # login and nobody could tell who had started using the app at all.
+    "UPDATE_LAST_LOGIN": True,
     "ACCESS_TOKEN_LIFETIME": timedelta(hours=8),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
     "ROTATE_REFRESH_TOKENS": True,
