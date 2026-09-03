@@ -1068,9 +1068,35 @@ class TrackingViewSet(viewsets.ViewSet):
         employee = _get_employee(request.user)
         if not employee:
             raise NoEmployeeProfile()
-        # Idempotent: tapping Start twice (or a reconnect) must not open a second
-        # overlapping session and double-count the day.
-        if not self._open_session(employee):
+        session = self._open_session(employee)
+        # A session that began on an earlier day was never stopped -- the app was
+        # closed, or the phone closed it for them. Today's Login is the signal
+        # that yesterday is over.
+        #
+        # It has to be said here because the two halves disagreed about dates:
+        # this lookup is date-blind, while the office's board asks for sessions
+        # STARTED on the day it is showing. An engineer who forgot to Logout last
+        # night logged in this morning, was quietly told "already on duty", no row
+        # was written for today, and the board read "Not on duty" all day beside
+        # his live position and a distance that kept climbing.
+        if session and timezone.localtime(session.started_at).date() < timezone.localdate():
+            # Closed at its own last fix rather than now: the engineer stopped
+            # reporting when the phone did, and stamping it with this morning's
+            # clock would invent a night's duty that nobody worked.
+            last = (
+                LocationPing.objects.filter(
+                    engineer=employee, timestamp__gte=session.started_at
+                )
+                .order_by("-timestamp")
+                .first()
+            )
+            session.ended_at = last.timestamp if last else session.started_at
+            session.auto_closed = True
+            session.save(update_fields=["ended_at", "auto_closed"])
+            session = None
+        # Idempotent within the day: tapping Login twice (or a reconnect) must not
+        # open a second overlapping session and double-count the day.
+        if not session:
             DutySession.objects.create(engineer=employee)
         return Response(self._duty_payload(employee), status=201)
 
