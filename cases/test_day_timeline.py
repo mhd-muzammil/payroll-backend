@@ -119,6 +119,23 @@ class DayTimelineTests(TestCase):
         self.assertEqual(len(entries), 1, entries)
         self.assertEqual(entries[0]["label"], "Case assigned")
 
+    def test_the_cases_real_status_rides_along(self):
+        """A call closed on an earlier day is still closed today.
+
+        Four of this engineer's five cases were completed before today, so this
+        day records no event for them at all. Reading their state from the day
+        alone would say "not started" beside an app that says DONE.
+        """
+        given = timezone.make_aware(
+            datetime.datetime.combine(self.yesterday, datetime.time(18, 10))
+        )
+        done = self._case("OC-000163", "WO-035168198", assigned_at=given, status="completed")
+        open_one = self._case("OC-003277", "WO-035694713", assigned_at=given, status="assigned")
+
+        by_case = {e["case_number"]: e for e in self._events() if e.get("case_number")}
+        self.assertEqual(by_case[done.case_number]["case_status"], "completed")
+        self.assertEqual(by_case[open_one.case_number]["case_status"], "assigned")
+
     def test_a_cancelled_case_stays_off_the_list(self):
         self._case(
             "OC-009999", "WO-099999999", status="cancelled",

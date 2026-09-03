@@ -1714,6 +1714,7 @@ class TrackingViewSet(viewsets.ViewSet):
             "case_number",
             "external_ref",
             "title",
+            "status",
             "assigned_at",
             "started_at",
             "reached_at",
@@ -1742,6 +1743,7 @@ class TrackingViewSet(viewsets.ViewSet):
                             "label": label,
                             "case_number": case.case_number,
                             "case_ref": case.external_ref or None,
+                            "case_status": case.status,
                         }
                     )
             if stamped_today:
@@ -1765,6 +1767,12 @@ class TrackingViewSet(viewsets.ViewSet):
                     "label": f"On the list from{since}" if since else "On the list",
                     "case_number": case.case_number,
                     "case_ref": case.external_ref or None,
+                    # Where the case actually stands, which is NOT what this day
+                    # shows: four of an engineer's five calls can be completed
+                    # and still carry no event today, because they were closed
+                    # on an earlier one. Without this the board would read
+                    # "not started" beside an app that says DONE.
+                    "case_status": case.status,
                 }
             )
         events.sort(key=lambda e: e["at"])
