@@ -1,7 +1,7 @@
 import logging
 import math
 import re
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -210,6 +210,12 @@ def _detect_stops(pings):
                 "case_id": next((p.case_id for p in reversed(cluster) if p.case_id), None),
                 "case_number": next(
                     (p.case.case_number for p in reversed(cluster) if p.case_id and p.case), None
+                ),
+                # The WO number beside it, because that is what everyone outside
+                # Payroll calls this job.
+                "case_ref": next(
+                    (p.case.external_ref or None for p in reversed(cluster) if p.case_id and p.case),
+                    None,
                 ),
             }
         )
@@ -1023,11 +1029,40 @@ class TrackingViewSet(viewsets.ViewSet):
     def _close_forgotten_sessions():
         """Auto-close sessions nobody ever stopped, so a missed Stop Duty does
         not leave someone 'on duty' for days. Cheap and idempotent; run before
-        any read or write of duty state."""
+        any read or write of duty state.
+
+        Closed at the session's own last fix, not at the clock time the sweep
+        happens to run. Stamping it now() recorded every hour between the
+        engineer's last position and whenever somebody next opened the board as
+        duty they had worked -- a night of it, most mornings. Capped at the
+        maximum duration, because a session cannot honestly be longer than the
+        rule that closed it.
+
+        The per-session query costs nothing in the ordinary case: this filter
+        matches no rows at all unless somebody actually forgot.
+        """
         cutoff = timezone.now() - timedelta(hours=DutySession.MAX_DURATION_HOURS)
-        DutySession.objects.filter(ended_at__isnull=True, started_at__lt=cutoff).update(
-            ended_at=timezone.now(), auto_closed=True
+        forgotten = list(
+            DutySession.objects.filter(ended_at__isnull=True, started_at__lt=cutoff)
         )
+        if not forgotten:
+            return
+        for session in forgotten:
+            window_end = session.started_at + timedelta(hours=DutySession.MAX_DURATION_HOURS)
+            last = (
+                LocationPing.objects.filter(
+                    engineer_id=session.engineer_id,
+                    timestamp__gte=session.started_at,
+                    timestamp__lte=window_end,
+                )
+                .order_by("-timestamp")
+                .first()
+            )
+            # No fix at all means the duty never reported anything, so it has no
+            # honest length: it starts and ends where it started.
+            session.ended_at = last.timestamp if last else session.started_at
+            session.auto_closed = True
+        DutySession.objects.bulk_update(forgotten, ["ended_at", "auto_closed"])
 
     @classmethod
     def _open_session(cls, employee):
@@ -1631,6 +1666,7 @@ class TrackingViewSet(viewsets.ViewSet):
                     "latitude": stop["latitude"],
                     "longitude": stop["longitude"],
                     "case_number": stop["case_number"],
+                    "case_ref": stop.get("case_ref"),
                 }
             )
         # What the engineer did to their cases that day, so a stop can be read
@@ -1641,20 +1677,96 @@ class TrackingViewSet(viewsets.ViewSet):
             ("reached_at", "Reached the site"),
             ("completed_at", "Completed the call"),
         )
-        for case in Case.objects.filter(assigned_to=engineer).only(
-            "case_number", "title", "assigned_at", "started_at", "reached_at", "completed_at"
+
+        # THE DAY'S WORKLOAD, not just what was stamped on the day.
+        #
+        # This used to be every case the engineer has ever had, kept only where
+        # one of the four moments landed on the date. That answers "what did they
+        # touch today" but not "what were they given today", and the office reads
+        # this screen for the second one. assigned_at is stamped ONCE, on first
+        # dispatch, so a call pushed yesterday evening and worked this morning
+        # produced no assignment entry at all -- five cases on the engineer's own
+        # list showed up here as one.
+        #
+        # The plan is the same source the engineer's list and OpenCall's Assigned
+        # column use, so the three cannot disagree. `plan_date` makes it work for
+        # a past day too; a case created by hand in Payroll has no plan date and
+        # counts as today's, exactly as the engineer's list treats it.
+        planned = Case.objects.filter(assigned_to=engineer, in_current_plan=True).exclude(
+            status="cancelled"
+        )
+        if target_date == timezone.localdate():
+            planned = planned.filter(Q(plan_date=target_date) | Q(plan_date__isnull=True))
+        else:
+            planned = planned.filter(plan_date=target_date)
+
+        touched = Case.objects.filter(assigned_to=engineer).filter(
+            Q(assigned_at__date=target_date)
+            | Q(started_at__date=target_date)
+            | Q(reached_at__date=target_date)
+            | Q(completed_at__date=target_date)
+        )
+
+        # Merged in Python rather than with union(): a combined queryset cannot
+        # then be narrowed with only(), and a case can legitimately be in both
+        # halves -- given today and worked today is the ordinary case.
+        fields = (
+            "case_number",
+            "external_ref",
+            "title",
+            "assigned_at",
+            "started_at",
+            "reached_at",
+            "completed_at",
+        )
+        day_cases = {}
+        for queryset in (planned, touched):
+            for case in queryset.only(*fields):
+                day_cases[case.pk] = case
+
+        # Sorted so several carried-over calls land in the order they were given
+        # rather than in whatever order the database returned them.
+        for case in sorted(
+            day_cases.values(), key=lambda c: c.assigned_at or timezone.now()
         ):
+            stamped_today = False
             for field, label in case_moments:
                 moment = getattr(case, field)
                 if moment and timezone.localtime(moment).date() == target_date:
+                    if field == "assigned_at":
+                        stamped_today = True
                     events.append(
                         {
                             "at": moment,
                             "type": field.replace("_at", ""),
                             "label": label,
                             "case_number": case.case_number,
+                            "case_ref": case.external_ref or None,
                         }
                     )
+            if stamped_today:
+                continue
+            # Given to them before today and still on the list: it opens the day
+            # rather than appearing at a clock time that belongs to another one.
+            # The date it was actually given is in the label, because "assigned"
+            # with no date next to it reads as "assigned this morning".
+            since = (
+                f" {timezone.localtime(case.assigned_at):%d %b}" if case.assigned_at else ""
+            )
+            events.append(
+                {
+                    "at": timezone.make_aware(
+                        datetime.combine(target_date, time.min), timezone.get_current_timezone()
+                    ),
+                    # Its own type, not "assigned": this is not a moment in the
+                    # day, it is what the day started with, and the screen shows
+                    # no clock time against it for exactly that reason.
+                    "type": "carried",
+                    "label": f"On the list from{since}" if since else "On the list",
+                    "case_number": case.case_number,
+                    "case_ref": case.external_ref or None,
+                }
+            )
         events.sort(key=lambda e: e["at"])
 
         clean = _usable_pings(pings)

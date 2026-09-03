@@ -33,10 +33,18 @@ class ForgottenDutySessionTests(TestCase):
     def _start(self):
         return self.client.post("/api/tracking/start_duty/")
 
+    @staticmethod
+    def _yesterday_at(hour, minute=0):
+        """A real time on yesterday's local calendar day."""
+        day = timezone.localdate() - datetime.timedelta(days=1)
+        return timezone.make_aware(
+            datetime.datetime.combine(day, datetime.time(hour, minute)),
+            timezone.get_current_timezone(),
+        )
+
     def test_login_after_a_forgotten_session_opens_one_dated_today(self):
-        yesterday = timezone.now() - datetime.timedelta(hours=14)
         stale = DutySession.objects.create(engineer=self.employee)
-        DutySession.objects.filter(pk=stale.pk).update(started_at=yesterday)
+        DutySession.objects.filter(pk=stale.pk).update(started_at=self._yesterday_at(21, 55))
 
         response = self._start()
         self.assertEqual(response.status_code, 201)
@@ -55,8 +63,8 @@ class ForgottenDutySessionTests(TestCase):
         )
 
     def test_a_forgotten_session_is_closed_at_its_last_fix_not_this_morning(self):
-        started = timezone.now() - datetime.timedelta(hours=14)
-        last_fix = timezone.now() - datetime.timedelta(hours=12)
+        started = self._yesterday_at(19, 10)
+        last_fix = self._yesterday_at(21, 40)
         stale = DutySession.objects.create(engineer=self.employee)
         DutySession.objects.filter(pk=stale.pk).update(started_at=started)
         ping = LocationPing.objects.create(
@@ -92,9 +100,8 @@ class ForgottenDutySessionTests(TestCase):
         self.assertEqual(session.started_at, opened_at, "today's session must not be restarted")
 
     def test_the_state_it_reports_is_on_duty(self):
-        yesterday = timezone.now() - datetime.timedelta(hours=14)
         stale = DutySession.objects.create(engineer=self.employee)
-        DutySession.objects.filter(pk=stale.pk).update(started_at=yesterday)
+        DutySession.objects.filter(pk=stale.pk).update(started_at=self._yesterday_at(21, 55))
 
         body = self._start().json()
         self.assertTrue(body["on_duty"])
