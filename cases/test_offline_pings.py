@@ -146,6 +146,23 @@ class PingEndpointTests(APITestCase):
         response = self.client.post("/api/tracking/ping/", {"latitude": 13.0}, format="json")
         self.assertEqual(response.status_code, 400)
 
+    def test_a_browser_may_not_report_a_position(self):
+        """The office opened an engineer's account in a desktop browser 250 km
+        away to see what he sees; the page posted the OFFICE LAPTOP'S position
+        as his, drew a line from Hosur to the coast and read 519 km for a man
+        who never left Hosur. Kilometres feed allowances, so this is money.
+
+        Without the header there is no phone, so there is no position. If this
+        test ever goes green after the guard is deleted, payroll is wrong and
+        silent -- which is why the negative case is asserted, not just the
+        positive one every other test here covers.
+        """
+        self.client.credentials()  # a browser sends no X-Payroll-Client
+        response = self._post()
+        self.assertEqual(response.status_code, 403, response.data)
+        self.assertTrue(response.data.get("app_only"))
+        self.assertFalse(LocationPing.objects.exists(), "a browser's fix was stored")
+
 
 class BatchEndpointTests(APITestCase):
     def setUp(self):
@@ -174,6 +191,17 @@ class BatchEndpointTests(APITestCase):
         return self.client.post(
             "/api/tracking/ping/batch/", {"pings": fixes}, format="json"
         )
+
+    def test_a_browser_may_not_deliver_a_backlog(self):
+        """The batch is the same money by another door. A browser with a page
+        full of queued fixes must be refused exactly as a single fix is --
+        guarding only /ping/ would leave the whole outage path open.
+        """
+        self.client.credentials()  # a browser sends no X-Payroll-Client
+        response = self._post(self._fixes(3))
+        self.assertEqual(response.status_code, 403, response.data)
+        self.assertTrue(response.data.get("app_only"))
+        self.assertFalse(LocationPing.objects.exists(), "a browser's backlog was stored")
 
     def test_an_outage_is_delivered_whole(self):
         """25 minutes dark is 50 fixes at the 30-second cadence."""
