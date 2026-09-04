@@ -50,6 +50,20 @@ class AttendanceSerializer(serializers.ModelSerializer):
         return attrs
 
     def validate(self, attrs):
+        # A record has to say WHICH DAY it is about.
+        #
+        # The office marked somebody absent, left both times empty -- there is
+        # no punch on a day nobody came in -- and the row was created with no
+        # date at all. Every list on the page is grouped and filtered by the
+        # date, which is read off intime, so the record existed and could not
+        # be seen or corrected by anyone. Refusing it says so at the moment it
+        # happens. A day with no punch is stored as midnight on that date, the
+        # same as the Excel import writes one.
+        if self.instance is None and not attrs.get("intime") and not attrs.get("outtime"):
+            raise serializers.ValidationError(
+                {"intime": "Please give the date this record is for."}
+            )
+
         request = self.context.get("request")
         if not request or not request.user.is_authenticated:
             return attrs
