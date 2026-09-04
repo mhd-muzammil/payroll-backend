@@ -99,6 +99,7 @@ class PingEndpointTests(APITestCase):
         self.user = User.objects.create_user(username="eng-off", password="x", role="employee")
         self.engineer = make_engineer(user=self.user)
         self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_X_PAYROLL_CLIENT="app")
 
     def _post(self, **body):
         payload = {"latitude": 13.08, "longitude": 80.27}
@@ -151,6 +152,7 @@ class BatchEndpointTests(APITestCase):
         self.user = User.objects.create_user(username="eng-batch", password="x", role="employee")
         self.engineer = make_engineer("Batch Tester", user=self.user)
         self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_X_PAYROLL_CLIENT="app")
         self.now = timezone.now()
 
     def _fixes(self, count, start_minutes_ago=60, key_prefix="k"):

@@ -705,6 +705,10 @@ class DutyAndLiveTrackingTests(TestCase):
         self.admin_client.force_authenticate(self.admin)
         self.eng = APIClient()
         self.eng.force_authenticate(self.engineer_user)
+        # The engineer's client stands in for the phone app. The admin's stays a
+        # browser: reading the board from one is right, reporting a position
+        # from one is the bug this header exists to stop.
+        self.eng.credentials(HTTP_X_PAYROLL_CLIENT="app")
 
     def _live(self):
         res = self.admin_client.get("/api/tracking/live/")

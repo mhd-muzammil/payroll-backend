@@ -196,6 +196,7 @@ class UntrackedGapTests(APITestCase):
     def test_the_phone_can_set_it_through_the_ping_endpoint(self):
         """The flag is no use unless it survives the wire."""
         self.client.force_authenticate(self.user)
+        self.client.credentials(HTTP_X_PAYROLL_CLIENT="app")
 
         plain = self.client.post(
             "/api/tracking/ping/",

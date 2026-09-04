@@ -332,6 +332,26 @@ def _get_employee(user):
     return getattr(user, "employee_profile", None)
 
 
+# The header the phone app puts on every request. A browser sends nothing.
+APP_CLIENT_HEADER = "HTTP_X_PAYROLL_CLIENT"
+
+
+def _from_the_app(request):
+    """Whether this request came from an engineer's own phone app.
+
+    Only the app may report an engineer's position. Anyone signed in as an
+    engineer used to be tracked as that engineer: the office opened one
+    engineer's account in a desktop browser two hundred and fifty kilometres
+    away, to see what he sees, and the page posted the OFFICE LAPTOP'S position
+    as his. His day drew a straight line to the coast and read 519 km for a man
+    who never left Hosur -- and kilometres feed allowances.
+
+    The app is blocked from tracking outside itself as well, in
+    useLiveTracking; this is the half that cannot be bypassed by a page.
+    """
+    return (request.META.get(APP_CLIENT_HEADER) or "").strip().lower() == "app"
+
+
 # Shared by case dispatch AND the tracking roster, so an engineer who can be
 # sent a case can always be tracked, and vice versa. When the two had separate
 # matching, a name only the alias table could resolve came back unmatched on the
@@ -1153,6 +1173,14 @@ class TrackingViewSet(viewsets.ViewSet):
         employee = _get_employee(request.user)
         if not employee:
             return Response({"detail": "No employee profile linked to this user."}, status=400)
+        if not _from_the_app(request):
+            return Response(
+                {
+                    "detail": "Only the RTPL app can record a position.",
+                    "app_only": True,
+                },
+                status=403,
+            )
 
         try:
             ping = build_ping(employee, request.data, _case_for)
@@ -1184,6 +1212,14 @@ class TrackingViewSet(viewsets.ViewSet):
         employee = _get_employee(request.user)
         if not employee:
             return Response({"detail": "No employee profile linked to this user."}, status=400)
+        if not _from_the_app(request):
+            return Response(
+                {
+                    "detail": "Only the RTPL app can record a position.",
+                    "app_only": True,
+                },
+                status=403,
+            )
 
         try:
             result = ingest_batch(employee, request.data.get("pings"), _case_for)
