@@ -157,3 +157,117 @@ class DayTimelineTests(TestCase):
 
         listed = {e["case_number"] for e in self._events(self.yesterday) if e.get("case_number")}
         self.assertEqual(listed, {"OC-001111"})
+
+
+class PastDayWorkloadTests(TestCase):
+    """A finished day cannot be asked about the CURRENT plan.
+
+    Productivity said Lingeshwaran M had five cases yesterday and the tracking
+    panel listed three; Vijayakumar R, five and one; Praveen, four and two.
+    Everybody else matched -- and the three who did not were exactly the three
+    who worked nothing that day. plan_date marks the plan the sync LAST pushed
+    and the sync renews it, so yesterday lost every call still open today and
+    kept only what the four timestamps caught.
+    """
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username="office-past", password="x", role="superadmin", is_superuser=True
+        )
+        self.engineer = Employee.objects.create(
+            employee_name="Lingeshwaran M", role="Service engineer", department="Service",
+            branch="Kanchipuram", salary=30000, email="lingesh@test.local",
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.staff)
+        self.today = timezone.localdate()
+        self.yesterday = self.today - datetime.timedelta(days=1)
+        self.tz = timezone.get_current_timezone()
+
+    def _at(self, day, hour=10, minute=0):
+        return timezone.make_aware(datetime.datetime.combine(day, datetime.time(hour, minute)), self.tz)
+
+    def _case(self, number, **kwargs):
+        fields = {
+            "case_number": number,
+            "external_ref": f"WO-{number[-6:]}",
+            "customer_name": "Customer",
+            "title": f"Service call ({number})",
+            "assigned_to": self.engineer,
+            "in_current_plan": True,
+            # What the sync leaves behind: the plan renewed to TODAY.
+            "plan_date": self.today,
+            "status": "assigned",
+        }
+        fields.update(kwargs)
+        return Case.objects.create(**fields)
+
+    def _cases_on(self, day):
+        response = self.client.get(f"/api/tracking/day/?engineer={self.engineer.id}&date={day}")
+        self.assertEqual(response.status_code, 200, response.content)
+        return {e["case_number"] for e in response.json()["events"] if e.get("case_number")}
+
+    def test_a_call_still_open_today_is_on_yesterdays_list(self):
+        """The whole bug, in one case.
+
+        Given three days ago, untouched since, and still open: the sync has
+        renewed plan_date to today, so the plan says nothing about yesterday --
+        but he had it yesterday.
+        """
+        self._case("OC-003381", assigned_at=self._at(self.today - datetime.timedelta(days=3)))
+        self.assertIn("OC-003381", self._cases_on(self.yesterday))
+
+    def test_five_given_and_none_worked_still_reads_five(self):
+        for i in range(5):
+            self._case(
+                f"OC-00338{i}",
+                assigned_at=self._at(self.today - datetime.timedelta(days=2 + i)),
+            )
+        self.assertEqual(len(self._cases_on(self.yesterday)), 5)
+
+    def test_a_call_closed_before_the_day_is_not_on_it(self):
+        self._case(
+            "OC-003300",
+            status="completed",
+            assigned_at=self._at(self.today - datetime.timedelta(days=5)),
+            completed_at=self._at(self.today - datetime.timedelta(days=4)),
+        )
+        self.assertNotIn("OC-003300", self._cases_on(self.yesterday))
+
+    def test_a_call_closed_on_the_day_is_on_it(self):
+        self._case(
+            "OC-003254",
+            status="completed",
+            assigned_at=self._at(self.today - datetime.timedelta(days=2)),
+            completed_at=self._at(self.yesterday, 15),
+        )
+        self.assertIn("OC-003254", self._cases_on(self.yesterday))
+
+    def test_a_call_given_after_the_day_is_not_on_it(self):
+        self._case("OC-003400", assigned_at=self._at(self.today, 9))
+        self.assertNotIn("OC-003400", self._cases_on(self.yesterday))
+
+    def test_a_cancelled_call_stays_off_a_past_day(self):
+        self._case(
+            "OC-003401",
+            status="cancelled",
+            assigned_at=self._at(self.today - datetime.timedelta(days=3)),
+        )
+        self.assertNotIn("OC-003401", self._cases_on(self.yesterday))
+
+    def test_today_still_reads_the_plan(self):
+        """Today is unchanged: the plan is the truth and the engineer's own list.
+
+        A call whose plan_date is yesterday's has left today's plan and must not
+        appear on today, however open it is.
+        """
+        self._case("OC-003500", assigned_at=self._at(self.today, 8))
+        self._case(
+            "OC-003501",
+            assigned_at=self._at(self.today - datetime.timedelta(days=4)),
+            plan_date=self.yesterday,
+            in_current_plan=False,
+        )
+        on_today = self._cases_on(self.today)
+        self.assertIn("OC-003500", on_today)
+        self.assertNotIn("OC-003501", on_today)

@@ -1724,17 +1724,48 @@ class TrackingViewSet(viewsets.ViewSet):
         # produced no assignment entry at all -- five cases on the engineer's own
         # list showed up here as one.
         #
-        # The plan is the same source the engineer's list and OpenCall's Assigned
-        # column use, so the three cannot disagree. `plan_date` makes it work for
-        # a past day too; a case created by hand in Payroll has no plan date and
-        # counts as today's, exactly as the engineer's list treats it.
-        planned = Case.objects.filter(assigned_to=engineer, in_current_plan=True).exclude(
-            status="cancelled"
-        )
+        # TODAY and a FINISHED DAY are two different questions, and only one of
+        # them can be answered by the plan.
+        #
+        # For today the plan IS the truth: it is the same source the engineer's
+        # own list and OpenCall's Assigned column use, so the three cannot
+        # disagree. A case created by hand in Payroll has no plan date and counts
+        # as today's, exactly as the engineer's list treats it.
+        #
+        # For a past day the plan cannot be asked at all. `plan_date` marks the
+        # plan the sync LAST pushed and the sync renews it -- "a call still open
+        # today is pushed again today and keeps this current" -- and
+        # in_current_plan is likewise about today. Read through them, yesterday
+        # lost every call that is still open now, and kept only what the four
+        # timestamps happened to catch. Productivity said Lingeshwaran M had five
+        # cases yesterday and this listed three; Vijayakumar R, five and one. The
+        # three engineers who disagreed were precisely the three who worked
+        # nothing that day, so nothing stamped their calls with it.
+        #
+        # So a finished day is reconstructed from what cannot move: the call was
+        # already his, and it was not finished before the day began. Cancelled
+        # calls stay out either way -- a cancelled call is not work. A case
+        # reassigned since will have moved with its new engineer, which no column
+        # here records; that is the one thing this cannot reconstruct.
         if target_date == timezone.localdate():
-            planned = planned.filter(Q(plan_date=target_date) | Q(plan_date__isnull=True))
+            planned = (
+                Case.objects.filter(assigned_to=engineer, in_current_plan=True)
+                .exclude(status="cancelled")
+                .filter(Q(plan_date=target_date) | Q(plan_date__isnull=True))
+            )
         else:
-            planned = planned.filter(plan_date=target_date)
+            planned = (
+                Case.objects.filter(assigned_to=engineer)
+                .exclude(status="cancelled")
+                # His by then. created_at stands in where a case was never
+                # dispatched and so has no assigned_at.
+                .filter(
+                    Q(assigned_at__date__lte=target_date)
+                    | Q(assigned_at__isnull=True, created_at__date__lte=target_date)
+                )
+                # And not already finished when the day started.
+                .filter(Q(completed_at__isnull=True) | Q(completed_at__date__gte=target_date))
+            )
 
         touched = Case.objects.filter(assigned_to=engineer).filter(
             Q(assigned_at__date=target_date)
