@@ -1724,48 +1724,34 @@ class TrackingViewSet(viewsets.ViewSet):
         # produced no assignment entry at all -- five cases on the engineer's own
         # list showed up here as one.
         #
-        # TODAY and a FINISHED DAY are two different questions, and only one of
-        # them can be answered by the plan.
+        # WITHDRAWN, and why it is worth writing down.
         #
-        # For today the plan IS the truth: it is the same source the engineer's
-        # own list and OpenCall's Assigned column use, so the three cannot
-        # disagree. A case created by hand in Payroll has no plan date and counts
-        # as today's, exactly as the engineer's list treats it.
+        # The plan cannot answer for a finished day: plan_date marks the plan the
+        # sync LAST pushed and the sync renews it every two minutes for every
+        # still-open call, so yesterday loses every call that is still open now.
+        # Productivity said five cases and this listed three.
         #
-        # For a past day the plan cannot be asked at all. `plan_date` marks the
-        # plan the sync LAST pushed and the sync renews it -- "a call still open
-        # today is pushed again today and keeps this current" -- and
-        # in_current_plan is likewise about today. Read through them, yesterday
-        # lost every call that is still open now, and kept only what the four
-        # timestamps happened to catch. Productivity said Lingeshwaran M had five
-        # cases yesterday and this listed three; Vijayakumar R, five and one. The
-        # three engineers who disagreed were precisely the three who worked
-        # nothing that day, so nothing stamped their calls with it.
+        # Reconstructing from "assigned by then and not finished before the day"
+        # replaced that with something worse: every call an engineer has ever had
+        # open appeared on EVERY past day. One engineer read 20 against
+        # Productivity's 5. Undercounting looks like loss; overcounting looks
+        # like the truth, so it is the more expensive mistake and it is out.
         #
-        # So a finished day is reconstructed from what cannot move: the call was
-        # already his, and it was not finished before the day began. Cancelled
-        # calls stay out either way -- a cancelled call is not work. A case
-        # reassigned since will have moved with its new engineer, which no column
-        # here records; that is the one thing this cannot reconstruct.
+        # This is back to the plan, which is honest about what it knows: a past
+        # day shows the calls whose LAST plan day was that day, plus anything
+        # actually worked on it. Calls carried forward are missing, and they
+        # cannot be recovered -- the renewal overwrote the only record that they
+        # were ever on that day. The fix for that is to stop overwriting it:
+        # record (case, plan_date) append-only as the sync pushes, and read a
+        # past day from those rows. Until that ships, this under-reports rather
+        # than inventing.
+        planned = Case.objects.filter(assigned_to=engineer, in_current_plan=True).exclude(
+            status="cancelled"
+        )
         if target_date == timezone.localdate():
-            planned = (
-                Case.objects.filter(assigned_to=engineer, in_current_plan=True)
-                .exclude(status="cancelled")
-                .filter(Q(plan_date=target_date) | Q(plan_date__isnull=True))
-            )
+            planned = planned.filter(Q(plan_date=target_date) | Q(plan_date__isnull=True))
         else:
-            planned = (
-                Case.objects.filter(assigned_to=engineer)
-                .exclude(status="cancelled")
-                # His by then. created_at stands in where a case was never
-                # dispatched and so has no assigned_at.
-                .filter(
-                    Q(assigned_at__date__lte=target_date)
-                    | Q(assigned_at__isnull=True, created_at__date__lte=target_date)
-                )
-                # And not already finished when the day started.
-                .filter(Q(completed_at__isnull=True) | Q(completed_at__date__gte=target_date))
-            )
+            planned = planned.filter(plan_date=target_date)
 
         touched = Case.objects.filter(assigned_to=engineer).filter(
             Q(assigned_at__date=target_date)
