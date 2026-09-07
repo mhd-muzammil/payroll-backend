@@ -16,7 +16,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from authentication.models import User
-from cases.models import Case, DutySession
+from cases.models import Case, DutySession, LocationPing
 from employees.models import Employee
 
 
@@ -266,3 +266,99 @@ class PastDayWorkloadTests(TestCase):
         """
         self._case("OC-003381", assigned_at=self._at(self.today - datetime.timedelta(days=3)))
         self.assertNotIn("OC-003381", self._cases_on(self.yesterday))
+
+
+class DarkStretchTests(TestCase):
+    """Where the day went dark, and which kind of dark it was.
+
+    The office could see short kilometres and not why. Two different facts:
+    location switched off (the stretch is genuinely unmeasured, and counts as
+    zero km) versus no network (the kilometres are honest, only the live board
+    was empty). Both were in the database and shown nowhere.
+    """
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username="office-dark", password="x", role="superadmin", is_superuser=True
+        )
+        self.engineer = Employee.objects.create(
+            employee_name="Dark Day", role="Service engineer", department="Service",
+            branch="Salem", salary=30000, email="dark@test.local",
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.staff)
+        self.tz = timezone.get_current_timezone()
+        self.today = timezone.localdate()
+
+    def _at(self, hour, minute=0):
+        return timezone.make_aware(
+            datetime.datetime.combine(self.today, datetime.time(hour, minute)), self.tz
+        )
+
+    def _ping(self, hour, minute, *, lat=11.0, after_gap=False, received=None):
+        ping = LocationPing.objects.create(
+            engineer=self.engineer, latitude=lat, longitude=78.0, accuracy=8,
+            after_gap=after_gap,
+        )
+        LocationPing.objects.filter(pk=ping.pk).update(
+            timestamp=self._at(hour, minute),
+            received_at=received if received is not None else self._at(hour, minute),
+        )
+        return ping
+
+    def _events(self, kind=None):
+        response = self.client.get(
+            f"/api/tracking/day/?engineer={self.engineer.id}&date={self.today}"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        events = response.json()["events"]
+        return [e for e in events if kind is None or e["type"] == kind]
+
+    def test_location_switched_off_is_named_with_how_long(self):
+        self._ping(9, 0, lat=11.00)
+        self._ping(9, 30, lat=11.05)
+        # Off at 09:30, back at 14:00 somewhere else entirely.
+        self._ping(14, 0, lat=11.60, after_gap=True)
+
+        dark = self._events("location_off")
+        self.assertEqual(len(dark), 1, dark)
+        self.assertEqual(dark[0]["label"], "Location off · 4h 30m")
+        self.assertEqual(dark[0]["minutes"], 270)
+
+    def test_a_moment_of_jitter_is_not_an_entry(self):
+        """A phone handing the GPS back in two minutes is not a lost stretch."""
+        self._ping(9, 0)
+        self._ping(9, 2, after_gap=True)
+        self.assertEqual(self._events("location_off"), [])
+
+    def test_the_first_fix_of_the_day_is_not_a_gap(self):
+        """Coming on duty flags the first fix, and there is nothing before it."""
+        self._ping(9, 0, after_gap=True)
+        self._ping(9, 30)
+        self.assertEqual(self._events("location_off"), [])
+
+    def test_an_outage_is_one_entry_however_many_fixes_it_held(self):
+        self._ping(9, 0)
+        # Twenty fixes taken through the outage, all delivered at 10:05.
+        for i in range(20):
+            self._ping(9, 20 + i, received=self._at(10, 5))
+        self._ping(10, 10)
+
+        offline = self._events("no_network")
+        self.assertEqual(len(offline), 1, offline)
+        self.assertEqual(offline[0]["label"], "No network · 45 min")
+
+    def test_a_late_fix_and_a_lost_stretch_are_different_entries(self):
+        self._ping(9, 0)
+        self._ping(9, 10, received=self._at(9, 55))
+        self._ping(13, 0, lat=11.4, after_gap=True)
+
+        kinds = {e["type"] for e in self._events()}
+        self.assertIn("no_network", kinds)
+        self.assertIn("location_off", kinds)
+
+    def test_an_ordinary_day_says_nothing_about_darkness(self):
+        for minute in (0, 30):
+            self._ping(9, minute)
+        self.assertEqual(self._events("location_off"), [])
+        self.assertEqual(self._events("no_network"), [])

@@ -161,6 +161,44 @@ def _trail_km(pings):
     return round(total, 2)
 
 
+# Below this a gap is the ordinary jitter of a phone handing the GPS back and
+# forth, not a stretch anybody lost.
+MIN_DARK_MINUTES = 5
+
+
+def duration_words(minutes):
+    """"4h 27m", "12 min" -- the way somebody would say it out loud."""
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours}h {rest}m" if rest else f"{hours}h"
+
+
+def _offline_event(first, last):
+    """One entry for a stretch the phone spent with no network.
+
+    Measured from when the first held fix was TAKEN to when the last one was
+    finally DELIVERED -- that is the window the office saw nothing in. Returns
+    a list so the caller can extend() and get nothing for a stretch too short
+    to be worth a line.
+    """
+    if last is None or last.received_at is None:
+        return []
+    minutes = int((last.received_at - first.timestamp).total_seconds() // 60)
+    if minutes < MIN_DARK_MINUTES:
+        return []
+    return [
+        {
+            "at": first.timestamp,
+            "type": "no_network",
+            "label": f"No network \u00b7 {duration_words(minutes)}",
+            "minutes": minutes,
+            "latitude": first.latitude,
+            "longitude": first.longitude,
+        }
+    ]
+
+
 def _usable_pings(pings):
     """Ordered pings with the low-accuracy noise dropped.
 
@@ -1707,6 +1745,63 @@ class TrackingViewSet(viewsets.ViewSet):
                     "case_ref": stop.get("case_ref"),
                 }
             )
+        # WHERE THE DAY WENT DARK, and which kind of dark it was.
+        #
+        # Two facts already in the database and shown nowhere, which is why the
+        # office could see short kilometres and not why:
+        #
+        #   Location off -- the phone flags the first fix after tracking stopped
+        #     and started again. Whatever happened in between was never measured
+        #     and _trail_km counts it as zero, deliberately. This is the entry
+        #     that explains a missing stretch.
+        #   No network -- a fix taken at two and delivered at four sat on the
+        #     phone. The kilometres are honest; only the board was empty at the
+        #     time. Nothing is missing and nobody needs chasing.
+        #
+        # Five minutes is the floor. Below it these are the ordinary jitter of a
+        # phone handing the GPS back and forth, and forty entries nobody reads
+        # is the same as none.
+        for previous, current in zip(pings, pings[1:]):
+            if not getattr(current, "after_gap", False):
+                continue
+            dark = int((current.timestamp - previous.timestamp).total_seconds() // 60)
+            if dark < MIN_DARK_MINUTES:
+                continue
+            events.append(
+                {
+                    # Stamped where the trail STOPS, not where it resumes: that
+                    # is the moment the office is looking for when they ask what
+                    # happened after four o'clock.
+                    "at": previous.timestamp,
+                    "type": "location_off",
+                    "label": f"Location off \u00b7 {duration_words(dark)}",
+                    "minutes": dark,
+                    "latitude": previous.latitude,
+                    "longitude": previous.longitude,
+                }
+            )
+
+        # One entry per OUTAGE, not per delayed fix: a phone offline for an hour
+        # delivers a hundred of them at once and each one is the same fact.
+        outage_start = None
+        outage_end = None
+        for ping in pings:
+            late = (
+                ping.received_at is not None
+                and (ping.received_at - ping.timestamp).total_seconds() / 60
+                >= QUEUED_THRESHOLD_MINUTES
+            )
+            if late:
+                if outage_start is None:
+                    outage_start = ping
+                outage_end = ping
+                continue
+            if outage_start is not None:
+                events.extend(_offline_event(outage_start, outage_end))
+                outage_start = outage_end = None
+        if outage_start is not None:
+            events.extend(_offline_event(outage_start, outage_end))
+
         # What the engineer did to their cases that day, so a stop can be read
         # against the job it belongs to.
         case_moments = (
