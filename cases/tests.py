@@ -1310,7 +1310,7 @@ class EngineerDayViewTests(TestCase):
         session.save(update_fields=["started_at", "ended_at", "auto_closed"])
 
         labels = [e["label"] for e in self._day()["events"]]
-        self.assertIn("Auto-closed (no Stop Duty)", labels)
+        self.assertIn("Auto-closed (no Logout)", labels)
 
     def test_an_earlier_day_can_be_read_back(self):
         yesterday = self.today - timedelta(days=1)

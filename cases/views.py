@@ -1679,16 +1679,18 @@ class TrackingViewSet(viewsets.ViewSet):
         events = []
         for session in sessions:
             events.append(
-                {"at": session.started_at, "type": "duty_start", "label": "Started duty"}
+                # The engineer's own word for this tap. There is no button
+                # called Start Duty any more; Login is what they press.
+                {"at": session.started_at, "type": "duty_start", "label": "Login"}
             )
             if session.ended_at:
                 events.append(
                     {
                         "at": session.ended_at,
                         "type": "duty_end",
-                        "label": "Auto-closed (no Stop Duty)"
+                        "label": "Auto-closed (no Logout)"
                         if session.auto_closed
-                        else "Stopped duty",
+                        else "Logout",
                         "minutes": session.duration_minutes(),
                     }
                 )
