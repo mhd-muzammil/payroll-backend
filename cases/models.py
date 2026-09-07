@@ -228,6 +228,34 @@ class DutySession(models.Model):
         return f"{self.engineer.employee_name} {state} since {self.started_at:%Y-%m-%d %H:%M}"
 
 
+class PlaceName(models.Model):
+    """One coordinate's street address, looked up once and kept.
+
+    The timeline shows where each entry happened, and most entries get that for
+    free -- a call the engineer reached carries the customer's address already.
+    This is for the rest: where they stood still away from a customer, and where
+    the trail went dark. Ola is metered and rate-limited per minute, so a place
+    is asked about once and then remembered.
+
+    Keyed on the coordinate rounded to four decimals, about eleven metres: fine
+    enough to tell two customers on a street apart, coarse enough that standing
+    in the same yard twice is one row.
+    """
+
+    lat_key = models.DecimalField(max_digits=9, decimal_places=4)
+    lon_key = models.DecimalField(max_digits=9, decimal_places=4)
+    address = models.CharField(max_length=300)
+    fetched_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["lat_key", "lon_key"], name="one_name_per_place"),
+        ]
+
+    def __str__(self):
+        return f"{self.lat_key},{self.lon_key} -> {self.address[:40]}"
+
+
 class LocationPing(models.Model):
     """One live GPS reading sent by an engineer's app while on duty. A trail of
     these draws the travel path; the latest per engineer is their live position.

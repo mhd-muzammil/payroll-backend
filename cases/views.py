@@ -16,6 +16,7 @@ from .models import Case, DutySession, EngineerAlias, EngineerScorecard, Locatio
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
 from .pings import MAX_BATCH, PingRejected, build_ping, coerce_number, ingest_batch
 from .tracks import snapped_trail
+from . import places
 from employees.models import Employee
 from authentication.models import get_allowed_branches
 
@@ -151,11 +152,21 @@ def _trail_km(pings):
     resumed_at = [
         ping.timestamp for ping in pings if getattr(ping, "after_gap", False)
     ]
+    # And by identity as well as by time. Two fixes can carry the SAME timestamp
+    # -- a phone's clock granularity is coarser than the gap between two quick
+    # sends -- and then "is a resumed fix strictly after prev" is false for the
+    # resumed fix itself, and the untracked stretch is charged to the engineer
+    # after all. The id says what the clock cannot.
+    resumed_ids = {
+        ping.id for ping in pings if getattr(ping, "after_gap", False) and ping.id
+    }
 
     moving = _moving_trail(pings)
     total = 0.0
     for prev, cur in zip(moving, moving[1:]):
-        if any(prev.timestamp < when <= cur.timestamp for when in resumed_at):
+        if cur.id in resumed_ids or any(
+            prev.timestamp < when <= cur.timestamp for when in resumed_at
+        ):
             continue
         total += haversine_km(prev.latitude, prev.longitude, cur.latitude, cur.longitude)
     return round(total, 2)
@@ -1865,6 +1876,9 @@ class TrackingViewSet(viewsets.ViewSet):
             "external_ref",
             "title",
             "status",
+            # Where the customer is. Loaded here so the timeline can say where
+            # each call happened without a query per entry.
+            "address",
             "assigned_at",
             "started_at",
             "reached_at",
@@ -1926,6 +1940,41 @@ class TrackingViewSet(viewsets.ViewSet):
                 }
             )
         events.sort(key=lambda e: e["at"])
+
+        # WHERE each entry happened, in words rather than coordinates.
+        #
+        # Free for anything tied to a call: the customer's address is already on
+        # the case. Only a stop away from any customer and the place the trail
+        # went dark need a coordinate resolved, and those come from the cache in
+        # cases/places.py -- looked up once per place, ever, and budgeted so a
+        # first look at a day costs about a second instead of five.
+        by_number = {
+            case.case_number: (case.address or "").strip()
+            for case in day_cases.values()
+            if case.case_number
+        }
+        for event in events:
+            address = by_number.get(event.get("case_number") or "")
+            if address:
+                event["address"] = address
+
+        unresolved = [
+            (event["latitude"], event["longitude"])
+            for event in events
+            if not event.get("address")
+            and event.get("latitude") is not None
+            and event.get("longitude") is not None
+        ]
+        if unresolved:
+            found = places.describe_many(unresolved)
+            for event in events:
+                if event.get("address"):
+                    continue
+                address = places.address_of(
+                    found, event.get("latitude"), event.get("longitude")
+                )
+                if address:
+                    event["address"] = address
 
         clean = _usable_pings(pings)
         return Response(

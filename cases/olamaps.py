@@ -73,6 +73,21 @@ def is_configured() -> bool:
     return bool(api_key())
 
 
+def fetch_json(url: str, params: dict) -> dict:
+    """A GET against Ola with the key attached, decoded.
+
+    Public because reverse geocoding needs exactly the same error handling as
+    snapping: a 429 is worth naming, the key must never reach a log, and a
+    non-JSON body is a failure rather than a surprise later. Adding the key
+    HERE is what keeps it out of every caller.
+    """
+    if not api_key():
+        raise SnapUnavailable("no Ola key configured")
+    query = dict(params)
+    query["api_key"] = api_key()
+    return _fetch(url + "?" + urllib.parse.urlencode(query))
+
+
 def _fetch(url: str) -> dict:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:

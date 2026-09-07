@@ -10,13 +10,15 @@ Run against the old view and test_every_case_on_the_days_list_appears fails
 with 1 entry instead of 4.
 """
 import datetime
+from decimal import Decimal
+from unittest import mock
 
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from authentication.models import User
-from cases.models import Case, DutySession, LocationPing
+from cases.models import Case, DutySession, LocationPing, PlaceName
 from employees.models import Employee
 
 
@@ -362,3 +364,104 @@ class DarkStretchTests(TestCase):
             self._ping(9, minute)
         self.assertEqual(self._events("location_off"), [])
         self.assertEqual(self._events("no_network"), [])
+
+
+class TimelineAddressTests(TestCase):
+    """Where each entry happened, in words.
+
+    Most are free: a call carries the customer's address already. Only a stop
+    away from any customer, and the place the trail went dark, need a
+    coordinate resolved -- and Ola is metered, so those are cached and budgeted.
+    """
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username="office-addr", password="x", role="superadmin", is_superuser=True
+        )
+        self.engineer = Employee.objects.create(
+            employee_name="Addressed", role="Service engineer", department="Service",
+            branch="Hosur", salary=30000, email="addr@test.local",
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.staff)
+        self.today = timezone.localdate()
+        self.tz = timezone.get_current_timezone()
+
+    def _at(self, hour, minute=0):
+        return timezone.make_aware(
+            datetime.datetime.combine(self.today, datetime.time(hour, minute)), self.tz
+        )
+
+    def _events(self):
+        response = self.client.get(
+            f"/api/tracking/day/?engineer={self.engineer.id}&date={self.today}"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()["events"]
+
+    def test_a_call_says_where_without_asking_anybody(self):
+        """The customer's address is on the case, so this costs no lookup."""
+        Case.objects.create(
+            case_number="OC-004001", external_ref="WO-004001", customer_name="Naveen",
+            title="Service call", address="P.B.NO 4, HARITHA Krishnagiri - 635109",
+            assigned_to=self.engineer, in_current_plan=True, plan_date=self.today,
+            status="completed", assigned_at=self._at(9), reached_at=self._at(10),
+            completed_at=self._at(11),
+        )
+        addressed = [e for e in self._events() if e.get("address")]
+        self.assertTrue(addressed, self._events())
+        self.assertTrue(
+            all(e["address"] == "P.B.NO 4, HARITHA Krishnagiri - 635109" for e in addressed)
+        )
+
+    def test_a_cached_place_is_used_and_nothing_is_fetched(self):
+        PlaceName.objects.create(
+            lat_key=Decimal("11.0000"), lon_key=Decimal("78.0000"),
+            address="Kirana Store, Hosur, Tamil Nadu",
+        )
+        for minute in (0, 30, 45):
+            ping = LocationPing.objects.create(
+                engineer=self.engineer, latitude=11.0, longitude=78.0, accuracy=8,
+            )
+            LocationPing.objects.filter(pk=ping.pk).update(timestamp=self._at(9, minute))
+
+        with mock.patch("cases.places._fetch_address") as fetch:
+            events = self._events()
+        fetch.assert_not_called()
+        stops = [e for e in events if e["type"] == "stop"]
+        self.assertTrue(stops, events)
+        self.assertEqual(stops[0]["address"], "Kirana Store, Hosur, Tamil Nadu")
+
+    def test_an_unknown_place_is_looked_up_once_and_kept(self):
+        for minute in (0, 30, 45):
+            ping = LocationPing.objects.create(
+                engineer=self.engineer, latitude=12.5, longitude=77.5, accuracy=8,
+            )
+            LocationPing.objects.filter(pk=ping.pk).update(timestamp=self._at(9, minute))
+
+        with mock.patch("cases.places._fetch_address", return_value="Some Road, Hosur") as fetch:
+            first = self._events()
+            self.assertEqual(fetch.call_count, 1)
+            # Asked again, it comes from the row that first call wrote.
+            second = self._events()
+            self.assertEqual(fetch.call_count, 1, "a cached place must not be fetched twice")
+
+        self.assertEqual(PlaceName.objects.count(), 1)
+        for events in (first, second):
+            stops = [e for e in events if e["type"] == "stop"]
+            self.assertEqual(stops[0]["address"], "Some Road, Hosur")
+
+    def test_a_place_that_cannot_be_resolved_is_simply_absent(self):
+        """No address is a missing line, never an error and never an empty one."""
+        for minute in (0, 30, 45):
+            ping = LocationPing.objects.create(
+                engineer=self.engineer, latitude=13.9, longitude=79.9, accuracy=8,
+            )
+            LocationPing.objects.filter(pk=ping.pk).update(timestamp=self._at(9, minute))
+
+        with mock.patch("cases.places._fetch_address", return_value=None):
+            events = self._events()
+        stops = [e for e in events if e["type"] == "stop"]
+        self.assertTrue(stops, events)
+        self.assertNotIn("address", stops[0])
+        self.assertEqual(PlaceName.objects.count(), 0)

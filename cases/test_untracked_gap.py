@@ -223,3 +223,24 @@ class UntrackedGapTests(APITestCase):
         for i in range(10):
             self._ping(minutes=i * 0.5, lat_offset=0.00002 * (i % 2))
         self.assertEqual(_trail_km(self._trail()), 0.0)
+
+    def test_two_fixes_sharing_a_timestamp_still_skip_the_gap(self):
+        """The clock is not fine enough to be the only witness.
+
+        On this machine 199 of 200 consecutive timezone.now() calls return the
+        SAME value, so two quick sends land on one timestamp. Asked only
+        "is a resumed fix strictly after the previous one", the answer is no,
+        and fifty kilometres nobody drove are charged to the engineer. The id
+        says what the clock cannot.
+        """
+        moment = self.start
+        first = LocationPing.objects.create(
+            engineer=self.engineer, latitude=CHENNAI_LAT, longitude=CHENNAI_LON,
+            accuracy=8, timestamp=moment,
+        )
+        resumed = LocationPing.objects.create(
+            engineer=self.engineer, latitude=CHENNAI_LAT + 0.5, longitude=CHENNAI_LON,
+            accuracy=8, after_gap=True, timestamp=moment,
+        )
+        self.assertEqual(first.timestamp, resumed.timestamp)
+        self.assertEqual(_trail_km(self._trail()), 0.0)
