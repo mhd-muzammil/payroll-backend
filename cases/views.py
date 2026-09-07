@@ -1748,7 +1748,11 @@ class TrackingViewSet(viewsets.ViewSet):
                 {
                     "at": stop["arrived_at"],
                     "type": "stop",
-                    "label": f"Stopped {stop['minutes']} min",
+                    # "Waiting", the office's own word for it. Their read is
+                    # that the engineer is not moving; whether that is work at a
+                    # customer or a wait on the road, the case number beside it
+                    # answers -- and this entry only ever claimed the first part.
+                    "label": f"Waiting {stop['minutes']} min",
                     "minutes": stop["minutes"],
                     "latitude": stop["latitude"],
                     "longitude": stop["longitude"],
