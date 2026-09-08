@@ -1822,8 +1822,13 @@ class TrackingViewSet(viewsets.ViewSet):
         case_moments = (
             ("assigned_at", "Case assigned"),
             ("started_at", "Left for the call"),
-            ("reached_at", "Reached the site"),
-            ("completed_at", "Completed the call"),
+            # The engineer's own buttons. They tap Check In when they arrive and
+            # Check Out when the work is done -- the same two taps this row was
+            # describing as "reached the site" and "completed the call". Past
+            # tense because a timeline entry is something that happened, and
+            # because the map legend already reads that way.
+            ("reached_at", "Check in"),
+            ("completed_at", "Check out"),
         )
 
         # THE DAY'S WORKLOAD, not just what was stamped on the day.

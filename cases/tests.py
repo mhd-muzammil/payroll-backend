@@ -1299,8 +1299,8 @@ class EngineerDayViewTests(TestCase):
 
         labels = [e["label"] for e in self._day()["events"]]
         self.assertIn("Left for the call", labels)
-        self.assertIn("Reached the site", labels)
-        self.assertIn("Completed the call", labels)
+        self.assertIn("Check in", labels)
+        self.assertIn("Check out", labels)
 
     def test_an_auto_closed_duty_says_so(self):
         session = DutySession.objects.create(engineer=self.engineer)
