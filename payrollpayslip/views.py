@@ -306,6 +306,10 @@ class PayslipViewSet(viewsets.ModelViewSet):
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
             queryset = queryset.filter(employee__user=user)
+            # Only what the office has actually sent. Generating a slip used to
+            # publish it, so payroll day put an unchecked figure in front of
+            # everybody; now a slip is private until somebody presses Send.
+            queryset = queryset.filter(sent_at__isnull=False)
         else:
             branches = get_allowed_branches(user, "payslips")
             if "All" not in branches:
@@ -339,6 +343,29 @@ class PayslipViewSet(viewsets.ModelViewSet):
             return False
         allowed = get_allowed_branches(user, "payslips")
         return None if "All" in allowed else allowed
+
+    @action(detail=True, methods=['post'])
+    def send(self, request, pk=None):
+        """Release this payslip to its employee.
+
+        The employee sees nothing until this runs, which is the whole point:
+        payroll can be generated, read, corrected and regenerated without
+        anybody watching it happen.
+
+        Idempotent. Pressing it twice is not an error and does not move the
+        date -- the office cannot tell from the button whether their first tap
+        registered, and re-stamping would lose when it actually went.
+        """
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
+        if role == "employee":
+            return Response({"detail": "Permission denied."}, status=403)
+
+        payslip = self.get_object()
+        if payslip.sent_at is None:
+            payslip.sent_at = timezone.now()
+            payslip.save(update_fields=["sent_at"])
+        return Response(self.get_serializer(payslip).data)
 
     @action(detail=False, methods=['post'])
     def generate_all(self, request):

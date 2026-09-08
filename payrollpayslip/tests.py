@@ -623,3 +623,107 @@ class StartingOverClearsSpecialWorkTests(APITestCase):
         self.slip.refresh_from_db()
         self.assertEqual(self.slip.special_work_days, Decimal(0))
         self.assertEqual(self.slip.special_work_pay, Decimal("0.00"))
+
+
+class PayslipIsPrivateUntilSentTests(APITestCase):
+    """Generating a payslip is not publishing it.
+
+    It used to be: the month payroll ran, every employee could open a slip
+    nobody had checked yet, and a correction meant they had already read the
+    wrong figure. Now the office presses Send Payslip when it is ready to go.
+    """
+
+    def setUp(self):
+        self.hr = User.objects.create_user(username="hr-send", password="x", role="hr")
+        self.employee_user = User.objects.create_user(
+            username="engineer-send", password="x", role="employee"
+        )
+        self.employee = make_employee("Sent Test", datetime.date(2025, 1, 1))
+        self.employee.user = self.employee_user
+        self.employee.save()
+
+        fields = compute_payslip_fields(self.employee, PERIOD, 0)
+        self.slip = Payslip.objects.create(employee=self.employee, month=8, year=2026, **fields)
+
+    def _as_employee(self):
+        self.client.force_authenticate(self.employee_user)
+
+    def _as_office(self):
+        self.client.force_authenticate(self.hr)
+
+    def _employee_sees(self):
+        response = self.client.get("/api/payslips/")
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        rows = body if isinstance(body, list) else body.get("results", [])
+        return [row["id"] for row in rows]
+
+    def test_a_generated_slip_is_not_visible_to_its_employee(self):
+        self._as_employee()
+        self.assertNotIn(self.slip.id, self._employee_sees())
+
+    def test_the_office_can_still_see_it(self):
+        """Payroll has to be able to read and correct what it has not sent."""
+        self._as_office()
+        response = self.client.get("/api/payslips/")
+        rows = response.json()
+        rows = rows if isinstance(rows, list) else rows.get("results", [])
+        self.assertIn(self.slip.id, [row["id"] for row in rows])
+
+    def test_sending_it_is_what_makes_it_visible(self):
+        self._as_office()
+        response = self.client.post(f"/api/payslips/{self.slip.id}/send/")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.slip.refresh_from_db()
+        self.assertIsNotNone(self.slip.sent_at)
+
+        self._as_employee()
+        self.assertIn(self.slip.id, self._employee_sees())
+
+    def test_an_employee_cannot_send_their_own(self):
+        self._as_employee()
+        response = self.client.post(f"/api/payslips/{self.slip.id}/send/")
+        self.assertEqual(response.status_code, 403)
+        self.slip.refresh_from_db()
+        self.assertIsNone(self.slip.sent_at)
+
+    def test_sending_twice_does_not_move_the_date(self):
+        """The office cannot tell from the button whether the first tap landed."""
+        self._as_office()
+        self.client.post(f"/api/payslips/{self.slip.id}/send/")
+        self.slip.refresh_from_db()
+        first = self.slip.sent_at
+
+        self.client.post(f"/api/payslips/{self.slip.id}/send/")
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.sent_at, first)
+
+    def test_a_patch_cannot_publish_it(self):
+        """Only the send action releases a slip -- not a raw field write."""
+        self._as_office()
+        response = self.client.patch(
+            f"/api/payslips/{self.slip.id}/",
+            {"sent_at": datetime.datetime(2026, 1, 1, 9, 0).isoformat()},
+            format="json",
+        )
+        self.assertIn(response.status_code, (200, 400))
+        self.slip.refresh_from_db()
+        self.assertIsNone(self.slip.sent_at)
+
+    def test_the_pdf_is_out_of_reach_too(self):
+        """Not sent means not readable, by any door.
+
+        The employee's payslip screen and the PDF ticket both go through the
+        same queryset, so gating the list gated the download with it. Asserted
+        because it would be easy to add a second path later that does not.
+        """
+        self._as_employee()
+        response = self.client.get(f"/api/payslips/{self.slip.id}/pdf_ticket/")
+        self.assertEqual(response.status_code, 404)
+
+        self._as_office()
+        self.client.post(f"/api/payslips/{self.slip.id}/send/")
+
+        self._as_employee()
+        response = self.client.get(f"/api/payslips/{self.slip.id}/pdf_ticket/")
+        self.assertEqual(response.status_code, 200, response.content)

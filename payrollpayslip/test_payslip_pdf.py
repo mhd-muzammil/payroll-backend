@@ -14,6 +14,8 @@ channel, that names one payslip and expires.
 import datetime
 from decimal import Decimal
 
+from django.utils import timezone
+
 from django.core import signing
 from django.test import override_settings
 from rest_framework.test import APITestCase
@@ -28,6 +30,10 @@ def _payslip(employee, **extra):
     defaults = dict(
         month=6,
         year=2026,
+        # Already sent. These tests are about the PDF, not about release -- and
+        # an employee cannot reach a slip the office has not sent, PDF
+        # included, which is the point of PayslipIsPrivateUntilSentTests.
+        sent_at=timezone.now(),
         total_days=30,
         lop_days=Decimal("2.00"),
         paid_days=Decimal("28.00"),

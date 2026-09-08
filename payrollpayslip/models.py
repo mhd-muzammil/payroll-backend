@@ -13,6 +13,12 @@ class Payslip(models.Model):
     year = models.IntegerField()
     
     # Days Tracking (2 decimal places so partial days like 5.05 are preserved)
+    # WHEN the office released this slip to the employee, and null until they
+    # do. Generating one used to publish it: the moment payroll ran, every
+    # employee could open a slip nobody had checked yet. Now generating is
+    # private and sending is a decision somebody makes.
+    sent_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
     total_days = models.IntegerField(default=30)
     lop_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     off_days = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
