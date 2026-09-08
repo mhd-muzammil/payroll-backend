@@ -465,3 +465,83 @@ class TimelineAddressTests(TestCase):
         self.assertTrue(stops, events)
         self.assertNotIn("address", stops[0])
         self.assertEqual(PlaceName.objects.count(), 0)
+
+
+class EveryEntryHasAPlaceTests(TestCase):
+    """Every entry can be opened on the map, because every entry has a place.
+
+    Only Waiting had one: stops carried coordinates and nothing else did. The
+    others always had a place, it just was not put on the event -- the punch
+    coordinates for the two taps at a customer, and the nearest fix in the
+    trail for Login and Logout.
+    """
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username="office-place", password="x", role="superadmin", is_superuser=True
+        )
+        self.engineer = Employee.objects.create(
+            employee_name="Placed", role="Service engineer", department="Service",
+            branch="Hosur", salary=30000, email="placed@test.local",
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.staff)
+        self.tz = timezone.get_current_timezone()
+        self.today = timezone.localdate()
+
+    def _at(self, hour, minute=0):
+        return timezone.make_aware(
+            datetime.datetime.combine(self.today, datetime.time(hour, minute)), self.tz
+        )
+
+    def _events(self, kind):
+        response = self.client.get(
+            f"/api/tracking/day/?engineer={self.engineer.id}&date={self.today}"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        return [e for e in response.json()["events"] if e["type"] == kind]
+
+    def test_check_in_opens_where_they_stood(self):
+        Case.objects.create(
+            case_number="OC-004001", external_ref="WO-1", customer_name="C", title="t",
+            assigned_to=self.engineer, in_current_plan=True, plan_date=self.today,
+            status="working", assigned_at=self._at(9), reached_at=self._at(10, 41),
+            latitude=12.700, longitude=77.700,
+            punch_in_lat=12.75767, punch_in_lon=77.81050,
+        )
+        entry = self._events("reached")[0]
+        self.assertAlmostEqual(entry["latitude"], 12.75767, places=5)
+        self.assertAlmostEqual(entry["longitude"], 77.81050, places=5)
+
+    def test_a_call_with_no_punch_falls_back_to_the_customer(self):
+        Case.objects.create(
+            case_number="OC-004002", external_ref="WO-2", customer_name="C", title="t",
+            assigned_to=self.engineer, in_current_plan=True, plan_date=self.today,
+            status="completed", assigned_at=self._at(9), completed_at=self._at(11, 17),
+            latitude=12.700, longitude=77.700,
+        )
+        entry = self._events("completed")[0]
+        self.assertAlmostEqual(entry["latitude"], 12.700, places=3)
+
+    def test_login_takes_the_nearest_fix(self):
+        session = DutySession.objects.create(engineer=self.engineer)
+        DutySession.objects.filter(pk=session.pk).update(started_at=self._at(9, 2))
+        ping = LocationPing.objects.create(
+            engineer=self.engineer, latitude=12.9, longitude=77.9, accuracy=8
+        )
+        LocationPing.objects.filter(pk=ping.pk).update(timestamp=self._at(9, 4))
+
+        entry = self._events("duty_start")[0]
+        self.assertAlmostEqual(entry["latitude"], 12.9, places=3)
+
+    def test_a_fix_an_hour_away_is_not_its_place(self):
+        """Fifteen minutes of driving is a different town."""
+        session = DutySession.objects.create(engineer=self.engineer)
+        DutySession.objects.filter(pk=session.pk).update(started_at=self._at(9, 2))
+        ping = LocationPing.objects.create(
+            engineer=self.engineer, latitude=12.9, longitude=77.9, accuracy=8
+        )
+        LocationPing.objects.filter(pk=ping.pk).update(timestamp=self._at(11, 30))
+
+        entry = self._events("duty_start")[0]
+        self.assertIsNone(entry.get("latitude"))

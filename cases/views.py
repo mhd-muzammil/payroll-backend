@@ -176,6 +176,11 @@ def _trail_km(pings):
 # forth, not a stretch anybody lost.
 MIN_DARK_MINUTES = 5
 
+# How far from an entry a fix may be and still be called its place. A quarter of
+# an hour of driving is a different town, and "view on map" has to open where
+# the thing happened or not at all.
+NEAREST_FIX_SECONDS = 15 * 60
+
 
 def duration_words(minutes):
     """"4h 27m", "12 min" -- the way somebody would say it out loud."""
@@ -1888,6 +1893,16 @@ class TrackingViewSet(viewsets.ViewSet):
             # Where the customer is. Loaded here so the timeline can say where
             # each call happened without a query per entry.
             "address",
+            # Where the customer IS, and where the engineer was STANDING when
+            # they tapped each button. Both, because a punch is the precise
+            # answer and the customer's pin is the fallback for a call moved by
+            # the older actions that recorded no punch.
+            "latitude",
+            "longitude",
+            "punch_in_lat",
+            "punch_in_lon",
+            "punch_out_lat",
+            "punch_out_lon",
             "assigned_at",
             "started_at",
             "reached_at",
@@ -1909,6 +1924,16 @@ class TrackingViewSet(viewsets.ViewSet):
                 if moment and timezone.localtime(moment).date() == target_date:
                     if field == "assigned_at":
                         stamped_today = True
+                    # Where they stood when they tapped, if that was recorded;
+                    # otherwise where the customer is.
+                    if field == "reached_at":
+                        lat, lon = case.punch_in_lat, case.punch_in_lon
+                    elif field == "completed_at":
+                        lat, lon = case.punch_out_lat, case.punch_out_lon
+                    else:
+                        lat = lon = None
+                    if lat is None or lon is None:
+                        lat, lon = case.latitude, case.longitude
                     events.append(
                         {
                             "at": moment,
@@ -1917,6 +1942,8 @@ class TrackingViewSet(viewsets.ViewSet):
                             "case_number": case.case_number,
                             "case_ref": case.external_ref or None,
                             "case_status": case.status,
+                            "latitude": lat,
+                            "longitude": lon,
                         }
                     )
             if stamped_today:
@@ -1948,6 +1975,26 @@ class TrackingViewSet(viewsets.ViewSet):
                     "case_status": case.status,
                 }
             )
+        # A PLACE FOR EVERY ENTRY, so every entry can be opened on the map.
+        #
+        # Login, Logout and "Left for the call" store no coordinate of their
+        # own. The trail does: the fix nearest in time says where the engineer
+        # was at that minute. Capped at fifteen minutes -- beyond that it is
+        # somewhere else and a link would be a small lie, so those keep none.
+        located = [ping for ping in pings if ping.latitude is not None]
+        for event in events:
+            if event.get("latitude") is not None:
+                continue
+            nearest = None
+            best = None
+            for ping in located:
+                apart = abs((ping.timestamp - event["at"]).total_seconds())
+                if best is None or apart < best:
+                    nearest, best = ping, apart
+            if nearest is not None and best <= NEAREST_FIX_SECONDS:
+                event["latitude"] = nearest.latitude
+                event["longitude"] = nearest.longitude
+
         events.sort(key=lambda e: e["at"])
 
         # WHERE each entry happened, in words rather than coordinates.
