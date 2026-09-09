@@ -12,7 +12,7 @@ from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Case, DutySession, EngineerAlias, EngineerScorecard, LocationPing
+from .models import Case, CaseVisit, DutySession, EngineerAlias, EngineerScorecard, LocationPing
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
 from .pings import MAX_BATCH, PingRejected, build_ping, coerce_number, ingest_batch
 from .tracks import snapped_trail
@@ -287,6 +287,87 @@ def _detect_stops(pings):
     return stops
 
 
+def _day_moments(case, visit):
+    """The four moments of one call, for one day.
+
+    From the day's own visit row when there is one: that is the record a later
+    dispatch cannot overwrite, so it still answers for a day that has already
+    happened after the same call has been sent out again. A call dispatched
+    before visits existed answers from its own columns.
+
+    Each entry is (field, label, when, punch lat, punch lon). The labels are
+    the engineer's own words for the two buttons, and the coordinates are where
+    they were standing when they pressed them.
+    """
+    if visit is not None:
+        # Per tap, not all-or-nothing. A row can exist for a day with no punch
+        # on it yet -- the sync writes it when the call is pushed, hours before
+        # the engineer arrives -- and the case's own column is then the only
+        # answer. It is safe to prefer it: the caller keeps only the stamps
+        # whose date IS the day being read, so a column a later trip has
+        # overwritten simply does not appear.
+        checked_in = visit.checked_in_at or case.reached_at
+        checked_out = visit.checked_out_at or case.completed_at
+        return (
+            ("assigned_at", "Case assigned", visit.assigned_at or case.assigned_at, None, None),
+            ("started_at", "Left for the call", case.started_at, None, None),
+            (
+                "reached_at",
+                "Check in",
+                checked_in,
+                visit.punch_in_lat if visit.checked_in_at else case.punch_in_lat,
+                visit.punch_in_lon if visit.checked_in_at else case.punch_in_lon,
+            ),
+            (
+                "completed_at",
+                "Check out",
+                checked_out,
+                visit.punch_out_lat if visit.checked_out_at else case.punch_out_lat,
+                visit.punch_out_lon if visit.checked_out_at else case.punch_out_lon,
+            ),
+        )
+    return (
+        ("assigned_at", "Case assigned", case.assigned_at, None, None),
+        ("started_at", "Left for the call", case.started_at, None, None),
+        ("reached_at", "Check in", case.reached_at, case.punch_in_lat, case.punch_in_lon),
+        ("completed_at", "Check out", case.completed_at, case.punch_out_lat, case.punch_out_lon),
+    )
+
+
+def _trip_day(case, visits=None):
+    """The plan day the case's CURRENT trip belongs to.
+
+    Read from the visits when there are any -- that is the only record a later
+    dispatch cannot overwrite. Falling back, in order: the plan day the sync
+    last stamped, then the day of whatever the engineer last did to the call.
+    Returns None when nothing on the case says which day it belongs to, and the
+    caller must treat that as "unknown", never as "an earlier day".
+    """
+    if visits is None:
+        visits = list(case.visits.all()) if case.pk else []
+    if visits:
+        return max(visit.plan_date for visit in visits)
+    if case.plan_date:
+        return case.plan_date
+    for stamp in (case.completed_at, case.reached_at, case.started_at, case.assigned_at):
+        if stamp:
+            return timezone.localtime(stamp).date()
+    return None
+
+
+def _visit_for(case, day, engineer=None):
+    """This call's row for that day, made if it is not there yet."""
+    visit, _ = CaseVisit.objects.get_or_create(
+        case=case,
+        plan_date=day,
+        defaults={
+            "engineer": engineer or case.assigned_to,
+            "assigned_at": case.assigned_at,
+        },
+    )
+    return visit
+
+
 def _punches_for_day(engineer, day):
     """Every call this engineer punched in or out of on `day`, with where.
 
@@ -297,13 +378,48 @@ def _punches_for_day(engineer, day):
     A punch whose position was never captured — no fix at the time — is still
     returned, so the timeline is complete; it simply cannot be drawn.
     """
-    cases = Case.objects.filter(assigned_to=engineer).only(
-        "case_number", "title", "reached_at", "completed_at",
-        "punch_in_lat", "punch_in_lon", "punch_in_accuracy",
-        "punch_out_lat", "punch_out_lon", "punch_out_accuracy",
-    )
-
     out = []
+
+    # The day's visits first. A call sent out again overwrites the columns on
+    # the case, so for any call that has been punched since visits existed this
+    # is the only place the day's own punches survive.
+    recorded = set()
+    for visit in (
+        CaseVisit.objects.filter(case__assigned_to=engineer)
+        .filter(Q(checked_in_at__date=day) | Q(checked_out_at__date=day))
+        .select_related("case")
+    ):
+        recorded.add(visit.case_id)
+        for kind, at, lat, lon, accuracy in (
+            ("in", visit.checked_in_at, visit.punch_in_lat, visit.punch_in_lon, visit.punch_in_accuracy),
+            ("out", visit.checked_out_at, visit.punch_out_lat, visit.punch_out_lon, visit.punch_out_accuracy),
+        ):
+            if not at or timezone.localtime(at).date() != day:
+                continue
+            out.append(
+                {
+                    "kind": kind,
+                    "at": at,
+                    "case_id": visit.case_id,
+                    "case_number": visit.case.case_number,
+                    "title": visit.case.title,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "accuracy": accuracy,
+                }
+            )
+
+    # Anything with no visit row at all -- dispatched before this table existed
+    # and never punched since -- still answers from its own columns.
+    cases = (
+        Case.objects.filter(assigned_to=engineer)
+        .exclude(id__in=recorded)
+        .only(
+            "case_number", "title", "reached_at", "completed_at",
+            "punch_in_lat", "punch_in_lon", "punch_in_accuracy",
+            "punch_out_lat", "punch_out_lon", "punch_out_accuracy",
+        )
+    )
     for case in cases:
         for kind, at, lat, lon, accuracy in (
             ("in", case.reached_at, case.punch_in_lat, case.punch_in_lon, case.punch_in_accuracy),
@@ -493,7 +609,13 @@ class CaseViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = Case.objects.select_related("assigned_to", "assigned_by").all()
+        # prefetch_related("visits"): the serializer reads this trip's two taps
+        # for every card, and without this that is one query per case.
+        qs = (
+            Case.objects.select_related("assigned_to", "assigned_by")
+            .prefetch_related("visits")
+            .all()
+        )
 
         if _role(user) == "employee":
             employee = _get_employee(user)
@@ -837,6 +959,27 @@ class CaseViewSet(viewsets.ModelViewSet):
 
             is_new = case.pk is None
             reassigned = case.assigned_to_id not in (None, engineer.id)
+            # THE DAY THIS CALL IS ALREADY ON -- read before the plan date below
+            # overwrites it.
+            #
+            # A push for a LATER day is a second trip to the same customer: the
+            # part did not arrive, nobody was in, the job needs another visit.
+            # The engineer's side has to start again or their phone shows the
+            # call with no Check In on it -- the case still says completed from
+            # the first trip, and the branch below leaves an engineer's own
+            # status alone on purpose.
+            #
+            # A push for the SAME day is the sync repeating itself. It runs
+            # every couple of minutes and always says "assigned", including
+            # about calls the engineer closed an hour ago, so it must change
+            # nothing. Unknown on either side counts as the same day for the
+            # same reason: a guess here re-opens finished work every tick.
+            previous_trip_day = None if is_new else _trip_day(case)
+            second_trip = (
+                plan_date is not None
+                and previous_trip_day is not None
+                and plan_date > previous_trip_day
+            )
             # Pushed in this batch, so it IS in the plan — including a ticket
             # coming back after having dropped out.
             case.in_current_plan = True
@@ -847,7 +990,10 @@ class CaseViewSet(viewsets.ModelViewSet):
             # Stamp on first assignment, and re-stamp when the ticket actually
             # moves to a different engineer — for the new engineer it IS a fresh
             # assignment. An unchanged engineer keeps the original timestamp.
-            if case.assigned_at is None or reassigned:
+            # Re-stamped for a second trip too: the call was handed to them
+            # again today, and the board should say so rather than "on the list
+            # from" a week ago. The first trip's own date is kept on its visit.
+            if case.assigned_at is None or reassigned or second_trip:
                 case.assigned_at = timezone.now()
 
             desired = self._EXTERNAL_STATUS_MAP.get((raw.get("status") or "").strip().lower())
@@ -855,11 +1001,14 @@ class CaseViewSet(viewsets.ModelViewSet):
                 # Terminal upstream: the originating system says this call is
                 # finished, which always wins over the field status.
                 case.status = desired
-                if desired == "completed" and case.completed_at is None:
+                # Stamped on a second trip as well, so a close reported today
+                # is dated today instead of inheriting the first trip's time
+                # and being filed on the wrong day.
+                if desired == "completed" and (case.completed_at is None or second_trip):
                     case.completed_at = timezone.now()
-            elif reassigned:
-                # New engineer — restart their side of the lifecycle, whatever
-                # the previous engineer had already done.
+            elif reassigned or second_trip:
+                # A different engineer, or a different day: either way the
+                # engineer's side of this call starts from the beginning.
                 case.status = desired or "assigned"
             elif case.status in ENGINEER_OWNED_STATUSES:
                 # Sync runs every few minutes and keeps repeating "assigned";
@@ -872,6 +1021,13 @@ class CaseViewSet(viewsets.ModelViewSet):
                 case.status = "assigned"
 
             case.save()
+            if plan_date:
+                # WHICH DAY'S LIST THIS CALL WAS ON, written once and never
+                # rewritten. The plan date on the case is renewed every couple
+                # of minutes and so can only ever answer for today; this is the
+                # record a second dispatch cannot overwrite, and it is what
+                # lets a day that has already happened keep its own answer.
+                _visit_for(case, plan_date, engineer)
             if ext:
                 assigned_refs.add(ext)
             assigned += 1
@@ -992,13 +1148,62 @@ class CaseViewSet(viewsets.ModelViewSet):
             )
 
         case.status = new_status
+        moment = timezone.now()
         if stamp_field:
-            setattr(case, stamp_field, timezone.now())
+            setattr(case, stamp_field, moment)
         if extra:
             for k, v in extra.items():
                 setattr(case, k, v)
         case.save()
+        # The case's columns are the LATEST trip; this is the trip itself. A
+        # call sent out again next week overwrites the columns, and without
+        # this row that day's arrival would be gone from the board that showed
+        # it.
+        if stamp_field in ("reached_at", "completed_at"):
+            self._record_trip(case, stamp_field, moment, extra or {})
+            # The serializer reads this trip off the case, and the prefetch
+            # that loaded it ran before the row was written. Left stale, the
+            # reply to a Check In would say the engineer had not checked in.
+            if hasattr(case, "_prefetched_objects_cache"):
+                case._prefetched_objects_cache.pop("visits", None)
         return Response(self.get_serializer(case).data)
+
+    def _record_trip(self, case, stamp_field, moment, extra):
+        """Write the punch onto the day's visit as well as onto the case.
+
+        Which day: the one the engineer is standing in. A check-out is filed
+        against the trip it belongs to even when the clock has passed midnight
+        -- an engineer finishing at 00:20 checked in yesterday, and splitting
+        that into two trips would leave both halves unreadable.
+        """
+        today = timezone.localdate()
+        if stamp_field == "completed_at":
+            open_trip = (
+                case.visits.filter(checked_out_at__isnull=True, checked_in_at__isnull=False)
+                .order_by("-plan_date")
+                .first()
+            )
+            visit = open_trip or _visit_for(case, today)
+        else:
+            visit = _visit_for(case, today)
+
+        if stamp_field == "reached_at":
+            visit.checked_in_at = moment
+            visit.punch_in_lat = extra.get("punch_in_lat", visit.punch_in_lat)
+            visit.punch_in_lon = extra.get("punch_in_lon", visit.punch_in_lon)
+            visit.punch_in_accuracy = extra.get("punch_in_accuracy", visit.punch_in_accuracy)
+        else:
+            visit.checked_out_at = moment
+            visit.punch_out_lat = extra.get("punch_out_lat", visit.punch_out_lat)
+            visit.punch_out_lon = extra.get("punch_out_lon", visit.punch_out_lon)
+            visit.punch_out_accuracy = extra.get("punch_out_accuracy", visit.punch_out_accuracy)
+            if extra.get("resolution_notes"):
+                visit.resolution_notes = extra["resolution_notes"]
+        if visit.engineer_id is None:
+            visit.engineer = case.assigned_to
+        if visit.assigned_at is None:
+            visit.assigned_at = case.assigned_at
+        visit.save()
 
     def _punch_coords(self, request, prefix):
         """The position the phone reported at the moment of the punch.
@@ -1823,18 +2028,9 @@ class TrackingViewSet(viewsets.ViewSet):
             events.extend(_offline_event(outage_start, outage_end))
 
         # What the engineer did to their cases that day, so a stop can be read
-        # against the job it belongs to.
-        case_moments = (
-            ("assigned_at", "Case assigned"),
-            ("started_at", "Left for the call"),
-            # The engineer's own buttons. They tap Check In when they arrive and
-            # Check Out when the work is done -- the same two taps this row was
-            # describing as "reached the site" and "completed the call". Past
-            # tense because a timeline entry is something that happened, and
-            # because the map legend already reads that way.
-            ("reached_at", "Check in"),
-            ("completed_at", "Check out"),
-        )
+        # against the job it belongs to. The four moments and their labels live
+        # in _day_moments, which reads them from the day's visit row when there
+        # is one -- see there.
 
         # THE DAY'S WORKLOAD, not just what was stamped on the day.
         #
@@ -1908,8 +2104,31 @@ class TrackingViewSet(viewsets.ViewSet):
             "reached_at",
             "completed_at",
         )
+        # THE DAY'S OWN RECORD, which is neither the plan nor the stamps.
+        #
+        # A visit row is written when the sync pushes a call for a day, and
+        # nothing later rewrites it. That makes it the only source that can
+        # still answer for a day after the same call has been sent out again --
+        # both for whether it was on that day's list, and for the arrival and
+        # departure punched on it. It is a record, not a reconstruction: a row
+        # exists only for a day the call was actually somebody's to do.
+        visits_by_case = {}
+        for visit in CaseVisit.objects.filter(case__assigned_to=engineer).filter(
+            Q(plan_date=target_date)
+            | Q(checked_in_at__date=target_date)
+            | Q(checked_out_at__date=target_date)
+        ):
+            visits_by_case.setdefault(visit.case_id, visit)
+        visited = (
+            Case.objects.filter(assigned_to=engineer, id__in=list(visits_by_case)).exclude(
+                status="cancelled"
+            )
+            if visits_by_case
+            else Case.objects.none()
+        )
+
         day_cases = {}
-        for queryset in (planned, touched):
+        for queryset in (planned, touched, visited):
             for case in queryset.only(*fields):
                 day_cases[case.pk] = case
 
@@ -1918,20 +2137,14 @@ class TrackingViewSet(viewsets.ViewSet):
         for case in sorted(
             day_cases.values(), key=lambda c: c.assigned_at or timezone.now()
         ):
+            visit = visits_by_case.get(case.pk)
             stamped_today = False
-            for field, label in case_moments:
-                moment = getattr(case, field)
+            for field, label, moment, lat, lon in _day_moments(case, visit):
                 if moment and timezone.localtime(moment).date() == target_date:
                     if field == "assigned_at":
                         stamped_today = True
                     # Where they stood when they tapped, if that was recorded;
                     # otherwise where the customer is.
-                    if field == "reached_at":
-                        lat, lon = case.punch_in_lat, case.punch_in_lon
-                    elif field == "completed_at":
-                        lat, lon = case.punch_out_lat, case.punch_out_lon
-                    else:
-                        lat = lon = None
                     if lat is None or lon is None:
                         lat, lon = case.latitude, case.longitude
                     events.append(
@@ -1952,9 +2165,11 @@ class TrackingViewSet(viewsets.ViewSet):
             # rather than appearing at a clock time that belongs to another one.
             # The date it was actually given is in the label, because "assigned"
             # with no date next to it reads as "assigned this morning".
-            since = (
-                f" {timezone.localtime(case.assigned_at):%d %b}" if case.assigned_at else ""
-            )
+            # The day it was given, from the day's own row when there is one:
+            # a second dispatch re-stamps the case, and this line is what tells
+            # an earlier day it was NOT given that morning.
+            given_at = (visit.assigned_at if visit and visit.assigned_at else case.assigned_at)
+            since = f" {timezone.localtime(given_at):%d %b}" if given_at else ""
             events.append(
                 {
                     "at": timezone.make_aware(

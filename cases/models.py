@@ -425,3 +425,82 @@ class EngineerScorecard(models.Model):
             f"{self.engineer.employee_name} {self.as_of}: "
             f"{self.assigned}/{self.attended}/{self.closed}"
         )
+
+
+class CaseVisit(models.Model):
+    """One trip to a call: the day the engineer was sent, and the two taps.
+
+    A call can be dispatched more than once -- a second day for the part that
+    did not arrive, a third for the customer who was out. The Case row holds
+    one pair of punch times, so without this the second trip could only
+    overwrite the first, and the day board would lose the first day's arrival
+    the moment the engineer arrived on the second.
+
+    One row per (case, plan day). Nothing here is ever rewritten by a later
+    trip: yesterday's row keeps yesterday's times whatever happens today.
+
+    The Case still carries the LATEST trip's times in its own columns, which is
+    what every existing screen reads. This is the record behind them.
+    """
+
+    case = models.ForeignKey(
+        "cases.Case",
+        on_delete=models.CASCADE,
+        related_name="visits",
+    )
+    # Who it was booked to on that day. Kept per trip rather than read off the
+    # case, because a ticket that moves to another engineer must not rewrite who
+    # made yesterday's visit. SET_NULL so removing an employee cannot delete
+    # the record of a visit that happened.
+    engineer = models.ForeignKey(
+        Employee,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="case_visits",
+    )
+    # The plan day this trip belongs to, as the originating system counts days.
+    plan_date = models.DateField(db_index=True)
+
+    # When the office put the call on that day's list. Not the same as
+    # Case.assigned_at, which a second dispatch re-stamps -- this keeps the
+    # first day's own answer.
+    assigned_at = models.DateTimeField(null=True, blank=True)
+
+    # The engineer's two taps, and where they were standing for each. Null
+    # until they press them; a trip that was dispatched and never visited keeps
+    # both null, which is itself the answer.
+    checked_in_at = models.DateTimeField(null=True, blank=True)
+    checked_out_at = models.DateTimeField(null=True, blank=True)
+    punch_in_lat = models.FloatField(null=True, blank=True)
+    punch_in_lon = models.FloatField(null=True, blank=True)
+    punch_in_accuracy = models.FloatField(null=True, blank=True, help_text="Metres, as the phone reported")
+    punch_out_lat = models.FloatField(null=True, blank=True)
+    punch_out_lon = models.FloatField(null=True, blank=True)
+    punch_out_accuracy = models.FloatField(null=True, blank=True, help_text="Metres, as the phone reported")
+
+    # What the engineer said they did on THIS trip. On the case there is one
+    # field, so a second check-out with nothing typed used to leave the first
+    # trip's answer standing as the second's.
+    resolution_notes = models.TextField(blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        # One trip per day per call. A second visit to the same customer on the
+        # same day is not something this system has ever been able to record,
+        # and pretending otherwise here would give the day board two arrivals
+        # it cannot tell apart.
+        constraints = [
+            models.UniqueConstraint(fields=["case", "plan_date"], name="one_visit_per_case_per_day"),
+        ]
+        # The day board asks "this engineer, this day"; the card asks "this
+        # case, latest". Indexed for both, because this table only grows.
+        indexes = [
+            models.Index(fields=["engineer", "plan_date"]),
+            models.Index(fields=["case", "-plan_date"]),
+        ]
+        ordering = ["plan_date", "id"]
+
+    def __str__(self):
+        return f"{self.case_id} on {self.plan_date}"

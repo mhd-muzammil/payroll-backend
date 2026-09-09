@@ -1,3 +1,4 @@
+from django.utils import timezone
 from rest_framework import serializers
 from .models import Case, LocationPing
 
@@ -6,6 +7,13 @@ class CaseSerializer(serializers.ModelSerializer):
     assigned_to_name = serializers.CharField(source="assigned_to.employee_name", read_only=True)
     assigned_by_name = serializers.CharField(source="assigned_by.username", read_only=True)
     branch = serializers.SerializerMethodField()
+    # THIS TRIP'S two taps, which is what the engineer's card has to decide its
+    # buttons from. reached_at and completed_at on the case are the LATEST trip
+    # whenever it happened: a call sent out again next week arrives carrying
+    # last week's check-in, and the card read that as "already on site" and
+    # offered Check Out to an engineer who had not left home.
+    visit_checked_in_at = serializers.SerializerMethodField()
+    visit_checked_out_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Case
@@ -40,6 +48,31 @@ class CaseSerializer(serializers.ModelSerializer):
         if obj.assigned_to:
             return obj.assigned_to.branch
         return None
+
+    def _trip(self, obj):
+        """The visit this card is about: the one for the case's plan day.
+
+        The engineer's list is today's plan, so for them that is today. A case
+        created by hand in Payroll has no plan day and is read as today too.
+        Falls back to the newest visit, so the office opening an older call
+        still sees the trip that actually happened.
+        """
+        visits = list(obj.visits.all())
+        if not visits:
+            return None
+        day = obj.plan_date or timezone.localdate()
+        for visit in visits:
+            if visit.plan_date == day:
+                return visit
+        return None
+
+    def get_visit_checked_in_at(self, obj):
+        trip = self._trip(obj)
+        return trip.checked_in_at if trip else None
+
+    def get_visit_checked_out_at(self, obj):
+        trip = self._trip(obj)
+        return trip.checked_out_at if trip else None
 
 
 class LocationPingSerializer(serializers.ModelSerializer):
