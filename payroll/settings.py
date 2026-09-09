@@ -97,7 +97,15 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    # Notes which build of the app each engineer is calling from. Last in the
+    # list, so it runs after the view has authenticated whoever is asking.
+    "authentication.app_version.RecordAppVersion",
 ]
+
+# The APK build the office is rolling out, for the App Usage page to measure
+# everybody against. A setting rather than a constant in the code: a release
+# should not need a deploy of Python to be counted correctly.
+CURRENT_APP_VERSION = os.environ.get("CURRENT_APP_VERSION", "1.4")
 
 ROOT_URLCONF = 'payroll.urls'
 

@@ -46,6 +46,20 @@ class User(AbstractUser):
     first_app_login_at = models.DateTimeField(null=True, blank=True)
     last_app_login_at = models.DateTimeField(null=True, blank=True)
 
+    # WHICH BUILD OF THE APK this person's phone is running, as the app itself
+    # reports it on every request -- "1.4 (5)".
+    #
+    # There is no store to ask: the APK is handed around as a file, and nothing
+    # here ever saw an install. So the office could not tell who had picked up a
+    # new version and who was still on the old one, which matters the moment a
+    # release fixes something in the field.
+    #
+    # Blank means the phone did not say, and that IS the answer: every build
+    # before 1.4 is silent, so an app user with nothing here has not updated.
+    # Written only when it changes, so the date reads "on this build since".
+    app_version = models.CharField(max_length=40, blank=True, default="")
+    app_version_at = models.DateTimeField(null=True, blank=True)
+
     allowed_sections = models.JSONField(default=default_sections, blank=True)
     assigned_branch = models.CharField(max_length=50, null=True, blank=True, default=None)
 

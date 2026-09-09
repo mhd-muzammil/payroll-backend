@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db.models import Q
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -73,6 +74,11 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 "first_app_login_at": account.first_app_login_at if account else None,
                 "last_app_login_at": account.last_app_login_at if account else None,
                 "uses_app": bool(account and account.last_app_login_at),
+                # Which build their phone is on. Empty means the app never said
+                # -- every version before 1.4 is silent -- so for somebody who
+                # uses the app that reads as "not updated yet".
+                "app_version": (account.app_version or "") if account else "",
+                "app_version_at": account.app_version_at if account else None,
             })
 
         using = [r for r in rows if r["uses_app"]]
@@ -83,12 +89,24 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             r for r in rows if r["has_login"] and not r["uses_app"] and r["last_login"]
         ]
 
+        # Who is on the build being rolled out, of the people using the app at
+        # all. Anybody using it whose phone reports something else, or nothing,
+        # is the chase list. Read from a setting so a release does not need a
+        # code change to be counted.
+        current = getattr(settings, "CURRENT_APP_VERSION", "")
+        on_current = [
+            r for r in using if current and r["app_version"].startswith(current)
+        ]
+
         return Response({
             "total": len(rows),
             "using_app": len(using),
             "not_using_app": len(rows) - len(using),
             "no_login_account": len(no_account),
             "browser_only": len(browser_only),
+            "current_app_version": current,
+            "on_current_version": len(on_current),
+            "behind_version": len(using) - len(on_current),
             "rows": rows,
         })
 
