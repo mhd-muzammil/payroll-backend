@@ -25,6 +25,15 @@ class Attendance(models.Model):
     outtime = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES)
 
+    # The day was closed by the 11.59pm rule, not by the person.
+    #
+    # People forget to press Logout, and the day then reads 0.0h forever. It is
+    # closed for them at 11.59pm so the register has an answer -- but an answer
+    # nobody gave has to be marked as such, or the office cannot tell a
+    # fifteen-hour day somebody worked from a Logout they never pressed. Shaped
+    # after DutySession.auto_closed, which exists for exactly this reason.
+    auto_closed_out = models.BooleanField(default=False)
+
     def __str__(self):
         return f"{self.employee_name} - {self.intime.date() if self.intime else 'No Date'}"
 
