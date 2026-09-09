@@ -191,12 +191,24 @@ def duration_words(minutes):
 
 
 def _offline_event(first, last):
-    """One entry for a stretch the phone spent with no network.
+    """BOTH ends of a stretch the phone spent with no network.
 
     Measured from when the first held fix was TAKEN to when the last one was
-    finally DELIVERED -- that is the window the office saw nothing in. Returns
-    a list so the caller can extend() and get nothing for a stretch too short
-    to be worth a line.
+    finally DELIVERED -- that is the window the office saw nothing in.
+
+    Two entries, not one. "No network 19 min" says a hole opened; it does not
+    say the phone came back, and somebody reading the rail at 11:11 had to work
+    out for themselves whether 11:30 was still dark. The moment it reconnected
+    is a fact we hold -- it is when the held fixes arrived -- so it is written
+    down rather than left to be inferred.
+
+    The reconnection carries no position on purpose. Where the phone WAS when
+    the delivery went through is not where the last held fix was taken, so the
+    nearest-fix pass in the day view answers it instead, and leaves it blank
+    rather than guessing when nothing is close enough in time.
+
+    Returns a list so the caller can extend() and get nothing for a stretch too
+    short to be worth a line.
     """
     if last is None or last.received_at is None:
         return []
@@ -211,7 +223,15 @@ def _offline_event(first, last):
             "minutes": minutes,
             "latitude": first.latitude,
             "longitude": first.longitude,
-        }
+        },
+        {
+            "at": last.received_at,
+            "type": "network_back",
+            "label": "Network back",
+            "minutes": minutes,
+            "latitude": None,
+            "longitude": None,
+        },
     ]
 
 
@@ -2003,6 +2023,25 @@ class TrackingViewSet(viewsets.ViewSet):
                     "minutes": dark,
                     "latitude": previous.latitude,
                     "longitude": previous.longitude,
+                }
+            )
+            # And the moment it came back. Without this the rail says a hole
+            # opened and never says it closed, so a stretch that ended at 3:40
+            # cannot be told from one that ran to the logout -- and that
+            # difference is whether anybody needs chasing.
+            #
+            # Honest about what it knows: the phone started reporting again at
+            # this moment. Whether the engineer switched location back on or
+            # simply walked back into a signal, only they can say, so the label
+            # says what happened and not why.
+            events.append(
+                {
+                    "at": current.timestamp,
+                    "type": "location_back",
+                    "label": "Location back on",
+                    "minutes": dark,
+                    "latitude": current.latitude,
+                    "longitude": current.longitude,
                 }
             )
 

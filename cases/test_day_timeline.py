@@ -297,6 +297,17 @@ class DarkStretchTests(TestCase):
             datetime.datetime.combine(self.today, datetime.time(hour, minute)), self.tz
         )
 
+    def _local(self, iso):
+        """The wall-clock time an entry carries, in the timezone people read.
+
+        The payload is UTC, and 14:00 IST serialises as 08:30Z -- comparing the
+        string against the local hour is how the first version of these tests
+        failed while the code was right.
+        """
+        from django.utils.dateparse import parse_datetime
+
+        return timezone.localtime(parse_datetime(iso))
+
     def _ping(self, hour, minute, *, lat=11.0, after_gap=False, received=None):
         ping = LocationPing.objects.create(
             engineer=self.engineer, latitude=lat, longitude=78.0, accuracy=8,
@@ -326,6 +337,74 @@ class DarkStretchTests(TestCase):
         self.assertEqual(len(dark), 1, dark)
         self.assertEqual(dark[0]["label"], "Location off · 4h 30m")
         self.assertEqual(dark[0]["minutes"], 270)
+
+    def test_the_moment_location_came_back_is_on_the_rail_too(self):
+        """A hole that opens has to be shown closing.
+
+        Without this the rail says "Location off 4h 30m" at 09:30 and nothing
+        else, so whether the phone returned at two o'clock or stayed dark until
+        the logout has to be worked out by eye -- and that difference is
+        whether anybody needs chasing.
+        """
+        self._ping(9, 0, lat=11.00)
+        self._ping(9, 30, lat=11.05)
+        self._ping(14, 0, lat=11.60, after_gap=True)
+
+        back = self._events("location_back")
+        self.assertEqual(len(back), 1, back)
+        self.assertEqual(back[0]["label"], "Location back on")
+        # At the moment it started reporting again, not where it stopped.
+        came_back = self._local(back[0]["at"])
+        self.assertEqual((came_back.hour, came_back.minute), (14, 0), back[0]["at"])
+        self.assertEqual(back[0]["latitude"], 11.60)
+
+    def test_the_two_ends_are_one_stretch_read_in_order(self):
+        self._ping(9, 0)
+        self._ping(9, 30)
+        self._ping(14, 0, after_gap=True)
+
+        pair = [e for e in self._events() if e["type"] in ("location_off", "location_back")]
+        self.assertEqual([e["type"] for e in pair], ["location_off", "location_back"], pair)
+        self.assertLess(pair[0]["at"], pair[1]["at"])
+        # Both carry the length of the same stretch, so either entry answers
+        # "how long" without the reader holding two times in their head.
+        self.assertEqual(pair[0]["minutes"], pair[1]["minutes"])
+
+    def test_jitter_produces_neither_end(self):
+        """The five-minute floor holds for the far end as well as the near one."""
+        self._ping(9, 0)
+        self._ping(9, 2, after_gap=True)
+        self.assertEqual(self._events("location_back"), [])
+
+    def test_the_network_coming_back_is_its_own_entry(self):
+        held_from = self._at(11, 11)
+        delivered = self._at(11, 30)
+        first = self._ping(11, 11, received=delivered)
+        self._ping(11, 20, received=delivered)
+        self.assertIsNotNone(first)
+
+        back = self._events("network_back")
+        self.assertEqual(len(back), 1, back)
+        self.assertEqual(back[0]["label"], "Network back")
+        # Stamped when the held fixes actually arrived.
+        arrived = self._local(back[0]["at"])
+        self.assertEqual((arrived.hour, arrived.minute), (11, 30), back[0]["at"])
+        self.assertGreater(arrived, held_from)
+
+    def test_the_network_coming_back_is_placed_by_the_nearest_fix(self):
+        """Where the phone was when the delivery went through.
+
+        Deliberately not the place the last held fix was TAKEN -- the engineer
+        has moved since. The day view's nearest-fix pass answers it, and this
+        pins that the entry is placed rather than left blank when there is a
+        fix close enough in time.
+        """
+        delivered = self._at(11, 30)
+        self._ping(11, 11, lat=11.10, received=delivered)
+        self._ping(11, 31, lat=11.40)
+
+        back = self._events("network_back")[0]
+        self.assertEqual(back["latitude"], 11.40, back)
 
     def test_a_moment_of_jitter_is_not_an_entry(self):
         """A phone handing the GPS back in two minutes is not a lost stretch."""
