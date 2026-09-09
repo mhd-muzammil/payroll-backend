@@ -12,7 +12,10 @@ class AttendanceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Attendance
         fields = '__all__'
-        read_only_fields = ("employee",)
+        # `employee` is writable on purpose: the office posts the id of the
+        # person it is marking, and without it the row is saved belonging to
+        # nobody -- see _link_office_record. An employee's own row does not
+        # get to choose: validate() overwrites it from their profile.
 
     def get_branch(self, obj):
         if obj.employee:
@@ -49,6 +52,36 @@ class AttendanceSerializer(serializers.ModelSerializer):
         attrs["salary"] = employee.salary
         return attrs
 
+    def _link_office_record(self, attrs):
+        """Attach the employee a row the office is creating is about.
+
+        Prefers the id the page sends. Falls back to the name, and only to an
+        unambiguous match: an active employee if exactly one is called that,
+        otherwise any one employee called that, otherwise nothing. Namesakes
+        are left unlinked -- two cards for one name is a smaller lie than one
+        person's absence landing on somebody else's record.
+
+        Never raises. A row that cannot be attributed is still saved, exactly
+        as it was before, so nobody is stopped from marking attendance for a
+        name the employee list does not have.
+        """
+        if attrs.get("employee") is not None:
+            return attrs
+
+        # On a PATCH the payload carries only what changed, so the name comes
+        # off the row itself. That is what lets opening an old unlinked row to
+        # correct its status also give it back its owner.
+        name = (attrs.get("employee_name") or getattr(self.instance, "employee_name", "") or "").strip()
+        if not name:
+            return attrs
+
+        named = Employee.objects.filter(employee_name__iexact=name)
+        active = list(named.exclude(status="relieved")[:2])
+        matches = active if len(active) == 1 else list(named[:2])
+        if len(matches) == 1:
+            attrs["employee"] = matches[0]
+        return attrs
+
     def validate(self, attrs):
         # A record has to say WHICH DAY it is about.
         #
@@ -71,8 +104,15 @@ class AttendanceSerializer(serializers.ModelSerializer):
         user = request.user
         role = "superadmin" if user.is_superuser else user.role
         if role == "employee":
+            # Their own row, whatever the payload claims.
             employee = self._get_employee_for_user(user)
             attrs = self._copy_employee_fields(attrs, employee)
+        elif self.instance is None or self.instance.employee_id is None:
+            # The office marking somebody. Also on edit while the row still
+            # belongs to nobody: opening an old row to correct it is a fair
+            # moment to give it back its owner. An already-linked row is left
+            # alone -- a rename must not move a day onto another person.
+            attrs = self._link_office_record(attrs)
         return attrs
 
     def create(self, validated_data):
