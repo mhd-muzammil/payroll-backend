@@ -246,6 +246,22 @@ def _offline_event(first, last):
     ]
 
 
+def _on_duty_at(sessions, moment):
+    """Was the engineer on duty at that instant?
+
+    True when there are no sessions at all: a day with no session is a fault in
+    the record, and hiding every entry would bury it instead of showing it.
+
+    An open session counts up to now, which is what "still on duty" means.
+    """
+    if not sessions:
+        return True
+    for session in sessions:
+        if session.started_at <= moment <= (session.ended_at or timezone.now()):
+            return True
+    return False
+
+
 def _usable_pings(pings):
     """Ordered pings with the low-accuracy noise dropped.
 
@@ -1962,7 +1978,17 @@ class TrackingViewSet(viewsets.ViewSet):
                 "started_at"
             )
         )
-        stops = _detect_stops(pings)
+        # STANDING STILL OFF DUTY IS THEIR OWN TIME.
+        #
+        # Filtered here rather than where the entries are built, so the count in
+        # the header, the markers on the map and the rail cannot disagree: one
+        # list, one rule. A day with no session at all is left alone -- see
+        # _on_duty_at.
+        stops = [
+            stop
+            for stop in _detect_stops(pings)
+            if _on_duty_at(sessions, stop["arrived_at"])
+        ]
         punches = _punches_for_day(engineer, target_date)
 
         # A timeline the office can read top to bottom, the way the day happened.
@@ -2023,6 +2049,11 @@ class TrackingViewSet(viewsets.ViewSet):
             dark = int((current.timestamp - previous.timestamp).total_seconds() // 60)
             if dark < MIN_DARK_MINUTES:
                 continue
+            # Off duty, nobody was asking the phone for anything. Judged on
+            # where the stretch STARTS, so both ends of it are kept or dropped
+            # together.
+            if not _on_duty_at(sessions, previous.timestamp):
+                continue
             events.append(
                 {
                     # Stamped where the trail STOPS, not where it resumes: that
@@ -2082,6 +2113,14 @@ class TrackingViewSet(viewsets.ViewSet):
             )
             if metres < UNTRACKED_MOVE_METERS:
                 continue  # they stood still; that is a stop, not a hole
+            # AND ONLY WHILE THEY WERE ON DUTY.
+            #
+            # An engineer who logs out at half past eleven and comes back at
+            # seven is not being tracked in between, and should not be told off
+            # for it. Without this the board read "Not tracked - 7h 40m" across
+            # somebody's own afternoon.
+            if not _on_duty_at(sessions, previous.timestamp):
+                continue
             events.append(
                 {
                     # Where the trail stops, like Location off: that is the
@@ -2110,6 +2149,11 @@ class TrackingViewSet(viewsets.ViewSet):
                 >= QUEUED_THRESHOLD_MINUTES
             )
             if late:
+                # Only what happened on duty. A phone catching up hours after
+                # the engineer logged out is not an outage anybody worked
+                # through.
+                if outage_start is None and not _on_duty_at(sessions, ping.timestamp):
+                    continue
                 if outage_start is None:
                     outage_start = ping
                 outage_end = ping

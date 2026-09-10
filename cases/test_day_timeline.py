@@ -467,6 +467,62 @@ class DarkStretchTests(TestCase):
         self._ping(10, 1, lat=11.001)
         self.assertEqual(self._events("untracked"), [])
 
+    def _duty(self, from_hour, to_hour=None):
+        """A declared duty session, the way Login and Logout write one."""
+        from cases.models import DutySession
+
+        return DutySession.objects.create(
+            engineer=self.engineer,
+            started_at=self._at(from_hour, 0),
+            ended_at=self._at(to_hour, 0) if to_hour is not None else None,
+        )
+
+    def test_nothing_from_before_login_is_on_the_rail(self):
+        """The day starts when they log in.
+
+        An engineer logged in at 11:26, logged out a moment later and came back
+        at seven. The board put "Not tracked - 7h 40m, they moved 48.8 km"
+        across the middle of that -- their own afternoon -- and another
+        engineer's rail carried a Waiting and an eight-hour No network before
+        their Login. Nobody was asking those phones for anything.
+        """
+        self._duty(14, 18)
+        # Moving about, hours before duty.
+        self._ping(9, 0, lat=11.00)
+        self._ping(11, 0, lat=11.40)
+
+        self.assertEqual(self._events("untracked"), [])
+        self.assertEqual(self._events("stop"), [])
+        # And the header count and the map markers say the same thing -- one
+        # list, one rule, or the board contradicts itself.
+        response = self.client.get(
+            f"/api/tracking/day/?engineer={self.engineer.id}&date={self.today}"
+        )
+        payload = response.json()
+        self.assertEqual(payload["stop_count"], 0, payload["stop_count"])
+        self.assertEqual(payload["stops"], [])
+
+    def test_the_same_stretch_inside_duty_is_still_shown(self):
+        self._duty(9, 18)
+        self._ping(9, 30, lat=11.00)
+        self._ping(11, 30, lat=11.40)
+
+        dark = self._events("untracked")
+        self.assertEqual(len(dark), 1, dark)
+
+    def test_an_open_session_counts_up_to_now(self):
+        """Still on duty means still being watched."""
+        self._duty(9)  # no logout yet
+        self._ping(9, 30, lat=11.00)
+        self._ping(11, 30, lat=11.40)
+        self.assertEqual(len(self._events("untracked")), 1)
+
+    def test_a_day_with_no_session_at_all_is_not_hidden(self):
+        """A missing session is a fault to see, not one to bury."""
+        self._ping(9, 0, lat=11.00)
+        self._ping(11, 0, lat=11.40)
+        self.assertEqual(len(self._events("untracked")), 1)
+
     def test_a_moment_of_jitter_is_not_an_entry(self):
         """A phone handing the GPS back in two minutes is not a lost stretch."""
         self._ping(9, 0)
