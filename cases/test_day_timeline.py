@@ -406,6 +406,67 @@ class DarkStretchTests(TestCase):
         back = self._events("network_back")[0]
         self.assertEqual(back["latitude"], 11.40, back)
 
+    def test_a_silence_the_app_never_admitted_to_is_still_shown(self):
+        """An app that is killed flags nothing.
+
+        "Location off" needs the phone to say tracking stopped. Swipe the app
+        away and there is no error to catch -- the fixes simply stop -- so one
+        engineer's day carried a hundred and thirteen minutes of nothing and
+        the board said not a word about it.
+        """
+        self._ping(9, 0, lat=11.00)
+        # Quiet for two hours, and a long way off when it comes back.
+        self._ping(11, 0, lat=11.30)
+
+        dark = self._events("untracked")
+        self.assertEqual(len(dark), 1, dark)
+        self.assertEqual(dark[0]["label"], "Not tracked · 2h")
+        self.assertEqual(dark[0]["minutes"], 120)
+        # How far they had got by the time it came back: the size of what
+        # nothing was watching.
+        self.assertGreater(dark[0]["moved_km"], 30)
+
+    def test_standing_at_a_customer_is_not_called_a_hole(self):
+        """THE one that would make this unusable.
+
+        A parked phone reports nothing either -- it only speaks every ten
+        metres -- so an engineer at a customer for two hours produces exactly
+        the same silence. That is a stop, the board already draws it as
+        Waiting, and calling it "not tracked" would put a red line against
+        every visit anybody makes.
+        """
+        self._ping(9, 0, lat=11.00)
+        self._ping(11, 0, lat=11.00)  # same place, two hours later
+        self.assertEqual(self._events("untracked"), [])
+
+    def test_a_flagged_stretch_is_not_reported_twice(self):
+        """Location off says it better; this must not say it again."""
+        self._ping(9, 0, lat=11.00)
+        self._ping(11, 0, lat=11.30, after_gap=True)
+        self.assertEqual(len(self._events("location_off")), 1)
+        self.assertEqual(self._events("untracked"), [])
+
+    def test_a_short_quiet_moment_is_not_an_entry(self):
+        self._ping(9, 0, lat=11.00)
+        self._ping(9, 2, lat=11.30)  # two minutes, under the floor
+        self.assertEqual(self._events("untracked"), [])
+
+    def test_a_wild_reading_cannot_invent_a_journey(self):
+        """A cold GPS throws one fix a district away.
+
+        Read off the accurate fixes only, so that reading cannot become an
+        hour of untracked travel on somebody's record.
+        """
+        self._ping(9, 0, lat=11.00)
+        wild = LocationPing.objects.create(
+            engineer=self.engineer, latitude=12.5, longitude=78.0, accuracy=400,
+        )
+        LocationPing.objects.filter(pk=wild.pk).update(
+            timestamp=self._at(10, 0), received_at=self._at(10, 0)
+        )
+        self._ping(10, 1, lat=11.001)
+        self.assertEqual(self._events("untracked"), [])
+
     def test_a_moment_of_jitter_is_not_an_entry(self):
         """A phone handing the GPS back in two minutes is not a lost stretch."""
         self._ping(9, 0)

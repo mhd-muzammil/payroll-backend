@@ -176,6 +176,17 @@ def _trail_km(pings):
 # forth, not a stretch anybody lost.
 MIN_DARK_MINUTES = 5
 
+# How far apart the two fixes either side of a silence have to be before that
+# silence is worth an entry.
+#
+# A quiet phone is not news by itself: an engineer standing at a customer for
+# two hours produces no fixes either, because the phone only reports every ten
+# metres of movement -- and the stop detector already draws that as "Waiting".
+# What is worth saying is a silence they came out of somewhere else: they
+# travelled and nothing watched it. Half a kilometre is comfortably past any
+# GPS wander while parked.
+UNTRACKED_MOVE_METERS = 500
+
 # How far from an entry a fix may be and still be called its place. A quarter of
 # an hour of driving is a different town, and "view on map" has to open where
 # the thing happened or not at all.
@@ -2042,6 +2053,49 @@ class TrackingViewSet(viewsets.ViewSet):
                     "minutes": dark,
                     "latitude": current.latitude,
                     "longitude": current.longitude,
+                }
+            )
+
+        # AND THE SILENCES THE APP NEVER ADMITTED TO.
+        #
+        # The entry above needs the phone to have FLAGGED that tracking stopped.
+        # An app that is killed -- swiped off the recents list, or stopped by
+        # the phone to save battery -- flags nothing: there is no error to
+        # catch, the fixes simply stop. Hours could pass with nothing on this
+        # rail at all, which is exactly the case the office cannot explain.
+        #
+        # Only when they came out of it somewhere ELSE. A quiet phone on its own
+        # is an engineer standing still, and the stop detector has already drawn
+        # that as "Waiting"; this is for a stretch they travelled with nothing
+        # watching. Read off the fixes that survive the accuracy filter, so one
+        # wild reading from a cold GPS cannot invent a journey.
+        flagged = {id(ping) for ping in pings if getattr(ping, "after_gap", False)}
+        steady = _usable_pings(pings)
+        for previous, current in zip(steady, steady[1:]):
+            if id(current) in flagged:
+                continue  # already said, and better said, as Location off
+            dark = int((current.timestamp - previous.timestamp).total_seconds() // 60)
+            if dark < MIN_DARK_MINUTES:
+                continue
+            metres = 1000 * haversine_km(
+                previous.latitude, previous.longitude, current.latitude, current.longitude
+            )
+            if metres < UNTRACKED_MOVE_METERS:
+                continue  # they stood still; that is a stop, not a hole
+            events.append(
+                {
+                    # Where the trail stops, like Location off: that is the
+                    # moment somebody is looking for.
+                    "at": previous.timestamp,
+                    "type": "untracked",
+                    "label": f"Not tracked \u00b7 {duration_words(dark)}",
+                    "minutes": dark,
+                    # How far they had moved by the time it came back. The
+                    # kilometres count this straight line -- the least they can
+                    # have travelled -- so this is the size of what is missing.
+                    "moved_km": round(metres / 1000, 1),
+                    "latitude": previous.latitude,
+                    "longitude": previous.longitude,
                 }
             )
 
