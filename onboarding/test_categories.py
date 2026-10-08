@@ -50,13 +50,17 @@ class OnboardingCategoryTests(APITestCase):
 
     # --------------------------------------------------------------- employees
 
-    def test_an_employee_still_needs_their_department_and_joining_date(self):
+    def test_an_employee_saves_without_department_or_joining_date(self):
+        """Nothing is compulsory: whatever somebody has, they fill in."""
         response = self.client.post(
             self.url, self._payload(category="Employee", designation="Engineer"), format="multipart"
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("department", response.data)
-        self.assertIn("date_of_joining", response.data)
+        self.assertEqual(response.status_code, 201, response.data)
+
+    def test_a_completely_blank_form_still_saves(self):
+        response = self.client.post(self.url, {"category": "Employee"}, format="multipart")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["employee_name"], "")
 
     def test_a_complete_employee_saves(self):
         response = self.client.post(
@@ -98,12 +102,11 @@ class OnboardingCategoryTests(APITestCase):
 
     # ----------------------------------------------------------------- vendors
 
-    def test_a_vendor_without_the_name_of_the_firm_is_refused(self):
+    def test_a_vendor_saves_without_the_name_of_the_firm(self):
         response = self.client.post(
             self.url, self._payload(category="Vendor"), format="multipart"
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("company_name", response.data)
+        self.assertEqual(response.status_code, 201, response.data)
 
     def test_a_vendor_saves_with_the_firm_and_its_gst(self):
         response = self.client.post(
@@ -155,7 +158,7 @@ class OnboardingCategoryTests(APITestCase):
         self.assertEqual(response.data["rate_amount"], "900.00")
         self.assertEqual(response.data["category"], "Freelancer", "and it stays a freelancer")
 
-    def test_editing_an_employee_still_cannot_empty_their_department(self):
+    def test_editing_an_employee_can_clear_a_field(self):
         created = self.client.post(
             self.url,
             self._payload(
@@ -168,5 +171,5 @@ class OnboardingCategoryTests(APITestCase):
         response = self.client.patch(
             f"{self.url}{created.data['id']}/", {"department": ""}, format="multipart"
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("department", response.data)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["department"], "")

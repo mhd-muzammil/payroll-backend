@@ -365,6 +365,31 @@ def _employee_status_for(employment_status):
 @receiver(post_save, sender=Onboarding)
 def sync_onboarding_to_employee(sender, instance, created, **kwargs):
     """Automatically connects or creates corresponding Employee record upon Onboarding save."""
+    # NOT EVERY ONBOARDING IS AN EMPLOYEE, AND NOT EVERY ONE HAS BEEN READ.
+    #
+    # Everything below matches the form against EXISTING employees -- by
+    # email, by employee code, by phone, by name -- and writes the form over
+    # whoever it finds: their name, phone, department, branch and status, and
+    # the login attached to them. That is right for a record the office has
+    # typed. It is not right for either of these:
+    #
+    #   * a freelancer or a vendor. They are not staff: no Employee row, no
+    #     place in attendance or payroll, and no login with role "employee";
+    #
+    #   * a form that arrived through the public link and is still Pending
+    #     Review. Somebody nobody here has met typed it, without logging in.
+    #     Let this run on it and anybody holding the link could type a working
+    #     engineer's email and rename them, re-number their phone and switch
+    #     them to Inactive -- before the office has even seen the form.
+    #
+    # Nothing is provisioned or touched until the office accepts it. Accepting
+    # moves it out of Pending Review, and from then on it is an ordinary record
+    # and this runs exactly as it always has.
+    if (instance.category or "Employee") != "Employee":
+        return
+    if instance.status == "Pending Review":
+        return
+
     from employees.models import Employee
     from decimal import Decimal
     from django.db import IntegrityError, transaction

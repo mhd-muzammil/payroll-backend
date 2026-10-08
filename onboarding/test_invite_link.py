@@ -111,13 +111,17 @@ class PublicOnboardingLinkTests(APITestCase):
         # And the authenticated list is still shut.
         self.assertIn(self.client.get("/api/onboarding/").status_code, (401, 403))
 
-    def test_a_vendor_link_still_needs_the_name_of_the_firm(self):
+    def test_a_vendor_link_takes_whatever_was_filled_in(self):
         vendor_invite = OnboardingInvite.objects.create(category="Vendor")
         response = self.client.post(
             f"/api/onboard/{vendor_invite.token}/", self._form(), format="multipart"
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("company_name", response.data)
+        self.assertEqual(response.status_code, 201, response.data)
+
+    def test_a_link_takes_an_almost_empty_form(self):
+        """A joiner sends what they have; the office reads it and fills the rest."""
+        response = self.client.post(self.url, {"employee_name": "Just A Name"}, format="multipart")
+        self.assertEqual(response.status_code, 201, response.data)
 
 
 @override_settings(REST_FRAMEWORK={**NO_THROTTLE})
