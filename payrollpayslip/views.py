@@ -1,3 +1,4 @@
+from html import escape as html_escape
 from django.db.models import Q, Sum
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -1066,7 +1067,7 @@ class PayslipViewSet(viewsets.ModelViewSet):
                     <p style="margin: 5px 0 0 0; color: #6b7280; font-size: 14px; font-weight: bold; letter-spacing: 0.5px;">SALARY PAYSLIP ADVICE</p>
                 </div>
                 
-                <p>Dear <strong>{emp.employee_name}</strong>,</p>
+                <p>Dear <strong>{html_escape(emp.employee_name or "")}</strong>,</p>
                 <p>Your payslip for the month of <strong>{period_str}</strong> has been generated. Please find the details of your earnings and deductions below:</p>
                 
                 <table style="width: 100%; border-collapse: collapse; margin: 20px 0; border: 1px solid #e5e7eb;">

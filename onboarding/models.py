@@ -150,6 +150,82 @@ class Onboarding(models.Model):
         return f"{self.employee_name} ({self.employment_status})"
 
 
+def trusted_onboarding_rows():
+    """Onboarding rows that are allowed to speak for an employee.
+
+    An employee's, and one the office has accepted. A form still Pending Review
+    was typed by somebody nobody here has met, through a link with no login;
+    a freelancer's or a vendor's is not about an employee at all. Neither may
+    be the source of anybody's bank account.
+
+    Oldest first, which is the order the lookups always used: the genuine row
+    that has been on file the longest is the one that answers.
+    """
+    return (
+        Onboarding.objects.filter(category="Employee")
+        .exclude(status="Pending Review")
+        .order_by("id")
+    )
+
+
+def onboarding_record_for(employee):
+    """The onboarding row whose bank and personal details belong to this employee.
+
+    Email first, because it is unique and reliable; then the employee code
+    within the employee's branch, because codes repeat across branches. Only
+    trusted rows are considered -- see trusted_onboarding_rows. This is the ONE
+    place the lookup lives: the Employees API and the payslip PDF used to carry
+    a copy each, and both copies read unreviewed link forms, which let a
+    stranger's bank account appear on a working engineer's payslip.
+    """
+    rows = trusted_onboarding_rows()
+    if employee.email:
+        record = rows.filter(email_id__iexact=employee.email).first()
+        if record:
+            return record
+    if employee.emp_code:
+        qs = rows.filter(employee_id=employee.emp_code)
+        if employee.branch:
+            qs = qs.filter(work_location__iexact=employee.branch)
+        return qs.first()
+    return None
+
+
+VALID_BRANCHES = ('Chennai', 'Vellore', 'Salem', 'Kanchipuram', 'Hosur')
+
+
+def branch_named_in(location):
+    """The branch a work location names, or None when it names none."""
+    loc = (location or "").strip().lower()
+    return next((b for b in VALID_BRANCHES if b.lower() == loc), None)
+
+
+def employee_already_holding(email=None, phone=None, emp_code=None, location=None):
+    """The existing employee whose identity a form would take over, if any.
+
+    Email and phone are unique on Employee, so either one is a definite match.
+    An employee code is only unique within a branch, so it is matched within
+    the branch the form names -- or not at all when it names none.
+    """
+    from employees.models import Employee
+
+    email = (email or "").strip()
+    phone = (phone or "").strip()
+    code = (emp_code or "").strip()
+    if email:
+        found = Employee.objects.filter(email__iexact=email).first()
+        if found:
+            return found
+    if phone:
+        found = Employee.objects.filter(phone=phone).first()
+        if found:
+            return found
+    branch = branch_named_in(location)
+    if code and branch:
+        return Employee.objects.filter(emp_code=code, branch=branch).first()
+    return None
+
+
 class OnboardingInvite(models.Model):
     """The shareable link for one kind of form.
 
@@ -390,17 +466,32 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
     if instance.status == "Pending Review":
         return
 
+    # A NAME IS NOT AN IDENTITY.
+    #
+    # Nothing on the form is compulsory now, so a record can arrive with a name
+    # and nothing else -- or with nothing at all. Without something to tell
+    # this person apart, everything below goes wrong in one of two ways: it
+    # finds nobody and creates a fresh "New Employee" with a working login on
+    # EVERY save, or it finds somebody who shares the name -- a relieved
+    # namesake included -- writes the form over them and reopens their login.
+    # Nothing is provisioned until the record carries one of the three that
+    # can: email, phone or employee code. Adding one later and saving is enough.
+    if not any(
+        (value or "").strip()
+        for value in (instance.email_id, instance.mobile_number, instance.employee_id)
+    ):
+        return
+
     from employees.models import Employee
     from decimal import Decimal
     from django.db import IntegrityError, transaction
 
-    valid_branches = ['Chennai', 'Vellore', 'Salem', 'Kanchipuram', 'Hosur']
-    branch_name = 'Chennai'
-    if instance.work_location:
-        loc = instance.work_location.strip()
-        matched = next((b for b in valid_branches if b.lower() == loc.lower()), None)
-        if matched:
-            branch_name = matched
+    # The branch the form actually names, or None. A new employee still lands
+    # in Chennai when it names none, as before -- but an EXISTING employee is
+    # only moved when the form names somewhere: a blank location used to send
+    # whoever it matched to Chennai.
+    location_branch = branch_named_in(instance.work_location)
+    branch_name = location_branch or 'Chennai'
 
     # Try to find existing employee by email, emp_code, phone, or name.
     # matched_by_identity is True only for the reliable keys (email/code/phone);
@@ -449,8 +540,8 @@ def sync_onboarding_to_employee(sender, instance, created, **kwargs):
             emp.department = instance.department.strip()
         if instance.designation and instance.designation.strip():
             emp.role = instance.designation.strip()
-        if branch_name:
-            emp.branch = branch_name
+        if location_branch:
+            emp.branch = location_branch
         if instance.date_of_joining:
             emp.date_of_joining = instance.date_of_joining
         # Follow the onboarding record. This used to be hardcoded to 'active',

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from .models import Employee
-from onboarding.models import Onboarding
+from onboarding.models import onboarding_record_for
 
 class EmployeeSerializer(serializers.ModelSerializer):
     dob = serializers.SerializerMethodField()
@@ -15,19 +15,10 @@ class EmployeeSerializer(serializers.ModelSerializer):
         if not hasattr(self, '_onboarding_cache'):
             self._onboarding_cache = {}
         if obj.id not in self._onboarding_cache:
-            onboarding = None
-            # Match on email first (unique, reliable). Only then fall back to
-            # emp_code qualified by branch, since emp_code is NOT globally
-            # unique. The old name-only fuzzy match leaked another employee's
-            # bank/PII and has been removed.
-            if obj.email:
-                onboarding = Onboarding.objects.filter(email_id__iexact=obj.email).first()
-            if not onboarding and obj.emp_code:
-                qs = Onboarding.objects.filter(employee_id=obj.emp_code)
-                if obj.branch:
-                    qs = qs.filter(work_location__iexact=obj.branch)
-                onboarding = qs.first()
-            self._onboarding_cache[obj.id] = onboarding
+            # Accepted employee rows only -- see onboarding_record_for. Reading
+            # any row with a matching email let a stranger's link form put their
+            # own bank account on a working engineer's record.
+            self._onboarding_cache[obj.id] = onboarding_record_for(obj)
         return self._onboarding_cache[obj.id]
 
     def get_dob(self, obj):

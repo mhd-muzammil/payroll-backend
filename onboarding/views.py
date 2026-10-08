@@ -127,7 +127,10 @@ class PublicOnboardingView(APIView):
     def post(self, request, token):
         invite = self._invite(token)
 
-        data = request.data.copy()
+        # A plain dict, not request.data.copy(). That copy is a DEEP copy, and
+        # an upload over 2 MB is a temporary file on disk that cannot be deep
+        # copied -- every phone photo of an Aadhaar came back as a 500.
+        data = {key: request.data.get(key) for key in request.data}
         # THE LINK DECIDES THESE, NOT THE BROWSER. Whatever was sent for them
         # is dropped: otherwise a freelancer's link would file an employee, and
         # a self-filled form would arrive already approved and working here.

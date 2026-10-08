@@ -95,21 +95,13 @@ def mask_account(number):
 def _onboarding_for(employee):
     """The bank / DOB details, which live on Onboarding rather than Employee.
 
-    Matched the same way EmployeeSerializer matches them: email first because
-    it is unique and reliable, then emp_code qualified by branch, because
-    emp_code is not unique across branches.
+    The same lookup EmployeeSerializer uses, now literally the same function,
+    so the PDF and the screen cannot disagree about whose bank account this is
+    -- and an unreviewed link form can never be the answer.
     """
-    from onboarding.models import Onboarding
+    from onboarding.models import onboarding_record_for
 
-    record = None
-    if employee.email:
-        record = Onboarding.objects.filter(email_id__iexact=employee.email).first()
-    if not record and employee.emp_code:
-        qs = Onboarding.objects.filter(employee_id=employee.emp_code)
-        if employee.branch:
-            qs = qs.filter(work_location__iexact=employee.branch)
-        record = qs.first()
-    return record
+    return onboarding_record_for(employee)
 
 
 def _leave_grid(cl_value):

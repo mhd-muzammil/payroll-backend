@@ -5,7 +5,7 @@ from django.conf import settings
 from django.urls import reverse
 from rest_framework import serializers
 
-from .models import Onboarding, Candidate
+from .models import Onboarding, Candidate, employee_already_holding
 
 
 DOCUMENT_FIELDS = (
@@ -163,6 +163,38 @@ class OnboardingSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"contract_end": "The contract cannot end before it starts."}
             )
+
+        # ACCEPTING A LINK FORM INTO SOMEBODY WHO IS ALREADY HERE.
+        #
+        # Accepting runs the employee sync, which writes the form over whoever
+        # it matches -- and a stranger chose every identity field on it. If the
+        # email, phone or code already belongs to an employee, that employee
+        # would be renamed, re-numbered and handed a new login by one click.
+        # The office used to be told to check first; that is not a control. It
+        # is refused here, naming who it would have hit, and the decision is
+        # made with that in front of somebody.
+        accepting = (
+            self.instance is not None
+            and self.instance.status == "Pending Review"
+            and attrs.get("status", "Pending Review") != "Pending Review"
+        )
+        if accepting and value("category") in (None, "", "Employee"):
+            holder = employee_already_holding(
+                email=value("email_id"),
+                phone=value("mobile_number"),
+                emp_code=value("employee_id"),
+                location=value("work_location"),
+            )
+            if holder:
+                raise serializers.ValidationError({
+                    "status": (
+                        f"This form's email, phone or employee code already belongs to "
+                        f"{holder.employee_name or 'an existing employee'} (employee #{holder.pk}). "
+                        "Accepting it would write the form over their record and their login. "
+                        "If it is the same person, update them from the Employees page and delete "
+                        "this form; if not, correct the form first."
+                    )
+                })
         return attrs
 
 
