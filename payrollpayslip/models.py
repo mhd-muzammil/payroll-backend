@@ -75,6 +75,25 @@ class Payslip(models.Model):
     employer_insurance = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     petrol_allowance = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     
+    # THIS MONTH'S AMOUNTS, as the office set them on this slip.
+    #
+    # Keys are the request names in views.MONTHLY_AMOUNTS (incentive,
+    # other_earnings, staff_advance, tds, insurance, other_deduction), values
+    # decimal strings. Kept so that editing a day count afterwards re-runs the
+    # sums WITH them rather than over them. Empty means the slip is exactly
+    # what the employee's structure produces. Undo Edits and Regenerate clear it.
+    # Nullable on purpose: a NOT NULL column with no database default turns a
+    # code rollback into every payslip INSERT failing. Read it as `or {}`.
+    manual_overrides = models.JSONField(default=dict, blank=True, null=True)
+
+    # THE SALARY STRUCTURE THIS SLIP WAS PRICED WITH -- the twenty employee
+    # figures compute_payslip_fields reads, as they stood when the slip was
+    # generated. Every edit re-prices from this, never from the employee, so a
+    # raise given in October does not quietly re-price August the next time
+    # somebody corrects August's TDS. Only Generate reads the employee and
+    # writes this. Empty on slips generated before it existed.
+    structure = models.JSONField(default=dict, blank=True, null=True)
+
     # Net Take Home Salary
     net_salary = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Generated')

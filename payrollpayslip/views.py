@@ -58,13 +58,65 @@ from .serializer import PayslipSerializer, BranchFinancialSerializer
 from employees.models import Employee, Performance
 from attendance.models import Attendance
 from authentication.models import get_allowed_branches
+from authentication.permissions import IsHRStaff
 
 def _q(val):
     """Round a Decimal value to two decimal places (bankers-safe half-up)."""
     return Decimal(val).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
-def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=None, off_days=0, casual_leave_days=0, special_work_days=0):
+# The amounts the office may set on ONE month's slip -- the ones that really
+# do move from month to month. Request key -> the field it decides.
+#
+# Earnings replace what the month EARNED, not the structure's gross: an
+# incentive of 2,000 this month is 2,000 paid, whatever the days were, the
+# same way special work and casual leave are paid as their own lines.
+# Deductions replace the flat monthly figure the structure would take.
+MONTHLY_AMOUNTS = {
+    "incentive": "earned_incentive",
+    "other_earnings": "earned_other_earnings",
+    "staff_advance": "deduction_staff_advance",
+    "tds": "deduction_tds",
+    "insurance": "deduction_insurance",
+    "other_deduction": "deduction_other",
+}
+
+
+# Every figure compute_payslip_fields reads off the employee. Listed, rather
+# than "whatever the employee has", so a snapshot can never silently miss one.
+STRUCTURE_FIELDS = (
+    "salary", "basic", "hra", "conveyance", "child_edu", "personal_allowance",
+    "incentive", "other_earnings",
+    "epf", "esi", "prof_tax", "lwf", "staff_advance", "tds", "other_deduction",
+    "deduction_insurance",
+    "employer_epf", "employer_esi", "employer_insurance", "petrol_allowance",
+)
+
+
+def structure_of(emp):
+    """The employee's salary structure as it stands, for keeping on a slip."""
+    return {name: str(getattr(emp, name) or 0) for name in STRUCTURE_FIELDS}
+
+
+class _Structure:
+    """A stored structure, shaped like the employee compute_payslip_fields reads."""
+
+    def __init__(self, stored):
+        for name in STRUCTURE_FIELDS:
+            setattr(self, name, Decimal(str(stored.get(name) or 0)))
+
+
+# The earnings side of a structure, as a slip stores it. Used to tell whether a
+# slip generated before snapshots existed was priced with the structure the
+# employee has now.
+_GROSS_FIELDS = (
+    "gross_basic", "gross_hra", "gross_conveyance", "gross_child_edu",
+    "gross_personal_allowance", "gross_incentive", "gross_other_earnings",
+    "gross_salary",
+)
+
+
+def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=None, off_days=0, casual_leave_days=0, special_work_days=0, overrides=None):
     """Compute every earnings/deduction/net field for one employee given the
     period length, LOP (loss-of-pay) days and paid off-days.
 
@@ -86,6 +138,10 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
     pay out a year.
     `other_deduction_override`, when not None, replaces the "Other Deduction"
     line with an operator-supplied amount (the rest of the math is unchanged).
+    `overrides` sets this month's amounts -- see MONTHLY_AMOUNTS. An earning
+    replaces what was earned and moves gross earnings by the difference, so the
+    components still add up to the total; a deduction replaces its line. Totals
+    and net are always recomputed here, never taken from anybody.
 
     Returns the `defaults` dict used by update_or_create (minus `status`).
     """
@@ -195,6 +251,27 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         if earned_personal < Decimal('0.00'):
             earned_personal = Decimal('0.00')
 
+    # 4b. This month's earnings, as the office set them.
+    #
+    # Applied AFTER personal allowance has been worked out as the balancing
+    # figure. Before it, the balance would simply absorb the change and the net
+    # would not move -- an incentive typed in and not paid. After it, gross
+    # earnings moves by exactly the difference, and the components still add up
+    # to it.
+    monthly = {}
+    for key, value in (overrides or {}).items():
+        if key in MONTHLY_AMOUNTS and value not in (None, ""):
+            monthly[key] = _q(Decimal(str(value)))
+    if other_deduction_override is not None:
+        monthly["other_deduction"] = _q(other_deduction_override)
+
+    if "incentive" in monthly:
+        gross_earnings += monthly["incentive"] - earned_incentive
+        earned_incentive = monthly["incentive"]
+    if "other_earnings" in monthly:
+        gross_earnings += monthly["other_earnings"] - earned_other_earnings
+        earned_other_earnings = monthly["other_earnings"]
+
     # 5. Deductions
     if emp.basic > Decimal('0.00'):
         deduction_epf = q(emp.epf * multiplier)
@@ -230,9 +307,15 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         employer_insurance = Decimal('0.00')
         petrol_allowance = Decimal('0.00')
 
-    # Optional manual override of the "Other Deduction" line.
-    if other_deduction_override is not None:
-        deduction_other = q(other_deduction_override)
+    # This month's deductions, as the office set them.
+    if "staff_advance" in monthly:
+        deduction_staff_advance = monthly["staff_advance"]
+    if "tds" in monthly:
+        deduction_tds = monthly["tds"]
+    if "insurance" in monthly:
+        deduction_insurance = monthly["insurance"]
+    if "other_deduction" in monthly:
+        deduction_other = monthly["other_deduction"]
 
     gross_deductions = deduction_epf + deduction_esi + deduction_prof_tax + deduction_lwf + deduction_staff_advance + deduction_tds + deduction_other + deduction_insurance
 
@@ -301,9 +384,29 @@ class PayslipViewSet(viewsets.ModelViewSet):
     serializer_class = PayslipSerializer
     permission_classes = [IsAuthenticated]
 
+    # WHAT ONLY THE OFFICE MAY DO.
+    #
+    # None of these checked the role. The buttons are hidden from employees,
+    # and that was the only thing stopping one: with their own token an
+    # employee could add special-work days to their own slip and be paid for
+    # them, mark it Paid, delete it, or regenerate the whole company's payroll
+    # -- wiping every manual edit and un-paying every Paid slip. Reading stays
+    # as it was: an employee still lists and downloads their own released slips.
+    OFFICE_ONLY_ACTIONS = {
+        "create", "update", "partial_update", "destroy",
+        "generate_all", "recalculate", "revert", "email_payslip", "send",
+    }
+
+    def get_permissions(self):
+        if self.action in self.OFFICE_ONLY_ACTIONS:
+            return [IsAuthenticated(), IsHRStaff()]
+        return super().get_permissions()
+
     def get_queryset(self):
         user = self.request.user
-        queryset = Payslip.objects.all().order_by("-year", "-month", "-id")
+        # The employee in the same query: the list is every slip in scope, and
+        # it was fetching each one's employee separately.
+        queryset = Payslip.objects.select_related("employee").order_by("-year", "-month", "-id")
         role = "superadmin" if user.is_superuser else getattr(user, 'role', 'employee')
         if role == "employee":
             queryset = queryset.filter(employee__user=user)
@@ -431,8 +534,26 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 
         created_count = 0
         updated_count = 0
+        skipped_paid = 0
+
+        # A PAID SLIP IS A RECORD OF WHAT WAS PAID. Recalculate and revert have
+        # always refused one; this rewrote it -- status back to Generated, every
+        # figure recomputed, and the record of what actually went out gone.
+        paid = set(
+            Payslip.objects.filter(
+                employee__in=active_employees, month=month, year=year, status="Paid"
+            ).values_list("employee_id", flat=True)
+        )
+        if employee_id and paid:
+            return Response(
+                {"error": "This payslip is already marked Paid and cannot be regenerated."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         for emp in active_employees:
+            if emp.id in paid:
+                skipped_paid += 1
+                continue
             # 2. Calculate LOP days based on Attendance Table within the range
             lop_days = Decimal(Attendance.objects.filter(
                 employee=emp,
@@ -455,6 +576,12 @@ class PayslipViewSet(viewsets.ModelViewSet):
             # 3-6. All earnings/deductions/net math lives in one shared helper.
             defaults = compute_payslip_fields(emp, total_days, lop_days, casual_leave_days=cl_apply)
             defaults['status'] = 'Generated'
+            # Regenerate means start over, and this month's hand-set amounts go
+            # with the rest of the manual edits -- as special work always has.
+            defaults['manual_overrides'] = {}
+            # And it is the one place the employee's CURRENT structure is read:
+            # keep it, so every later edit to this slip re-prices from it.
+            defaults['structure'] = structure_of(emp)
 
             # Save / Update Record
             payslip, created = Payslip.objects.update_or_create(
@@ -471,11 +598,17 @@ class PayslipViewSet(viewsets.ModelViewSet):
 
         emp_name = active_employees.first().employee_name if (employee_id and active_employees.exists()) else None
         msg_detail = f"Processed slip for {emp_name} for {month}/{year}." if emp_name else f"Processed slips for {month}/{year} with pro-rated structural logic."
+        if skipped_paid:
+            if skipped_paid == 1:
+                msg_detail += " 1 slip already marked Paid was left as it was."
+            else:
+                msg_detail += f" {skipped_paid} slips already marked Paid were left as they were."
 
         return Response({
             "message": msg_detail,
             "created": created_count,
-            "updated": updated_count
+            "updated": updated_count,
+            "skipped_paid": skipped_paid,
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'])
@@ -521,6 +654,12 @@ class PayslipViewSet(viewsets.ModelViewSet):
             if total_days <= 0:
                 return Response({"error": "total_days must be greater than 0."},
                                 status=status.HTTP_400_BAD_REQUEST)
+            # A cycle is a whole number of days. 30.5 used to be priced over
+            # 30.5 days and stored as 30, so the slip could no longer reproduce
+            # its own net and the next unrelated edit moved it.
+            if total_days != total_days.to_integral_value():
+                return Response({"error": "total_days must be a whole number of days."},
+                                status=status.HTTP_400_BAD_REQUEST)
 
             # Off days (paid weekly-offs/holidays) default to the slip's current value.
             if request.data.get('off_days') is not None:
@@ -553,15 +692,28 @@ class PayslipViewSet(viewsets.ModelViewSet):
             # Re-deriving is safe to repeat: casual_leave_available() excludes
             # this month's own casual_leave_used from the year's tally, so
             # saving the same slip twice cannot spend the balance twice.
+            #
+            # Worked out again ONLY WHEN THE LOP ACTUALLY CHANGES -- which is the
+            # case above, HR typing the real LOP in. On any other edit it is
+            # carried forward exactly as it stands, the way special work is.
+            # Re-deriving on every edit is how casual leave came back: a
+            # Paid-days edit drops it, and the next edit to the TDS paid the day
+            # again, so a 100 deduction raised the net by 900.
+            lop_changed = (
+                request.data.get('lop_days') is not None
+                and _q(lop_days) != _q(Decimal(payslip.lop_days or 0))
+            )
             if request.data.get('paid_days') is not None:
                 cl_days = Decimal(0)
             elif request.data.get('casual_leave_used') is not None:
                 cl_days = to_decimal(request.data.get('casual_leave_used'), 'casual_leave_used')
-            else:
+            elif lop_changed:
                 cl_days = min(
                     casual_leave_available(payslip.employee, payslip.year, payslip.month),
                     max(lop_days, Decimal(0)),
                 )
+            else:
+                cl_days = Decimal(payslip.casual_leave_used or 0)
 
             # Special work stands on its own: it is not derived from anything,
             # so an edit to any other box must carry it forward untouched rather
@@ -571,13 +723,19 @@ class PayslipViewSet(viewsets.ModelViewSet):
             else:
                 special_days = Decimal(payslip.special_work_days or 0)
 
-            # Optional other-deduction override.
-            other_override = None
-            if request.data.get('other_deduction') is not None:
-                other_override = to_decimal(request.data.get('other_deduction'), 'other_deduction')
-                if other_override < 0:
-                    return Response({"error": "other_deduction cannot be negative."},
-                                    status=status.HTTP_400_BAD_REQUEST)
+            # THIS MONTH'S AMOUNTS -- what is already set on the slip, plus
+            # whatever this request changes. Kept on the slip, so the next edit
+            # to a day count re-runs the sums WITH them. Other Deduction used to
+            # be applied only on the request that carried it: set it, fix the
+            # LOP a minute later, and it was gone.
+            overrides = dict(payslip.manual_overrides or {})
+            for key in MONTHLY_AMOUNTS:
+                if request.data.get(key) is not None:
+                    amount = to_decimal(request.data.get(key), key)
+                    if amount < 0:
+                        return Response({"error": f"{key} cannot be negative."},
+                                        status=status.HTTP_400_BAD_REQUEST)
+                    overrides[key] = str(_q(amount))
         except ValueError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -597,15 +755,53 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Every day count at the two places it is stored at, BEFORE it is
+        # priced -- so the figures on the slip are exactly the ones its net was
+        # worked out from, and the next edit cannot move the net by itself.
+        lop_days, off_days, cl_days, special_days = (
+            _q(lop_days), _q(off_days), _q(cl_days), _q(special_days)
+        )
+
+        # WHICH STRUCTURE TO PRICE WITH: the one the slip was generated with,
+        # never the employee's today. A slip from before snapshots were kept
+        # has none; it is priced with the employee's structure only if that
+        # still matches the gross figures the slip itself recorded. If it does
+        # not, the edit would re-price the whole month at a salary it was never
+        # paid at -- refused, and the office decides by regenerating.
+        if payslip.structure:
+            priced_with = _Structure(payslip.structure)
+        else:
+            current = compute_payslip_fields(payslip.employee, total_days, Decimal(0))
+            drifted = [
+                name for name in _GROSS_FIELDS
+                if _q(Decimal(str(getattr(payslip, name) or 0))) != _q(current[name])
+            ]
+            if drifted:
+                return Response(
+                    {"error": (
+                        "This employee's salary structure has changed since this payslip was "
+                        "generated, so editing it would re-price the whole month at the new "
+                        "salary. Regenerate the payslip if the new salary should apply to this "
+                        "month; otherwise leave it as it is."
+                    )},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            priced_with = payslip.employee
+
         defaults = compute_payslip_fields(
-            payslip.employee, total_days, lop_days,
-            other_deduction_override=other_override,
+            priced_with, total_days, lop_days,
             off_days=off_days,
             casual_leave_days=cl_days,
             special_work_days=special_days,
+            overrides=overrides,
         )
         for field, value in defaults.items():
             setattr(payslip, field, value)
+        payslip.manual_overrides = overrides
+        if not payslip.structure:
+            # Priced with the employee's structure because it still matched;
+            # keep it now, so it cannot drift under this slip from here on.
+            payslip.structure = structure_of(payslip.employee)
         payslip.save()
 
         serializer = self.get_serializer(payslip)
@@ -661,14 +857,20 @@ class PayslipViewSet(viewsets.ModelViewSet):
         # rest of them: the button promises the slip as generation left it, and
         # generation never puts special work on a slip. Keeping it made Undo
         # look like it had not worked.
+        # Undo Edits goes back to the slip as it was GENERATED -- its own
+        # structure, not one the employee has been given since. Applying a new
+        # salary to an old month is what Regenerate is for.
         defaults = compute_payslip_fields(
-            payslip.employee, total_days, lop_days,
+            _Structure(payslip.structure) if payslip.structure else payslip.employee,
+            total_days, lop_days,
             casual_leave_days=cl_apply,
             special_work_days=Decimal(0),
         )
         defaults['status'] = 'Generated'
         for field, value in defaults.items():
             setattr(payslip, field, value)
+        # Undo Edits undoes this month's hand-set amounts with the rest.
+        payslip.manual_overrides = {}
         payslip.save()
 
         serializer = self.get_serializer(payslip)
@@ -1222,7 +1424,11 @@ class PayslipViewSet(viewsets.ModelViewSet):
 class BranchFinancialViewSet(viewsets.ModelViewSet):
     queryset = BranchFinancial.objects.all()
     serializer_class = BranchFinancialSerializer
-    permission_classes = [IsAuthenticated]
+    # OFFICE ONLY. Any login could create, change or delete a branch's revenue
+    # and expenses here -- the figures the P&L is built from -- because only
+    # the Payroll page's hidden buttons stood in the way. The same hole the
+    # payslip actions had; only the office uses this.
+    permission_classes = [IsAuthenticated, IsHRStaff]
 
     def get_queryset(self):
         queryset = super().get_queryset()
