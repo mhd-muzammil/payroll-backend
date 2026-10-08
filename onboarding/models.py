@@ -1,15 +1,67 @@
 from django.db import models
 
 class Onboarding(models.Model):
+    # WHO this record is about.
+    #
+    # An employee, a freelancer we pay by the job, and a vendor we buy work
+    # from are three different relationships, and all three were being put
+    # through the employee's form. One record type still -- they share who to
+    # ring, where they work, the bank details and the documents on file, and
+    # the office looks at one list -- with the parts that are not shared in
+    # their own fields below.
+    CATEGORY_CHOICES = (
+        ('Employee', 'Employee'),
+        ('Freelancer', 'Freelancer'),
+        ('Vendor', 'Vendor'),
+    )
+    category = models.CharField(
+        max_length=20,
+        choices=CATEGORY_CHOICES,
+        default='Employee',
+        db_index=True,
+    )
+
     # 1. Basic Details
     employee_name = models.CharField(max_length=255)
     employee_id = models.CharField(max_length=50, blank=True, null=True)
-    department = models.CharField(max_length=100)
-    designation = models.CharField(max_length=100)
+    # An employee's facts, not everybody's: a vendor has no department, no
+    # designation and no date of joining -- they have a contract that starts.
+    # The employee form still asks for all three.
+    department = models.CharField(max_length=100, blank=True, null=True)
+    designation = models.CharField(max_length=100, blank=True, null=True)
     work_location = models.CharField(max_length=100)
-    date_of_joining = models.DateField()
+    date_of_joining = models.DateField(blank=True, null=True)
     mobile_number = models.CharField(max_length=20)
     email_id = models.EmailField()
+
+    # 1b. A vendor is a firm, not a person. The person's name still goes in
+    # employee_name -- it is who you ring -- and the firm goes here.
+    company_name = models.CharField(max_length=255, blank=True, null=True)
+    gst_number = models.CharField(max_length=30, blank=True, null=True)
+    contact_person_role = models.CharField(max_length=100, blank=True, null=True)
+    service_type = models.CharField(max_length=255, blank=True, null=True)
+
+    # 1c. What the work costs and how long the arrangement runs. Freelancers
+    # and vendors are paid per job or per contract rather than by the month,
+    # and an engagement with no end date is an open one, not a missing one.
+    RATE_TYPE_CHOICES = (
+        ('Per case', 'Per case'),
+        ('Per day', 'Per day'),
+        ('Per hour', 'Per hour'),
+        ('Monthly', 'Monthly'),
+        ('Per job quote', 'Per job quote'),
+    )
+    rate_type = models.CharField(
+        max_length=20, choices=RATE_TYPE_CHOICES, blank=True, null=True
+    )
+    rate_amount = models.DecimalField(
+        max_digits=10, decimal_places=2, blank=True, null=True
+    )
+    contract_start = models.DateField(blank=True, null=True)
+    contract_end = models.DateField(blank=True, null=True)
+    agreement = models.FileField(
+        upload_to='onboarding_docs/agreement/', blank=True, null=True
+    )
 
     # 2. Personal Details
     dob = models.DateField(null=True, blank=True)

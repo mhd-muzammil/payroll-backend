@@ -9,6 +9,7 @@ from .models import Onboarding, Candidate
 
 
 DOCUMENT_FIELDS = (
+    "agreement",
     "cancelled_cheque",
     "doc_aadhaar",
     "doc_pan",
@@ -97,6 +98,9 @@ class ProtectedDocumentField(serializers.FileField):
 
 
 class OnboardingSerializer(serializers.ModelSerializer):
+    agreement = ProtectedDocumentField(
+        required=False, allow_null=True, validators=[validate_employee_document]
+    )
     cancelled_cheque = ProtectedDocumentField(
         required=False, allow_null=True, validators=[validate_employee_document]
     )
@@ -125,6 +129,45 @@ class OnboardingSerializer(serializers.ModelSerializer):
     class Meta:
         model = Onboarding
         fields = '__all__'
+
+    def validate(self, attrs):
+        """What each kind of record cannot be saved without.
+
+        The model loosened department, designation and date of joining because
+        they are an employee's facts and not a vendor's. Loosened for everyone
+        is not what was meant, so the rule is restored here per category --
+        where it can say WHY, and where a vendor saved without the name of the
+        firm is caught at the door rather than turning up as a blank in the
+        list a month later.
+        """
+        category = attrs.get("category") or getattr(self.instance, "category", "Employee")
+        # A PATCH carries only what changed, so anything absent is read off the
+        # record as it stands.
+        def value(name):
+            if name in attrs:
+                return attrs[name]
+            return getattr(self.instance, name, None)
+
+        missing = {}
+        if category == "Employee":
+            for field, label in (
+                ("department", "Department"),
+                ("designation", "Designation"),
+                ("date_of_joining", "Date of joining"),
+            ):
+                if not value(field):
+                    missing[field] = f"{label} is needed for an employee."
+        elif category == "Vendor":
+            if not value("company_name"):
+                missing["company_name"] = "A vendor needs the name of the firm."
+
+        start, end = value("contract_start"), value("contract_end")
+        if start and end and end < start:
+            missing["contract_end"] = "The contract cannot end before it starts."
+
+        if missing:
+            raise serializers.ValidationError(missing)
+        return attrs
 
 
 class CandidateSerializer(serializers.ModelSerializer):
