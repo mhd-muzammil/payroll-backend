@@ -218,6 +218,13 @@ REST_FRAMEWORK = {
     "DEFAULT_FILTER_BACKENDS": (
         "django_filters.rest_framework.DjangoFilterBackend",
     ),
+    # The shared onboarding link is the only unauthenticated endpoint that
+    # WRITES, and it accepts file uploads with it. Twenty a day from one
+    # address is far more than a person filling in their own form once and
+    # far less than anything worth doing with an open door.
+    "DEFAULT_THROTTLE_RATES": {
+        "onboarding_link": "20/day",
+    },
 }
 
 SIMPLE_JWT = {

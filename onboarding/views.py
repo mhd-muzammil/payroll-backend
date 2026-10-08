@@ -2,16 +2,19 @@ import mimetypes
 from pathlib import Path
 
 from django.http import FileResponse, Http404
-from rest_framework import viewsets
+from django.utils import timezone
+from rest_framework import status as http_status, viewsets
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.views import APIView
 
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from authentication.permissions import IsHRStaff
 from .candidate_import import build_candidates, UnreadableUpload
-from .models import Onboarding, Candidate
+from .models import Onboarding, OnboardingInvite, Candidate, new_invite_token
 from .serializers import DOCUMENT_FIELDS, OnboardingSerializer, CandidateSerializer
 
 # Big enough for the lead exports HR actually has (the largest is ~400 KB and
@@ -58,6 +61,88 @@ class OnboardingViewSet(viewsets.ModelViewSet):
         response["X-Content-Type-Options"] = "nosniff"
         response["Content-Security-Policy"] = "default-src 'none'; sandbox"
         return response
+
+
+class OnboardingLinkViewSet(viewsets.ViewSet):
+    """The office's end: read the three links, and replace one.
+
+    The token itself is handed over, because the page has to build a URL out
+    of it to put on the clipboard. It is already behind the same HR-only wall
+    as the records the link creates.
+    """
+    permission_classes = [IsAuthenticated, IsHRStaff]
+
+    def list(self, request):
+        links = []
+        for category, _ in Onboarding.CATEGORY_CHOICES:
+            # Created on first sight rather than by a migration, so a category
+            # added later needs no backfill.
+            invite, _created = OnboardingInvite.objects.get_or_create(category=category)
+            links.append(
+                {
+                    "category": invite.category,
+                    "token": invite.token,
+                    "rotated_at": invite.rotated_at,
+                }
+            )
+        return Response(links)
+
+    @action(detail=False, methods=["post"], url_path=r"(?P<category>[A-Za-z]+)/rotate")
+    def rotate(self, request, category=None):
+        """Replace the link for one category. The old one stops working at once."""
+        valid = {name for name, _ in Onboarding.CATEGORY_CHOICES}
+        if category not in valid:
+            raise Http404
+        invite, _created = OnboardingInvite.objects.get_or_create(category=category)
+        invite.token = new_invite_token()
+        invite.rotated_at = timezone.now()
+        invite.save(update_fields=["token", "rotated_at"])
+        return Response(
+            {"category": invite.category, "token": invite.token, "rotated_at": invite.rotated_at}
+        )
+
+
+class PublicOnboardingView(APIView):
+    """The open door, and the only one. See the module docstring."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "onboarding_link"
+    parser_classes = [MultiPartParser, FormParser]
+
+    def _invite(self, token):
+        # Exactly the same answer for a token that never existed and one that
+        # has been replaced: nothing to learn from either.
+        try:
+            return OnboardingInvite.objects.get(token=token)
+        except OnboardingInvite.DoesNotExist:
+            raise Http404
+
+    def get(self, request, token):
+        """Which form to draw. Nothing else is readable here."""
+        invite = self._invite(token)
+        return Response({"category": invite.category})
+
+    def post(self, request, token):
+        invite = self._invite(token)
+
+        data = request.data.copy()
+        # THE LINK DECIDES THESE, NOT THE BROWSER. Whatever was sent for them
+        # is dropped: otherwise a freelancer's link would file an employee, and
+        # a self-filled form would arrive already approved and working here.
+        data["category"] = invite.category
+        data["source"] = "Self"
+        data["status"] = "Pending Review"
+        data["employment_status"] = "Inactive"
+
+        serializer = OnboardingSerializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        # Nothing of the record goes back out of the public door -- the person
+        # filling it in already knows what they typed, and anybody else with
+        # the link should learn nothing by posting to it.
+        return Response({"submitted": True}, status=http_status.HTTP_201_CREATED)
 
 
 class CandidateViewSet(viewsets.ModelViewSet):

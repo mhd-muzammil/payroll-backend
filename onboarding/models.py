@@ -1,4 +1,12 @@
+import secrets
+
 from django.db import models
+
+
+def new_invite_token():
+    """Unguessable, and short enough to paste into a WhatsApp message."""
+    return secrets.token_urlsafe(32)
+
 
 class Onboarding(models.Model):
     # WHO this record is about.
@@ -102,9 +110,24 @@ class Onboarding(models.Model):
     hp_experience = models.CharField(max_length=100, blank=True, null=True)
     skills = models.CharField(max_length=50, blank=True, null=True)
 
+    # WHO FILLED THIS IN. A record typed by the office has been seen by
+    # somebody here; one that arrived through a shared link has not, and until
+    # it is looked at it must not be mistaken for the other kind.
+    SOURCE_CHOICES = (
+        ('Office', 'Office'),
+        ('Self', 'Self'),
+    )
+    source = models.CharField(
+        max_length=20, choices=SOURCE_CHOICES, default='Office', db_index=True
+    )
+
     # Timestamps and internal tracking
     # How far the onboarding PAPERWORK got. Separate from employment_status
     # below: a person can be fully onboarded and since have left.
+    #
+    # 'Pending Review' is what arrives through a shared link and what the
+    # office clears by hand; anything the office types itself is 'Completed'
+    # the moment it is saved, as it always was.
     status = models.CharField(max_length=20, default='Completed')
 
     # Where the person stands with the company TODAY. These three are mutually
@@ -125,6 +148,26 @@ class Onboarding(models.Model):
 
     def __str__(self):
         return f"{self.employee_name} ({self.employment_status})"
+
+
+class OnboardingInvite(models.Model):
+    """The shareable link for one kind of form.
+
+    One row per category, so the office has one standing link per kind to hand
+    out rather than a new one per person -- that is how they said they would
+    use it. The token is a column rather than anything derived, so a link that
+    has been forwarded further than intended can be replaced without touching
+    anything else.
+    """
+    category = models.CharField(
+        max_length=20, choices=Onboarding.CATEGORY_CHOICES, unique=True
+    )
+    token = models.CharField(max_length=64, unique=True, db_index=True, default=new_invite_token)
+    created_at = models.DateTimeField(auto_now_add=True)
+    rotated_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.category} invite"
 
 
 class Candidate(models.Model):
