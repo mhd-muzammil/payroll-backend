@@ -18,3 +18,6 @@ Dockerfile*
 docker-compose*.yml
 DEPLOY_RENDER.md
 test_*.py
+
+# The WhatsApp poster is its own Dokploy app with its own Dockerfile.
+whatsapp_poster

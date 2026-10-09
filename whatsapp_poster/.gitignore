@@ -1,0 +1,8 @@
+node_modules/
+data/
+out/
+.env
+
+# The root .gitignore drops every package-lock.json, and the Dockerfile's
+# npm ci cannot install without this one.
+!package-lock.json

@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-attendance-poster",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Posts each branch's attendance for the day to its WhatsApp group, three times a day.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "once": "node src/index.js --once",
+    "capture": "node src/index.js --capture-only",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright": "1.64.0"
+  }
+}
