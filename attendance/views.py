@@ -1013,22 +1013,40 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def working_days(self, request):
-        """Per-employee day counts for ?start_date..?end_date (inclusive).
+        """Per-employee day counts for ?start_date..?end_date (inclusive), counted
+        the way a payslip counts them.
 
         Built for the expense tracker's Engineer P&L, which matches people by
-        email. `working_days` is the calendar days in the range less Sundays;
-        `present_days` is the distinct days with a worked status. Scoped by
-        get_queryset, so a branch admin only ever sees their own branches."""
+        email and charges each engineer what Payroll would actually pay them:
+
+          present_days   distinct days with a worked status (Present/Late/Overtime)
+          absent_days    distinct days marked Absent -- the only unpaid days, as on
+                         the payslip (a Leave row, and every Sunday, is paid)
+          casual_leave_days  of those absences, what casual leave covers: one a
+                         salary cycle once six months' service are done, exactly
+                         as payslip generation applies it
+          lop_days       absent_days - casual_leave_days
+          unmarked_days  working days (not Sundays) with no row at all; the
+                         payslip pays them, the office may want to mark them
+          payslip        when the range is exactly one 25th-24th cycle and its
+                         slip is Generated or Paid: what that slip pays
+
+        Scoped by get_queryset, so a branch admin only ever sees their own
+        branches. Employees with an email are listed even with no rows, so a
+        linked engineer is never mistaken for an unlinked one."""
+        from payrollpayslip.models import Payslip
+        from payrollpayslip.views import casual_leave_available
+
         start = parse_date(request.query_params.get("start_date") or "")
         end = parse_date(request.query_params.get("end_date") or "")
         if not start or not end or end < start:
             return Response({"detail": "start_date and end_date (YYYY-MM-DD) are required."}, status=400)
 
         days = (end - start).days + 1
-        sundays = sum(1 for i in range(days) if (start + timedelta(days=i)).weekday() == 6)
+        all_days = [start + timedelta(days=i) for i in range(days)]
+        working = {d for d in all_days if d.weekday() != 6}
 
-        present = {}
-        leave = {}
+        present, absent, leave = {}, {}, {}
         rows = (
             self.get_queryset()
             .filter(employee__isnull=False, intime__isnull=False)
@@ -1036,27 +1054,90 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         )
         for employee_id, intime, status in rows:
             day = timezone.localtime(intime).date()
-            bucket = present if status in self.WORKED_STATUSES else leave
+            if status in self.WORKED_STATUSES:
+                bucket = present
+            elif status == "Absent":
+                bucket = absent
+            else:
+                bucket = leave
             bucket.setdefault(employee_id, set()).add(day)
 
-        employees = Employee.objects.filter(id__in=set(present) | set(leave))
+        # The 25th-24th cycles the range touches, as (payslip month, year, days).
+        def cycle_of(d):
+            if d.day >= 25:
+                nxt = (d.replace(day=1) + timedelta(days=32)).replace(day=1)
+                return nxt.month, nxt.year
+            return d.month, d.year
+        cycles = {}
+        for d in all_days:
+            cycles.setdefault(cycle_of(d), set()).add(d)
+
+        full_cycle = None
+        if start.day == 25 and end.day == 24 and len(cycles) == 1:
+            full_cycle = next(iter(cycles))
+
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, "role", "employee")
+        employees = Employee.objects.exclude(status="relieved")
+        if role == "employee":
+            employees = employees.filter(user=user)
+        else:
+            branches = get_allowed_branches(user, "attendance")
+            if "All" not in branches:
+                employees = employees.filter(branch__in=branches)
+        seen = set(present) | set(absent) | set(leave)
+        employees = [e for e in employees if e.id in seen or (e.email or "").strip()]
+
+        slips = {}
+        if full_cycle:
+            for slip in Payslip.objects.filter(
+                employee__in=employees, month=full_cycle[0], year=full_cycle[1],
+                status__in=("Generated", "Paid"),
+            ):
+                slips[slip.employee_id] = slip
+
         results = []
         for emp in employees:
             worked = present.get(emp.id, set())
+            # A day with a worked row counts as worked, whatever else is on it.
+            off = absent.get(emp.id, set()) - worked
+            lv = leave.get(emp.id, set()) - worked - off
+            cl = 0
+            for (m, y), cdays in cycles.items():
+                missed = len(off & cdays)
+                if missed:
+                    cl += int(min(casual_leave_available(emp, y, m), missed))
+            slip = slips.get(emp.id)
             results.append({
                 "employee_id": emp.id,
                 "employee_name": emp.employee_name,
                 "email": emp.email or "",
                 "branch": emp.branch,
+                "date_of_joining": emp.date_of_joining.isoformat() if emp.date_of_joining else None,
                 "present_days": len(worked),
-                # A day with a worked row and a leave row counts as worked.
-                "leave_days": len(leave.get(emp.id, set()) - worked),
+                "absent_days": len(off),
+                "leave_days": len(lv),
+                "casual_leave_days": cl,
+                "lop_days": len(off) - cl,
+                "unmarked_days": len(working - worked - off - lv),
+                "payslip": None if not slip else {
+                    "month": slip.month,
+                    "year": slip.year,
+                    "status": slip.status,
+                    "total_days": slip.total_days,
+                    "paid_days": str(slip.paid_days),
+                    "lop_days": str(slip.lop_days),
+                    "casual_leave_used": str(slip.casual_leave_used),
+                    # What the company pays for the cycle before deductions:
+                    # earned salary plus the casual-leave and special-work lines.
+                    "earned": str(slip.gross_earnings + slip.casual_leave_pay + slip.special_work_pay),
+                },
             })
         return Response({
             "start_date": start.isoformat(),
             "end_date": end.isoformat(),
             "calendar_days": days,
-            "working_days": days - sundays,
+            "working_days": len(working),
             "results": results,
         })
 
