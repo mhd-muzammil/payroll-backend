@@ -50,6 +50,16 @@ const parseGroups = () => {
 
 const DATA_DIR = env.DATA_DIR || "/data";
 
+// "09:10, 09:35" -> ["09:10", "09:35"]. A time that is not HH:MM stops the
+// poster at start rather than quietly never firing.
+const times = (value, fallback) => {
+  const list = (value ?? fallback).split(",").map((t) => t.trim()).filter(Boolean);
+  for (const t of list) {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) throw new Error(`"${t}" is not a time like 09:10`);
+  }
+  return list;
+};
+
 export const config = {
   // The site, for POST_AS=image (the picture is made by its own button), and
   // the API the text is read from.
@@ -66,11 +76,15 @@ export const config = {
   // "text": the day's register as a message (the default -- the office asked
   // for text). "image": the Attendance page's "Today (Image)" picture.
   postAs: /^\s*image\s*$/i.test(env.POST_AS || "") ? "image" : "text",
-  // IST wall-clock times, HH:MM, comma separated.
-  runTimes: (env.RUN_TIMES || "09:15,10:30,21:30")
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean),
+  // IST wall-clock times, HH:MM, comma separated. The office's day:
+  //   09:10 report, 09:11 reminder, 09:35 report, 09:37 reminder,
+  //   (10:00 the backend marks the no-shows Absent), 10:05 final report,
+  //   19:00 report, 21:00 report.
+  runTimes: times(env.RUN_TIMES, "09:10,09:35,19:00,21:00"),
+  // Who has not logged in yet, named, in each branch's group.
+  reminderTimes: times(env.REMINDER_TIMES, "09:11,09:37"),
+  // The report after 10am: Absent first, then on leave, then present.
+  finalTimes: times(env.FINAL_TIMES, "10:05"),
 
   // While trying it out: every post goes to this one chat instead of the
   // branch groups ("Message yourself" works -- type your own name).

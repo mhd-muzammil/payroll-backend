@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildMessage, formatTime, hoursBetween, todaysRows, workedSpan } from "../src/attendanceText.js";
+import {
+  buildFinalReport,
+  buildMessage,
+  buildReminder,
+  formatTime,
+  hoursBetween,
+  punchTime,
+  todaysRows,
+  workedSpan,
+} from "../src/attendanceText.js";
 
 // The API writes times in India time, "+05:30".
 const at = (hhmm, day = "2026-10-09") => `${day}T${hhmm}:00+05:30`;
@@ -78,4 +87,69 @@ test("one person is one record", () => {
   const rows = [{ employee_name: "Agalya A", department: "General", status: "Present", intime: at("09:12") }];
   const text = buildMessage({ rows, branch: "Vellore", now: new Date("2026-10-09T05:39:00Z") });
   assert.match(text, /Present 1 · Absent 0 · On leave 0 · 1 record\n/);
+});
+
+test("a Login after 10am shows on the Absent row; a marked day shows a dash", () => {
+  assert.equal(punchTime({ status: "Absent", intime: at("10:42") }, "intime"), "10:42 AM");
+  assert.equal(punchTime({ status: "Absent", intime: at("00:00") }, "intime"), "—");
+  assert.equal(punchTime({ status: "Leave", intime: at("00:00") }, "intime"), "—");
+  // Midnight on a Present day is not a mark, and reads as what it is.
+  assert.equal(punchTime({ status: "Present", intime: at("00:00") }, "intime"), "12:00 AM");
+});
+
+test("the reminder", () => {
+  const now = new Date("2026-10-10T03:41:00Z"); // 9:11 am in India
+  assert.equal(
+    buildReminder({ branch: "Salem", names: ["Karthik  S ", "Priya R"], cutoff: "10:00", now }),
+    [
+      "*Login reminder* · *Salem branch*",
+      "Saturday, 10 October 2026 · 9:11 am",
+      "",
+      "Not logged in yet, please log in now:",
+      "1. Karthik S",
+      "2. Priya R",
+      "",
+      "No login by 10:00 am = Absent.",
+    ].join("\n"),
+  );
+});
+
+test("the final report: Absent first, then on leave, then present", () => {
+  const rows = [
+    { employee_name: "Lava kumar V", status: "Present", intime: at("08:34") },
+    { employee_name: "Karthik S", status: "Absent", intime: at("00:00") },
+    { employee_name: "Priya R", status: "Absent", intime: at("10:03") },
+    { employee_name: "Meena K", status: "Leave", intime: at("00:00") },
+    { employee_name: "Mohan R", status: "Late", intime: at("09:52"), outtime: at("18:00") },
+  ];
+  const now = new Date("2026-10-10T04:35:00Z"); // 10:05 am in India
+  assert.equal(
+    buildFinalReport({ rows, branch: "Chennai", now }),
+    [
+      "*Renderways Technology*",
+      "Final Attendance · *Chennai branch*",
+      "Saturday, 10 October 2026",
+      "Present 2 · Absent 2 · On leave 1 · Total 5",
+      "",
+      "*Absent (2)*",
+      "1. Karthik S",
+      "2. Priya R — logged in 10:03 AM",
+      "",
+      "*On leave (1)*",
+      "1. Meena K",
+      "",
+      "*Present (2)*",
+      "*Lava kumar V* — In 08:34 AM",
+      "*Mohan R* — In 09:52 AM · Out 06:00 PM · Late",
+      "",
+      "_Generated 10 Oct 2026, 10:05 am_",
+    ].join("\n"),
+  );
+});
+
+test("the final report says so when the 10am job has not marked somebody", () => {
+  const rows = [{ employee_name: "Lava kumar V", status: "Present", intime: at("08:34") }];
+  const text = buildFinalReport({ rows, branch: "Chennai", notMarked: ["Karthik S"], now: new Date("2026-10-10T04:35:00Z") });
+  assert.match(text, /Present 1 · Absent 0 · On leave 0 · Not marked 1 · Total 2\n/);
+  assert.match(text, /\*Not logged in, not marked Absent yet \(1\)\*\n1\. Karthik S\n/);
 });

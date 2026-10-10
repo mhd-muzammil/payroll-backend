@@ -1,7 +1,20 @@
 # WhatsApp attendance poster
 
-Three times a day (9:15 am, 10:30 am and 9:30 pm IST) it posts each branch's
-attendance for the day to the branch's WhatsApp group, as a text message:
+Posts each branch's attendance for the day to the branch's WhatsApp group, on
+the office's day (IST, every day but what is skipped below):
+
+| Time  | Message |
+|-------|---------|
+| 09:10 | report |
+| 09:11 | reminder — who has not logged in yet, by name |
+| 09:35 | report |
+| 09:37 | reminder |
+| 10:00 | *(the backend marks everybody not logged in Absent — see below)* |
+| 10:05 | final report — Absent first, then on leave, then present |
+| 19:00 | report |
+| 21:00 | report |
+
+The report:
 
 ```
 *Renderways Technology*
@@ -28,10 +41,19 @@ API. (`POST_AS=image` sends that picture instead.)
 | Vellore     | RENDERWAYS-VELLORE-ATTENDANCE          |
 | Hosur       | RENDERWAYS-HOSUR-ATTENDANCE            |
 
-A branch with nobody marked that day is skipped.
+A branch with nobody marked that day is skipped. The reminders name the
+people the backend's `GET /api/attendance/not_logged_in/` lists — the same
+rule its 10am job uses, so whoever a reminder names is whoever gets marked.
+On a Sunday, or a day nobody at all has logged in (a holiday, an outage),
+there are no reminders and nobody is marked.
+
+**10:00 — marking Absent is the backend's job, not this app's.** It is
+`python manage.py mark_absent_no_login`, run by a Dokploy *Schedule* on the
+backend app at `30 4 * * *` (UTC = 10:00 IST). If it did not run, the 10:05
+report lists those people under *Not logged in, not marked Absent yet*.
 
 > Automating WhatsApp Web is against WhatsApp's terms and the number can be
-> banned. Three posts per group a day is low risk, not no risk. Use a
+> banned. A handful of posts per group a day is low risk, not no risk. Use a
 > company number, not somebody's personal one.
 
 ## Deploy on Dokploy
@@ -48,10 +70,16 @@ A branch with nobody marked that day is skipped.
    PAYROLL_USERNAME=<an HR or admin login that sees every branch>
    PAYROLL_PASSWORD=<its password>
    WA_PHONE=91XXXXXXXXXX
-   RUN_TIMES=09:15,10:30,21:30
    ```
 
-   Optional:
+   Optional — the times default to the table above; set one only to change it
+   (HH:MM, IST, comma separated; empty turns that kind off):
+
+   ```
+   RUN_TIMES=09:10,09:35,19:00,21:00
+   REMINDER_TIMES=09:11,09:37
+   FINAL_TIMES=10:05
+   ```
 
    ```
    TEST_CHAT=<a chat name>   # while trying it out: every post goes here instead
@@ -93,5 +121,6 @@ database error occurred on your browser"* and never shows a login.
 npm install
 npm test
 DATA_DIR=./data node src/index.js --capture-only     # messages into data/out, nothing sent
+DATA_DIR=./data node src/index.js --capture-only --kind=reminder   # or --kind=final
 BROWSER_CHANNEL=chrome DATA_DIR=./data node src/index.js --once   # link, post once
 ```

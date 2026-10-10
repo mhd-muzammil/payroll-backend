@@ -31,8 +31,8 @@ async function call(path, { method = "GET", token, body } = {}) {
   return res.json();
 }
 
-/** Every attendance row the poster's login can see. */
-export async function fetchAttendance() {
+/** A token for the poster's own login; one run signs in once. */
+export async function signIn() {
   let access;
   try {
     ({ access } = await call("/api/auth/login/", {
@@ -46,8 +46,28 @@ export async function fetchAttendance() {
     throw err;
   }
   if (!access) throw new Error("payroll: sign-in gave no token");
+  return access;
+}
 
-  const data = await call("/api/attendance/", { token: access });
+/**
+ * Who has not logged in yet today, by branch -- the server's list, the same
+ * people its 10am job marks Absent. {date, cutoff, skip, branches: {Salem: [names]}};
+ * `skip` says why there is nobody to chase (Sunday, or nobody logged in at all).
+ */
+export async function fetchNotLoggedIn(token) {
+  try {
+    return await call("/api/attendance/not_logged_in/", { token: token || (await signIn()) });
+  } catch (err) {
+    if (err.status === 404) {
+      throw new Error("payroll: /api/attendance/not_logged_in/ is not there -- redeploy the backend");
+    }
+    throw err;
+  }
+}
+
+/** Every attendance row the poster's login can see. */
+export async function fetchAttendance(token) {
+  const data = await call("/api/attendance/", { token: token || (await signIn()) });
   // The API has answered with a bare list and with {results: [...]}; the page
   // reads both, and so does this.
   if (Array.isArray(data)) return data;

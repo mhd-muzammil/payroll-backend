@@ -12,6 +12,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
+from . import absence
 from .models import Attendance, LeaveRequest
 from .serializer import AttendanceSerializer, LeaveRequestSerializer
 from employees.models import Employee
@@ -1074,9 +1075,20 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         # Check if already checked in today
         today = timezone.localdate()
         existing = Attendance.objects.filter(employee=employee, intime__date=today).first()
-        
+
         if existing:
-             return Response({"detail": "Already checked in for today."}, status=400)
+            # A day already marked Absent or Leave with no punch on it -- by the
+            # 10am rule for not having logged in (mark_absent_no_login), or by
+            # the office. The Login is still accepted, and its time written on
+            # that row: the app starts an engineer's duty, and the km, only once
+            # this answers yes, so refusing it would cost them the day's trail.
+            # The status is NOT changed. In after 10am stays Absent -- the
+            # office's rule -- and a Leave day stays Leave until they change it.
+            if absence.is_day_mark(existing):
+                existing.intime = timezone.now()
+                existing.save(update_fields=["intime"])
+                return Response(self.get_serializer(existing).data, status=200)
+            return Response({"detail": "Already checked in for today."}, status=400)
 
         # Create record
         attendance = Attendance.objects.create(
@@ -1109,6 +1121,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         if not existing:
              return Response({"detail": "No clock-in found for today. Cannot clock out."}, status=400)
 
+        # A marked Absent or Leave day nobody punched is not a Login to close.
+        # A logout stamped on its midnight would read as a shift from 12am.
+        if absence.is_day_mark(existing):
+            return Response({"detail": "No clock-in found for today. Cannot clock out."}, status=400)
+
         if existing.outtime:
              return Response({"detail": "Already clocked out for today."}, status=400)
 
@@ -1116,6 +1133,36 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         existing.save()
         serializer = self.get_serializer(existing)
         return Response(serializer.data, status=200)
+
+    @action(detail=False, methods=["get"])
+    def not_logged_in(self, request):
+        """Who has not logged in yet today, by branch.
+
+        What the WhatsApp reminders post at 9:11 and 9:37 -- and, by the same
+        rule (attendance/absence.py), the people the 10am job will mark Absent.
+        `skip` says why there is nobody to chase: Sunday, or a day nobody at all
+        has logged in. Office accounts only, scoped to their branches."""
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, "role", "employee")
+        if role not in ("superadmin", "admin", "hr"):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        day = timezone.localdate()
+        skip = absence.reason_to_skip(day)
+        branches = {}
+        if not skip:
+            allowed = get_allowed_branches(user, "attendance")
+            for person in absence.not_logged_in(day):
+                branch = person.branch or "Chennai"
+                if "All" not in allowed and branch not in allowed:
+                    continue
+                branches.setdefault(branch, []).append(person.employee_name)
+        return Response({
+            "date": day.isoformat(),
+            "cutoff": absence.CUTOFF.strftime("%H:%M"),
+            "skip": skip,
+            "branches": branches,
+        })
 
 
 class LeaveRequestViewSet(viewsets.ModelViewSet):

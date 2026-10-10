@@ -60,9 +60,21 @@ export const formatTime = (value) => {
   return plainSpaces(CLOCK.format(at));
 };
 
+/**
+ * Whether a record holds only a date -- an Absent or Leave day stored at
+ * midnight that nobody punched. Not the status alone: somebody marked Absent
+ * at 10am who logs in later has their Login recorded on that row, and the day
+ * stays Absent. (isDayMark in the page's attendanceUtils.js.)
+ */
+const isDayMark = (record) => {
+  if (!record?.intime || !NO_PUNCH_STATUSES.has(record.status)) return false;
+  const at = new Date(record.intime);
+  if (Number.isNaN(at.getTime())) return false;
+  return formatTime(record.intime) === "12:00 AM";
+};
+
 /** A clock time for the register: a dash on a day nobody punched. */
-export const punchTime = (record, field) =>
-  NO_PUNCH_STATUSES.has(record?.status) ? "—" : formatTime(record?.[field]);
+export const punchTime = (record, field) => (isDayMark(record) ? "—" : formatTime(record?.[field]));
 
 /**
  * How long the day was, by the office's rule -- or null, when the day cannot
@@ -203,6 +215,99 @@ export const buildMessage = ({ rows, branch, now = new Date() }) => {
         `Hours ${workedSpan(record.intime, record.outtime)}`,
       ].join(" · "),
     );
+  }
+
+  lines.push("", `_Generated ${plainSpaces(STAMP.format(now))}_`);
+  return lines.join("\n");
+};
+
+const CLOCK_SHORT = new Intl.DateTimeFormat("en-IN", { timeStyle: "short", timeZone: ZONE });
+
+/** "10:00" from the server -> "10:00 am", the way the rest of the message says times. */
+const cutoffWords = (cutoff) => {
+  const [h, m] = String(cutoff || "10:00").split(":").map(Number);
+  const at = new Date(Date.UTC(2000, 0, 1, h, m) - IST_OFFSET_MS);
+  return plainSpaces(CLOCK_SHORT.format(at));
+};
+
+const numbered = (names) => names.map((name, i) => `${i + 1}. ${tidy(name)}`);
+
+/**
+ * The 9:11 and 9:37 reminder: who in this branch has not logged in yet.
+ *
+ *     *Login reminder* · *Salem branch*
+ *     Saturday, 10 October 2026 · 9:11 am
+ *
+ *     Not logged in yet, please log in now:
+ *     1. Karthik S
+ *     2. Priya R
+ *
+ *     No login by 10:00 am = Absent.
+ *
+ * English, as the office chose. The names are the server's list -- the same
+ * people its 10am job marks Absent if they still have not logged in.
+ */
+export const buildReminder = ({ branch, names, cutoff, now = new Date() }) =>
+  [
+    `*Login reminder* · *${branch} branch*`,
+    `${plainSpaces(DAY.format(now))} · ${plainSpaces(CLOCK_SHORT.format(now))}`,
+    "",
+    "Not logged in yet, please log in now:",
+    ...numbered(names),
+    "",
+    `No login by ${cutoffWords(cutoff)} = Absent.`,
+  ].join("\n");
+
+/**
+ * The 10:05 report, after the 10am rule has marked the no-shows Absent: the
+ * count, then who is Absent, on leave and present, in that order.
+ *
+ * `notMarked` is anybody the server still lists as not logged in at 10:05. It
+ * should be nobody -- they were marked Absent at 10:00 -- so a name there means
+ * the 10am job did not run, and the message says so rather than counting them
+ * Absent when the register does not.
+ */
+export const buildFinalReport = ({ rows, branch, notMarked = [], now = new Date() }) => {
+  const absent = rows.filter((r) => r.status === "Absent");
+  const leave = rows.filter((r) => r.status === "Leave");
+  const present = rows.filter((r) => r.status !== "Absent" && r.status !== "Leave");
+
+  const counts = [
+    `Present ${present.length}`,
+    `Absent ${absent.length}`,
+    `On leave ${leave.length}`,
+    ...(notMarked.length ? [`Not marked ${notMarked.length}`] : []),
+    `Total ${rows.length + notMarked.length}`,
+  ];
+  const lines = [
+    "*Renderways Technology*",
+    `Final Attendance · *${branch} branch*`,
+    plainSpaces(DAY.format(now)),
+    counts.join(" · "),
+  ];
+
+  // A Login after 10am is on the Absent row, and the day stays Absent.
+  const lateLogin = (r) => (isDayMark(r) || !r.intime ? "" : ` — logged in ${formatTime(r.intime)}`);
+  if (absent.length) {
+    lines.push("", `*Absent (${absent.length})*`);
+    absent.forEach((r, i) => lines.push(`${i + 1}. ${tidy(r.employee_name) || "—"}${lateLogin(r)}`));
+  }
+  if (notMarked.length) {
+    lines.push("", `*Not logged in, not marked Absent yet (${notMarked.length})*`, ...numbered(notMarked));
+  }
+  if (leave.length) {
+    lines.push("", `*On leave (${leave.length})*`, ...numbered(leave.map((r) => r.employee_name)));
+  }
+  if (present.length) {
+    lines.push("", `*Present (${present.length})*`);
+    for (const r of present) {
+      const status = tidy(getStatusDisplay(r.status));
+      const out = r.outtime ? ` · Out ${formatTime(r.outtime)}` : "";
+      lines.push(
+        `*${tidy(r.employee_name) || "—"}* — In ${formatTime(r.intime)}${out}` +
+          (status && status !== "Present" ? ` · ${status}` : ""),
+      );
+    }
   }
 
   lines.push("", `_Generated ${plainSpaces(STAMP.format(now))}_`);
