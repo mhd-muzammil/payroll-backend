@@ -1006,6 +1006,59 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         return queryset
 
+    # Statuses that mean the person turned up. Leave covers the company-wide
+    # Sunday row too, so a Sunday only counts when somebody actually worked it.
+    WORKED_STATUSES = ("Present", "Late", "Overtime")
+
+    @action(detail=False, methods=["get"])
+    def working_days(self, request):
+        """Per-employee day counts for ?start_date..?end_date (inclusive).
+
+        Built for the expense tracker's Engineer P&L, which matches people by
+        email. `working_days` is the calendar days in the range less Sundays;
+        `present_days` is the distinct days with a worked status. Scoped by
+        get_queryset, so a branch admin only ever sees their own branches."""
+        start = parse_date(request.query_params.get("start_date") or "")
+        end = parse_date(request.query_params.get("end_date") or "")
+        if not start or not end or end < start:
+            return Response({"detail": "start_date and end_date (YYYY-MM-DD) are required."}, status=400)
+
+        days = (end - start).days + 1
+        sundays = sum(1 for i in range(days) if (start + timedelta(days=i)).weekday() == 6)
+
+        present = {}
+        leave = {}
+        rows = (
+            self.get_queryset()
+            .filter(employee__isnull=False, intime__isnull=False)
+            .values_list("employee_id", "intime", "status")
+        )
+        for employee_id, intime, status in rows:
+            day = timezone.localtime(intime).date()
+            bucket = present if status in self.WORKED_STATUSES else leave
+            bucket.setdefault(employee_id, set()).add(day)
+
+        employees = Employee.objects.filter(id__in=set(present) | set(leave))
+        results = []
+        for emp in employees:
+            worked = present.get(emp.id, set())
+            results.append({
+                "employee_id": emp.id,
+                "employee_name": emp.employee_name,
+                "email": emp.email or "",
+                "branch": emp.branch,
+                "present_days": len(worked),
+                # A day with a worked row and a leave row counts as worked.
+                "leave_days": len(leave.get(emp.id, set()) - worked),
+            })
+        return Response({
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "calendar_days": days,
+            "working_days": days - sundays,
+            "results": results,
+        })
+
     @action(detail=False, methods=["post"])
     def check_in(self, request):
         user = request.user
