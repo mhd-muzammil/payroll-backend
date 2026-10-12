@@ -105,9 +105,9 @@ test("the reminder", () => {
       "*Login reminder* · *Salem branch*",
       "Saturday, 10 October 2026 · 9:11 am",
       "",
-      "Not logged in yet, please log in now:",
-      "1. Karthik S",
-      "2. Priya R",
+      "Not logged in yet (2), please log in now:",
+      "• Karthik S",
+      "• Priya R",
       "",
       "No login by 10:00 am = Absent.",
     ].join("\n"),
@@ -132,11 +132,11 @@ test("the final report: Absent first, then on leave, then present", () => {
       "Present 2 · Absent 2 · On leave 1 · Total 5",
       "",
       "*Absent (2)*",
-      "1. Karthik S",
-      "2. Priya R — logged in 10:03 AM",
+      "• Karthik S",
+      "• Priya R — logged in 10:03 AM",
       "",
       "*On leave (1)*",
-      "1. Meena K",
+      "• Meena K",
       "",
       "*Present (2)*",
       "*Lava kumar V* — In 08:34 AM",
@@ -151,5 +151,29 @@ test("the final report says so when the 10am job has not marked somebody", () =>
   const rows = [{ employee_name: "Lava kumar V", status: "Present", intime: at("08:34") }];
   const text = buildFinalReport({ rows, branch: "Chennai", notMarked: ["Karthik S"], now: new Date("2026-10-10T04:35:00Z") });
   assert.match(text, /Present 1 · Absent 0 · On leave 0 · Not marked 1 · Total 2\n/);
-  assert.match(text, /\*Not logged in, not marked Absent yet \(1\)\*\n1\. Karthik S\n/);
+  assert.match(text, /\*Not logged in, not marked Absent yet \(1\)\*\n• Karthik S\n/);
+});
+
+test("no line starts the way WhatsApp turns into a list", () => {
+  // "1. ", "- ", "* " and "> " at the start of a line are formatting in the
+  // WhatsApp message box. Typed, they change what the box holds -- "1. A"
+  // then a new line came back "2. " before the second name was typed, and
+  // every reminder with two names or more was refused (12 Oct 2026).
+  const rows = [
+    { employee_name: "Karthik S", status: "Absent", intime: at("00:00") },
+    { employee_name: "Priya R", status: "Absent", intime: at("00:00") },
+    { employee_name: "Meena K", status: "Leave", intime: at("00:00") },
+    { employee_name: "Lava kumar V", department: "General", status: "Present", intime: at("08:34") },
+  ];
+  const now = new Date("2026-10-12T04:35:00Z");
+  const texts = [
+    buildReminder({ branch: "Salem", names: ["A", "B", "C"], cutoff: "10:00", now }),
+    buildFinalReport({ rows, branch: "Salem", notMarked: ["D", "E"], now }),
+    buildMessage({ rows, branch: "Salem", now }),
+  ];
+  for (const text of texts) {
+    for (const line of text.split("\n")) {
+      assert.doesNotMatch(line, /^(\d+[.)] |[-*>] )/, `"${line}"`);
+    }
+  }
 });

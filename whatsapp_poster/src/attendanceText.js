@@ -230,7 +230,11 @@ const cutoffWords = (cutoff) => {
   return plainSpaces(CLOCK_SHORT.format(at));
 };
 
-const numbered = (names) => names.map((name, i) => `${i + 1}. ${tidy(name)}`);
+// "• Karthik S", never "1. Karthik S": WhatsApp's message box turns a line
+// that starts "1. " into a numbered list and starts the next line with "2. "
+// itself, so the box no longer held what was typed and every reminder with
+// two names or more was refused (12 Oct 2026). A bullet is just a character.
+const listed = (names) => names.map((name) => `• ${tidy(name) || "—"}`);
 
 /**
  * The 9:11 and 9:37 reminder: who in this branch has not logged in yet.
@@ -238,9 +242,9 @@ const numbered = (names) => names.map((name, i) => `${i + 1}. ${tidy(name)}`);
  *     *Login reminder* · *Salem branch*
  *     Saturday, 10 October 2026 · 9:11 am
  *
- *     Not logged in yet, please log in now:
- *     1. Karthik S
- *     2. Priya R
+ *     Not logged in yet (2), please log in now:
+ *     • Karthik S
+ *     • Priya R
  *
  *     No login by 10:00 am = Absent.
  *
@@ -252,8 +256,8 @@ export const buildReminder = ({ branch, names, cutoff, now = new Date() }) =>
     `*Login reminder* · *${branch} branch*`,
     `${plainSpaces(DAY.format(now))} · ${plainSpaces(CLOCK_SHORT.format(now))}`,
     "",
-    "Not logged in yet, please log in now:",
-    ...numbered(names),
+    `Not logged in yet (${names.length}), please log in now:`,
+    ...listed(names),
     "",
     `No login by ${cutoffWords(cutoff)} = Absent.`,
   ].join("\n");
@@ -290,13 +294,13 @@ export const buildFinalReport = ({ rows, branch, notMarked = [], now = new Date(
   const lateLogin = (r) => (isDayMark(r) || !r.intime ? "" : ` — logged in ${formatTime(r.intime)}`);
   if (absent.length) {
     lines.push("", `*Absent (${absent.length})*`);
-    absent.forEach((r, i) => lines.push(`${i + 1}. ${tidy(r.employee_name) || "—"}${lateLogin(r)}`));
+    absent.forEach((r) => lines.push(`• ${tidy(r.employee_name) || "—"}${lateLogin(r)}`));
   }
   if (notMarked.length) {
-    lines.push("", `*Not logged in, not marked Absent yet (${notMarked.length})*`, ...numbered(notMarked));
+    lines.push("", `*Not logged in, not marked Absent yet (${notMarked.length})*`, ...listed(notMarked));
   }
   if (leave.length) {
-    lines.push("", `*On leave (${leave.length})*`, ...numbered(leave.map((r) => r.employee_name)));
+    lines.push("", `*On leave (${leave.length})*`, ...listed(leave.map((r) => r.employee_name)));
   }
   if (present.length) {
     lines.push("", `*Present (${present.length})*`);

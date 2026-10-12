@@ -357,10 +357,18 @@ export async function sendText(page, chatName, text, mustSay) {
 
     // What is in the box is what goes, so it is checked while it can still be
     // taken back.
-    if (!sameLines(await box.innerText().catch(() => ""), text)) {
+    const held = await box.innerText().catch(() => "");
+    if (!sameLines(held, text)) {
       await page.keyboard.press("Control+A");
       await page.keyboard.press("Backspace");
-      throw new Error("whatsapp: the message box did not hold the message as typed -- nothing sent");
+      // Which line, so the log says what WhatsApp did to it.
+      const wanted = wordedLines(text);
+      const got = wordedLines(held);
+      const at = Math.max(0, wanted.findIndex((line, i) => line !== got[i]));
+      throw new Error(
+        "whatsapp: the message box did not hold the message as typed -- nothing sent " +
+          `(line ${at + 1}: wanted "${wanted[at] ?? ""}", the box had "${got[at] ?? ""}")`,
+      );
     }
 
     const send = await firstVisible(page, SEND_BUTTON, 5_000);
