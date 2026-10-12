@@ -6,13 +6,15 @@ the office's day (IST, every day but what is skipped below):
 | Time  | Message |
 |-------|---------|
 | 09:10 | report |
-| 09:11 | reminder — who has not logged in yet, by name |
+| 09:13 | login reminder — who has not logged in yet, by name |
 | 09:35 | report |
-| 09:37 | reminder |
-| 10:00 | *(the backend marks everybody not logged in Absent — see below)* |
-| 10:05 | final report — Absent first, then on leave, then present |
+| 09:38 | login reminder |
+| 10:00 | report |
+| 10:05 | login reminder |
+| 10:30 | *the payroll marks everybody not logged in Absent* — then the final report (Absent first, then on leave, then present) |
 | 19:00 | report |
-| 21:00 | report |
+| 19:15 | logout reminder — who logged in and has not logged out |
+| 21:00 | final report |
 
 The report:
 
@@ -47,10 +49,14 @@ rule its 10am job uses, so whoever a reminder names is whoever gets marked.
 On a Sunday, or a day nobody at all has logged in (a holiday, an outage),
 there are no reminders and nobody is marked.
 
-**10:00 — marking Absent is the backend's job, not this app's.** It is
-`python manage.py mark_absent_no_login`, run by a Dokploy *Schedule* on the
-backend app at `30 4 * * *` (UTC = 10:00 IST). If it did not run, the 10:05
-report lists those people under *Not logged in, not marked Absent yet*.
+**10:30 — marking Absent.** At 10:30 this app asks the payroll to mark the
+no-shows (`POST /api/attendance/mark_absent/`), and only then sends the 10:30
+report, so the report always shows the marks. The rule itself is the
+backend's (attendance/absence.py): refused before 10:30, nothing on a Sunday
+or a day nobody logged in, nobody marked twice. No Dokploy schedule is
+needed; `python manage.py mark_absent_no_login` does the same by hand, on a
+day this app was down. If the marking did not happen, the 10:30 report lists
+those people under *Not logged in, not marked Absent yet*.
 
 > Automating WhatsApp Web is against WhatsApp's terms and the number can be
 > banned. A handful of posts per group a day is low risk, not no risk. Use a
@@ -76,9 +82,11 @@ report lists those people under *Not logged in, not marked Absent yet*.
    (HH:MM, IST, comma separated; empty turns that kind off):
 
    ```
-   RUN_TIMES=09:10,09:35,19:00,21:00
-   REMINDER_TIMES=09:11,09:37
-   FINAL_TIMES=10:05
+   RUN_TIMES=09:10,09:35,10:00,19:00
+   REMINDER_TIMES=09:13,09:38,10:05
+   MARK_TIMES=10:30
+   FINAL_TIMES=10:30,21:00
+   LOGOUT_TIMES=19:15
    ```
 
    ```
@@ -121,6 +129,6 @@ database error occurred on your browser"* and never shows a login.
 npm install
 npm test
 DATA_DIR=./data node src/index.js --capture-only     # messages into data/out, nothing sent
-DATA_DIR=./data node src/index.js --capture-only --kind=reminder   # or --kind=final
+DATA_DIR=./data node src/index.js --capture-only --kind=reminder   # or final, logout
 BROWSER_CHANNEL=chrome DATA_DIR=./data node src/index.js --once   # link, post once
 ```

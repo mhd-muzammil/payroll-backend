@@ -2,17 +2,20 @@
  * Each branch's attendance for the day into that branch's WhatsApp group, on
  * the office's day (IST):
  *
- *   09:10  report        09:11  reminder: who has not logged in yet
- *   09:35  report        09:37  reminder
- *   10:05  final report  (the backend marks the no-shows Absent at 10:00)
- *   19:00  report        21:00  report
+ *   09:10  report        09:13  login reminder: who has not logged in yet
+ *   09:35  report        09:38  login reminder
+ *   10:00  report        10:05  login reminder
+ *   10:30  mark: the payroll marks the no-shows Absent -- then the final report
+ *   19:00  report        19:15  logout reminder: who has not logged out yet
+ *   21:00  final report
  *
  *   node src/index.js                          run for ever, on that schedule
  *   node src/index.js --once [--kind=final]    link if needed, post one run now, exit
  *   node src/index.js --capture-only [--kind=reminder]
  *                                              only make the messages (no WhatsApp), exit
  *
- * --kind is report (the default), reminder or final. Everything is read from
+ * --kind is report (the default), reminder, final, logout, or mark -- which
+ * sends nothing and writes attendance, so it runs only with --once. Everything is read from
  * the payroll API; with POST_AS=image the report is instead the Attendance
  * page's own "Today (Image)" picture, made in a browser tab on the payroll
  * site. It all goes out through a WhatsApp Web tab that stays open between
@@ -23,18 +26,27 @@ import path from "node:path";
 
 import { chromium } from "playwright";
 
-import { buildFinalReport, buildMessage, buildReminder, indianDate, todaysRows } from "./attendanceText.js";
+import {
+  buildFinalReport,
+  buildLogoutReminder,
+  buildMessage,
+  buildReminder,
+  indianDate,
+  notLoggedOut,
+  todaysRows,
+} from "./attendanceText.js";
 import { config, missingForPosting } from "./config.js";
 import { log } from "./log.js";
 import { captureBranchImage } from "./payroll.js";
-import { fetchAttendance, fetchNotLoggedIn, signIn } from "./payrollApi.js";
+import { fetchAttendance, fetchNotLoggedIn, markAbsent, signIn } from "./payrollApi.js";
+import { KINDS, slotsOfTheDay } from "./slots.js";
 import { recordRun, startStatusServer, status } from "./status.js";
 import { ensureLinked, sendImage, sendText } from "./whatsapp.js";
 
 const args = process.argv.slice(2);
 const ONCE = args.includes("--once");
 const CAPTURE_ONLY = args.includes("--capture-only");
-const KINDS = ["report", "reminder", "final"];
+
 const KIND = (args.find((a) => a.startsWith("--kind=")) || "--kind=report").slice("--kind=".length);
 if (!KINDS.includes(KIND)) {
   console.error(`--kind must be one of ${KINDS.join(", ")}`);
@@ -118,7 +130,7 @@ const POSTERS = {
     const { pending } = data;
     if (pending.skip) return `skipped: ${pending.skip}`;
     const names = pending.branches?.[branch] || [];
-    // Everybody has logged in -- or, after 10am, been marked Absent.
+    // Everybody has logged in -- or, after 10:30, been marked Absent.
     if (!names.length) return "skipped: nobody left to remind";
     return deliver(
       waPage, target, buildReminder({ branch, names, cutoff: pending.cutoff, now: at }),
@@ -128,7 +140,7 @@ const POSTERS = {
 
   async final({ waPage, branch, target, data, at, stamp }) {
     const rows = todaysRows(data.records, branch, indianDate(at));
-    // Anybody still not logged in AND not marked: the 10am job did not run.
+    // Anybody still not logged in AND not marked: the 10:30 marking did not happen.
     const notMarked = data.pending && !data.pending.skip ? data.pending.branches?.[branch] || [] : [];
     if (!rows.length && !notMarked.length) return "skipped: nobody marked today";
     return deliver(
@@ -136,7 +148,45 @@ const POSTERS = {
       path.join(config.outDir, `${stamp}-${branch}-final.txt`), `Final Attendance · ${branch} branch`,
     );
   },
+
+  async logout({ waPage, branch, target, data, at, stamp }) {
+    const names = notLoggedOut(todaysRows(data.records, branch, indianDate(at)));
+    if (!names.length) return "skipped: nobody left to remind";
+    return deliver(
+      waPage, target, buildLogoutReminder({ branch, names, now: at }),
+      path.join(config.outDir, `${stamp}-${branch}-logout.txt`), `Logout reminder · ${branch} branch`,
+    );
+  },
 };
+
+/**
+ * The 10:30 rule: ask the payroll to mark today's no-shows Absent. Nothing is
+ * sent and WhatsApp is not needed -- it runs even while the phone is unlinked.
+ * At 10:30 it runs before the final report, so the report shows the marks.
+ */
+async function runMark(reason) {
+  log(`run (${reason}): mark`);
+  const entry = { at: new Date().toISOString(), reason, kind: "mark", branch: "all", group: "-", result: "" };
+  try {
+    const answer = await markAbsent();
+    if (answer.skip) {
+      entry.result = `nobody marked: ${answer.skip}`;
+    } else {
+      const lines = Object.entries(answer.marked || {}).map(([b, names]) => `${b} ${names.length}`);
+      entry.result = `${answer.count} marked Absent${lines.length ? ` (${lines.join(", ")})` : ""}`;
+    }
+    log(`  ${entry.result}`);
+  } catch (err) {
+    entry.result = `FAILED: ${err.message}`;
+    status.lastError = `${new Date().toISOString()} mark: ${err.message}`;
+    log(`  mark: FAILED -- ${err.message}`);
+  }
+  recordRun(entry);
+}
+
+/** Whatever a slot is: the marking, or one kind of post. */
+const runSlot = (payrollPage, waPage, kind, reason) =>
+  kind === "mark" ? runMark(reason) : runPosts(payrollPage, waPage, kind, reason);
 
 /** One read of the payroll for every branch, so the five messages describe
  *  the same moment. */
@@ -146,10 +196,10 @@ async function readPayroll(kind) {
   if (kind === "reminder") return { pending: await fetchNotLoggedIn(token) };
 
   const records = await fetchAttendance(token);
-  if (kind === "report") return { records };
+  if (kind === "report" || kind === "logout") return { records };
 
   // The final report still goes without the list; it only loses the line
-  // that would show the 10am job had not run.
+  // that would show the 10:30 marking had not happened.
   let pending = null;
   try {
     pending = await fetchNotLoggedIn(token);
@@ -220,22 +270,9 @@ function saveDone(done) {
 // but a container started in the afternoon must not post the morning's.
 const CATCH_UP_MINUTES = 20;
 
-function slotsOfTheDay() {
-  return [
-    ...config.runTimes.map((label) => ({ label, kind: "report" })),
-    ...config.reminderTimes.map((label) => ({ label, kind: "reminder" })),
-    ...config.finalTimes.map((label) => ({ label, kind: "final" })),
-  ]
-    .map((slot) => {
-      const [h, m] = slot.label.split(":").map(Number);
-      return { ...slot, minutes: h * 60 + m };
-    })
-    .sort((a, b) => a.minutes - b.minutes);
-}
-
 async function schedule(payrollPage, waPage) {
   const done = loadDone();
-  const slots = slotsOfTheDay();
+  const slots = slotsOfTheDay(config);
   log(`schedule (IST, every day): ${slots.map((s) => `${s.label} ${s.kind}`).join(", ")}`);
 
   let busy = false;
@@ -252,7 +289,7 @@ async function schedule(payrollPage, waPage) {
       done.add(key);
       saveDone(done);
       try {
-        await runPosts(payrollPage, waPage, slot.kind, `scheduled ${slot.label}`);
+        await runSlot(payrollPage, waPage, slot.kind, `scheduled ${slot.label}`);
       } catch (err) {
         status.lastError = `${new Date().toISOString()} ${err.message}`;
         log("run failed:", err.message);
@@ -284,6 +321,14 @@ async function main() {
   fs.mkdirSync(config.outDir, { recursive: true });
   const missing = missingForPosting();
   if (missing.length) log(`WARNING: ${missing.join(", ")} not set -- the attendance cannot be read`);
+
+  if (KIND === "mark") {
+    // It writes attendance and sends nothing: never part of a capture-only
+    // run, and no browser for --once.
+    if (!ONCE) throw new Error("--kind=mark writes attendance; run it with --once, not --capture-only");
+    await runMark("once");
+    return;
+  }
 
   if (CAPTURE_ONLY) {
     if (KIND !== "report" || config.postAs === "text") {

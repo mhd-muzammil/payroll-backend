@@ -1159,11 +1159,11 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
         if existing:
             # A day already marked Absent or Leave with no punch on it -- by the
-            # 10am rule for not having logged in (mark_absent_no_login), or by
+            # 10:30 rule for not having logged in (attendance/absence.py), or by
             # the office. The Login is still accepted, and its time written on
             # that row: the app starts an engineer's duty, and the km, only once
             # this answers yes, so refusing it would cost them the day's trail.
-            # The status is NOT changed. In after 10am stays Absent -- the
+            # The status is NOT changed. In after 10:30 stays Absent -- the
             # office's rule -- and a Leave day stays Leave until they change it.
             if absence.is_day_mark(existing):
                 existing.intime = timezone.now()
@@ -1219,8 +1219,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
     def not_logged_in(self, request):
         """Who has not logged in yet today, by branch.
 
-        What the WhatsApp reminders post at 9:11 and 9:37 -- and, by the same
-        rule (attendance/absence.py), the people the 10am job will mark Absent.
+        What the WhatsApp reminders post at 9:13, 9:38 and 10:05 -- and, by the
+        same rule (attendance/absence.py), the people marked Absent at 10:30.
         `skip` says why there is nobody to chase: Sunday, or a day nobody at all
         has logged in. Office accounts only, scoped to their branches."""
         user = request.user
@@ -1243,6 +1243,41 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "cutoff": absence.CUTOFF.strftime("%H:%M"),
             "skip": skip,
             "branches": branches,
+        })
+
+    @action(detail=False, methods=["post"])
+    def mark_absent(self, request):
+        """Mark today's no-shows Absent, now: the 10:30 rule.
+
+        Asked for by the WhatsApp poster at 10:30, just before its 10:30
+        report, so the report can never go out ahead of the marking. Refused
+        before 10:30, and a no-op on a Sunday or a day nobody logged in --
+        attendance/absence.py has every rule. It marks every branch, so only
+        an office account that sees every branch may ask. Running it twice
+        marks nobody twice."""
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, "role", "employee")
+        if role not in ("superadmin", "admin", "hr") or "All" not in get_allowed_branches(user, "attendance"):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        try:
+            day, skip, people = absence.mark_today()
+        except absence.TooEarly as err:
+            return Response({"detail": str(err)}, status=400)
+
+        marked = {}
+        for person in people:
+            marked.setdefault(person.branch or "Chennai", []).append(person.employee_name)
+        logger.info(
+            "mark_absent by %s on %s: %s marked%s",
+            user.username, day, len(people), f" (skipped: {skip})" if skip else "",
+        )
+        return Response({
+            "date": day.isoformat(),
+            "cutoff": absence.CUTOFF.strftime("%H:%M"),
+            "skip": skip,
+            "count": len(people),
+            "marked": marked,
         })
 
 

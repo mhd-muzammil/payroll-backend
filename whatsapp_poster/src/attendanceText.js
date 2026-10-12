@@ -63,7 +63,7 @@ export const formatTime = (value) => {
 /**
  * Whether a record holds only a date -- an Absent or Leave day stored at
  * midnight that nobody punched. Not the status alone: somebody marked Absent
- * at 10am who logs in later has their Login recorded on that row, and the day
+ * at 10:30 who logs in later has their Login recorded on that row, and the day
  * stays Absent. (isDayMark in the page's attendanceUtils.js.)
  */
 const isDayMark = (record) => {
@@ -223,9 +223,9 @@ export const buildMessage = ({ rows, branch, now = new Date() }) => {
 
 const CLOCK_SHORT = new Intl.DateTimeFormat("en-IN", { timeStyle: "short", timeZone: ZONE });
 
-/** "10:00" from the server -> "10:00 am", the way the rest of the message says times. */
+/** "10:30" from the server -> "10:30 am", the way the rest of the message says times. */
 const cutoffWords = (cutoff) => {
-  const [h, m] = String(cutoff || "10:00").split(":").map(Number);
+  const [h, m] = String(cutoff || "10:30").split(":").map(Number);
   const at = new Date(Date.UTC(2000, 0, 1, h, m) - IST_OFFSET_MS);
   return plainSpaces(CLOCK_SHORT.format(at));
 };
@@ -237,19 +237,19 @@ const cutoffWords = (cutoff) => {
 const listed = (names) => names.map((name) => `• ${tidy(name) || "—"}`);
 
 /**
- * The 9:11 and 9:37 reminder: who in this branch has not logged in yet.
+ * The login reminder (9:13, 9:38, 10:05): who in this branch has not logged in yet.
  *
  *     *Login reminder* · *Salem branch*
- *     Saturday, 10 October 2026 · 9:11 am
+ *     Monday, 12 October 2026 · 9:13 am
  *
  *     Not logged in yet (2), please log in now:
  *     • Karthik S
  *     • Priya R
  *
- *     No login by 10:00 am = Absent.
+ *     No login by 10:30 am = Absent.
  *
  * English, as the office chose. The names are the server's list -- the same
- * people its 10am job marks Absent if they still have not logged in.
+ * people it marks Absent at 10:30 if they still have not logged in.
  */
 export const buildReminder = ({ branch, names, cutoff, now = new Date() }) =>
   [
@@ -263,12 +263,13 @@ export const buildReminder = ({ branch, names, cutoff, now = new Date() }) =>
   ].join("\n");
 
 /**
- * The 10:05 report, after the 10am rule has marked the no-shows Absent: the
+ * The final report -- at 10:30, right after the no-shows are marked Absent,
+ * and again at 9pm: the
  * count, then who is Absent, on leave and present, in that order.
  *
- * `notMarked` is anybody the server still lists as not logged in at 10:05. It
- * should be nobody -- they were marked Absent at 10:00 -- so a name there means
- * the 10am job did not run, and the message says so rather than counting them
+ * `notMarked` is anybody the server still lists as not logged in. After 10:30
+ * it should be nobody -- they were marked Absent -- so a name there means the
+ * marking did not happen, and the message says so rather than counting them
  * Absent when the register does not.
  */
 export const buildFinalReport = ({ rows, branch, notMarked = [], now = new Date() }) => {
@@ -290,7 +291,7 @@ export const buildFinalReport = ({ rows, branch, notMarked = [], now = new Date(
     counts.join(" · "),
   ];
 
-  // A Login after 10am is on the Absent row, and the day stays Absent.
+  // A Login after 10:30 is on the Absent row, and the day stays Absent.
   const lateLogin = (r) => (isDayMark(r) || !r.intime ? "" : ` — logged in ${formatTime(r.intime)}`);
   if (absent.length) {
     lines.push("", `*Absent (${absent.length})*`);
@@ -317,3 +318,31 @@ export const buildFinalReport = ({ rows, branch, notMarked = [], now = new Date(
   lines.push("", `_Generated ${plainSpaces(STAMP.format(now))}_`);
   return lines.join("\n");
 };
+
+/**
+ * Of a branch's rows for today, who logged in and has not logged out: a real
+ * Login (not a day-mark) with no logout. A Login after 10:30 counts too -- the
+ * day is Absent, but they are out working, and Logout is what closes their
+ * duty and their km.
+ */
+export const notLoggedOut = (rows) =>
+  rows.filter((r) => r.intime && !isDayMark(r) && !r.outtime).map((r) => r.employee_name);
+
+/**
+ * The 7:15pm reminder: who in this branch logged in and has not logged out.
+ *
+ *     *Logout reminder* · *Chennai branch*
+ *     Monday, 12 October 2026 · 7:15 pm
+ *
+ *     Not logged out yet (2), please log out:
+ *     • Karthik S
+ *     • Priya R
+ */
+export const buildLogoutReminder = ({ branch, names, now = new Date() }) =>
+  [
+    `*Logout reminder* · *${branch} branch*`,
+    `${plainSpaces(DAY.format(now))} · ${plainSpaces(CLOCK_SHORT.format(now))}`,
+    "",
+    `Not logged out yet (${names.length}), please log out:`,
+    ...listed(names),
+  ].join("\n");

@@ -1,14 +1,20 @@
-"""Who has not logged in today -- and, at 10am, marking them Absent.
+"""Who has not logged in today -- and, at 10:30am, marking them Absent.
 
-The office's rule: anybody who has not pressed Login by 10am is Absent for the
-day. Leave applied for in the app does not change that; the office corrects a
-leave day by hand.
+The office's rule: anybody who has not pressed Login by 10:30am is Absent for
+the day. (It was 10:00 for the first two days; the office moved it.) Leave
+applied for in the app does not change that; the office corrects a leave day
+by hand.
 
 One rule, read in two places that have to agree. The WhatsApp reminders at
-9:11 and 9:37 name the people who have not logged in yet, and the 10am job
-marks those same people Absent. A reminder that named somebody the job then
-skipped, or a job that marked somebody no reminder had named, would be worse
-than having neither -- so both ask `not_logged_in`, and nothing else.
+9:13, 9:38 and 10:05 name the people who have not logged in yet, and the
+10:30 marking marks those same people Absent. A reminder that named somebody
+the marking then skipped, or a marking of somebody no reminder had named,
+would be worse than having neither -- so both ask `not_logged_in`, and
+nothing else.
+
+The marking is asked for by the WhatsApp poster, at 10:30, just before its
+10:30 report -- so the report can never go out ahead of it -- through the
+mark_absent endpoint. `manage.py mark_absent_no_login` does the same by hand.
 
 Absent is not a label here, it is pay: a payslip's loss-of-pay days are the
 count of Absent rows in its cycle. So every rule below is about who must NOT
@@ -34,7 +40,7 @@ from attendance.models import Attendance
 from employees.models import Employee
 
 # Not logged in by then is Absent.
-CUTOFF = time(10, 0)
+CUTOFF = time(10, 30)
 
 SUNDAY = 6  # datetime.weekday()
 
@@ -136,3 +142,29 @@ def mark_absent(day, dry_run=False):
             ]
         )
     return people
+
+
+class TooEarly(Exception):
+    """Asked to mark before the cutoff: people still have time to log in."""
+
+
+def mark_today(now=None, dry_run=False):
+    """The 10:30 marking, for whoever asks for it -- the poster just before its
+    10:30 report, or the management command.
+
+    TODAY ONLY, and never before the cutoff. An Absent row is a day's pay, so
+    no date is taken: marking a past day would mark Absent everybody whose
+    attendance was simply never entered. Returns (day, skip, people), where
+    `skip` says why nobody was marked (Sunday, nobody logged in at all).
+    """
+    now = timezone.localtime(now) if now else timezone.localtime()
+    day = now.date()
+    if now.time() < CUTOFF:
+        raise TooEarly(
+            f"It is {now:%H:%M}. Nobody is marked Absent before {CUTOFF:%H:%M} -- "
+            "they still have time to log in."
+        )
+    skip = reason_to_skip(day)
+    if skip:
+        return day, skip, []
+    return day, None, mark_absent(day, dry_run=dry_run)

@@ -76,15 +76,23 @@ export const config = {
   // "text": the day's register as a message (the default -- the office asked
   // for text). "image": the Attendance page's "Today (Image)" picture.
   postAs: /^\s*image\s*$/i.test(env.POST_AS || "") ? "image" : "text",
-  // IST wall-clock times, HH:MM, comma separated. The office's day:
-  //   09:10 report, 09:11 reminder, 09:35 report, 09:37 reminder,
-  //   (10:00 the backend marks the no-shows Absent), 10:05 final report,
-  //   19:00 report, 21:00 report.
-  runTimes: times(env.RUN_TIMES, "09:10,09:35,19:00,21:00"),
+  // IST wall-clock times, HH:MM, comma separated. The office's day (12 Oct):
+  //   09:10 report      09:13 login reminder
+  //   09:35 report      09:38 login reminder
+  //   10:00 report      10:05 login reminder
+  //   10:30 the no-shows are marked Absent, then the final report
+  //   19:00 report      19:15 logout reminder
+  //   21:00 final report
+  runTimes: times(env.RUN_TIMES, "09:10,09:35,10:00,19:00"),
   // Who has not logged in yet, named, in each branch's group.
-  reminderTimes: times(env.REMINDER_TIMES, "09:11,09:37"),
-  // The report after 10am: Absent first, then on leave, then present.
-  finalTimes: times(env.FINAL_TIMES, "10:05"),
+  reminderTimes: times(env.REMINDER_TIMES, "09:13,09:38,10:05"),
+  // Asking the payroll to mark today's no-shows Absent. No message of its
+  // own; at the same minute as a final report it always runs first.
+  markTimes: times(env.MARK_TIMES, "10:30"),
+  // Absent first, then on leave, then present.
+  finalTimes: times(env.FINAL_TIMES, "10:30,21:00"),
+  // Who logged in and has not logged out yet.
+  logoutTimes: times(env.LOGOUT_TIMES, "19:15"),
 
   // While trying it out: every post goes to this one chat instead of the
   // branch groups ("Message yourself" works -- type your own name).

@@ -1,11 +1,11 @@
-"""Not logged in by 10am is Absent.
+"""Not logged in by 10:30am is Absent.
 
 Absent is pay -- a payslip's loss-of-pay days are the count of Absent rows --
 so most of what is pinned here is who must NOT be marked: anybody with a row
 already, anybody who could not have logged in, a Sunday, a day nobody logged
-in at all, and any run before 10am.
+in at all, and any run before 10:30.
 
-And the half that is easy to miss: a Login after 10am is still accepted. The
+And the half that is easy to miss: a Login after 10:30 is still accepted. The
 app starts an engineer's duty, and their km, only once Login answers yes; a
 refusal would cost them the whole day's trail. The day itself stays Absent.
 """
@@ -70,7 +70,7 @@ class MarkAbsentTests(People, TestCase):
 
     def _run(self, moment=None, *args):
         out = StringIO()
-        with _clock(moment or _at(WEDNESDAY, 10, 0, 5)):
+        with _clock(moment or _at(WEDNESDAY, 10, 30, 5)):
             call_command("mark_absent_no_login", *args, stdout=out)
         return out.getvalue()
 
@@ -141,7 +141,7 @@ class MarkAbsentTests(People, TestCase):
     def test_running_it_twice_marks_nobody_twice(self):
         self._run()
         first = Attendance.objects.count()
-        self._run(_at(WEDNESDAY, 10, 30))
+        self._run(_at(WEDNESDAY, 11, 0))
         self.assertEqual(Attendance.objects.count(), first)
 
     def test_other_days_are_untouched(self):
@@ -150,14 +150,14 @@ class MarkAbsentTests(People, TestCase):
 
     # ------------------------------------------------------------- the guards
 
-    def test_never_before_ten(self):
+    def test_never_before_half_past_ten(self):
         with self.assertRaises(CommandError) as caught:
-            self._run(_at(WEDNESDAY, 9, 59, 59))
-        self.assertIn("before 10:00", str(caught.exception))
+            self._run(_at(WEDNESDAY, 10, 29, 59))
+        self.assertIn("before 10:30", str(caught.exception))
         self.assertFalse(Attendance.objects.filter(status="Absent").exists())
 
     def test_never_on_a_sunday(self):
-        out = self._run(_at(SUNDAY, 10, 30))
+        out = self._run(_at(SUNDAY, 10, 45))
         self.assertIn("Sunday", out)
         self.assertFalse(Attendance.objects.filter(status="Absent").exists())
 
@@ -259,12 +259,12 @@ class NotLoggedInListTests(People, APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["branches"], {"Chennai": ["Anand K"], "Salem": ["Bala M"]})
         self.assertIsNone(response.data["skip"])
-        self.assertEqual(response.data["cutoff"], "10:00")
+        self.assertEqual(response.data["cutoff"], "10:30")
         self.assertEqual(response.data["date"], WEDNESDAY.isoformat())
 
-    def test_it_is_the_list_the_ten_oclock_job_marks(self):
+    def test_it_is_the_list_the_marking_marks(self):
         listed = self._get(self.office, _at(WEDNESDAY, 9, 37)).data["branches"]
-        with _clock(_at(WEDNESDAY, 10, 0, 5)):
+        with _clock(_at(WEDNESDAY, 10, 30, 5)):
             call_command("mark_absent_no_login", stdout=StringIO())
         marked = {}
         for row in Attendance.objects.filter(status="Absent").select_related("employee"):
@@ -293,3 +293,63 @@ class NotLoggedInListTests(People, APITestCase):
     def test_an_employee_cannot_read_it(self):
         response = self._get(self.anand.user, _at(WEDNESDAY, 9, 11))
         self.assertEqual(response.status_code, 403)
+
+
+class MarkAbsentEndpointTests(People, APITestCase):
+    """POST /api/attendance/mark_absent/ -- what the poster asks for at 10:30,
+    just before its 10:30 report."""
+
+    def setUp(self):
+        self.anand = self._person("Anand K")
+        self.bala = self._person("Bala M", branch="Salem")
+        self.chitra = self._person("Chitra R")
+        self._row(self.chitra, WEDNESDAY, "Present", hour=9)
+        self.office = User.objects.create_user(username="office", password="x", role="admin")
+
+    def _post(self, user, moment):
+        self.client.force_authenticate(user)
+        with _clock(moment):
+            return self.client.post("/api/attendance/mark_absent/")
+
+    def test_it_marks_the_no_shows_and_says_who(self):
+        response = self._post(self.office, _at(WEDNESDAY, 10, 30, 2))
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["marked"], {"Chennai": ["Anand K"], "Salem": ["Bala M"]})
+        self.assertIsNone(response.data["skip"])
+        self.assertEqual(
+            sorted(Attendance.objects.filter(status="Absent").values_list("employee_name", flat=True)),
+            ["Anand K", "Bala M"],
+        )
+
+    def test_asked_twice_marks_nobody_twice(self):
+        self._post(self.office, _at(WEDNESDAY, 10, 30, 2))
+        again = self._post(self.office, _at(WEDNESDAY, 10, 31))
+        self.assertEqual(again.data["count"], 0)
+        self.assertEqual(Attendance.objects.filter(status="Absent").count(), 2)
+
+    def test_refused_before_half_past_ten(self):
+        response = self._post(self.office, _at(WEDNESDAY, 10, 29, 59))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("before 10:30", response.data["detail"])
+        self.assertFalse(Attendance.objects.filter(status="Absent").exists())
+
+    def test_nothing_on_a_sunday(self):
+        response = self._post(self.office, _at(SUNDAY, 10, 30, 2))
+        self.assertEqual(response.data["skip"], "Sunday")
+        self.assertFalse(Attendance.objects.filter(status="Absent").exists())
+
+    def test_an_employee_cannot_ask(self):
+        response = self._post(self.anand.user, _at(WEDNESDAY, 10, 30, 2))
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Attendance.objects.filter(status="Absent").exists())
+
+    def test_a_one_branch_office_cannot_ask(self):
+        # It marks every branch; an office that sees only Salem must not.
+        salem_office = User.objects.create_user(
+            username="salem.office", password="x", role="hr",
+            allowed_sections={"attendance": ["Salem"]},
+        )
+        response = self._post(salem_office, _at(WEDNESDAY, 10, 30, 2))
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Attendance.objects.filter(status="Absent").exists())

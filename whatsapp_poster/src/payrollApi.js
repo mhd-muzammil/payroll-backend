@@ -65,6 +65,22 @@ export async function fetchNotLoggedIn(token) {
   }
 }
 
+/**
+ * Ask the payroll to mark today's no-shows Absent -- the office's 10:30 rule,
+ * run by the server (attendance/absence.py), refused before 10:30, a no-op on
+ * a Sunday or a day nobody logged in. {date, cutoff, skip, count, marked}.
+ */
+export async function markAbsent(token) {
+  try {
+    return await call("/api/attendance/mark_absent/", { method: "POST", token: token || (await signIn()) });
+  } catch (err) {
+    if (err.status === 404) {
+      throw new Error("payroll: /api/attendance/mark_absent/ is not there -- redeploy the backend");
+    }
+    throw err;
+  }
+}
+
 /** Every attendance row the poster's login can see. */
 export async function fetchAttendance(token) {
   const data = await call("/api/attendance/", { token: token || (await signIn()) });

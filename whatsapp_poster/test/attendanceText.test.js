@@ -3,8 +3,10 @@ import test from "node:test";
 
 import {
   buildFinalReport,
+  buildLogoutReminder,
   buildMessage,
   buildReminder,
+  notLoggedOut,
   formatTime,
   hoursBetween,
   punchTime,
@@ -176,4 +178,35 @@ test("no line starts the way WhatsApp turns into a list", () => {
       assert.doesNotMatch(line, /^(\d+[.)] |[-*>] )/, `"${line}"`);
     }
   }
+});
+
+test("the logout reminder names who logged in and has not logged out", () => {
+  const rows = [
+    { employee_name: "Done Already", status: "Present", intime: at("09:00"), outtime: at("18:30") },
+    { employee_name: "Still Out", status: "Present", intime: at("09:10") },
+    // In after 10:30: Absent for the day, but out working, and Logout ends their duty.
+    { employee_name: "Late Comer", status: "Absent", intime: at("10:42") },
+    // Marked Absent, never came: there is no Login to close.
+    { employee_name: "Never Came", status: "Absent", intime: at("00:00") },
+    { employee_name: "On Leave", status: "Leave", intime: at("00:00") },
+  ];
+  assert.deepEqual(notLoggedOut(rows), ["Still Out", "Late Comer"]);
+
+  const now = new Date("2026-10-12T13:45:00Z"); // 7:15 pm in India
+  assert.equal(
+    buildLogoutReminder({ branch: "Chennai", names: ["Still Out", "Late Comer"], now }),
+    [
+      "*Logout reminder* · *Chennai branch*",
+      "Monday, 12 October 2026 · 7:15 pm",
+      "",
+      "Not logged out yet (2), please log out:",
+      "• Still Out",
+      "• Late Comer",
+    ].join("\n"),
+  );
+});
+
+test("the reminder says the 10:30 the server sends", () => {
+  const text = buildReminder({ branch: "Salem", names: ["A"], cutoff: "10:30", now: new Date("2026-10-12T03:43:00Z") });
+  assert.match(text, /No login by 10:30 am = Absent\.$/);
 });
