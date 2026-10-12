@@ -8,6 +8,12 @@ class AttendanceSerializer(serializers.ModelSerializer):
     employee_id = serializers.IntegerField(source="employee.id", read_only=True)
     branch = serializers.SerializerMethodField()
     email = serializers.SerializerMethodField()
+    # The employee's role now. `role` on the row is a copy taken the day the
+    # row was written, and roles have been renamed since -- "Service engineer"
+    # is "FIELD ENGINEER" on the employee today -- so the Attendance page's role
+    # filter, built from the copies, listed names nobody uses any more and
+    # split one person's days between two of them. The filter reads this.
+    employee_role = serializers.SerializerMethodField()
 
     class Meta:
         model = Attendance
@@ -26,6 +32,10 @@ class AttendanceSerializer(serializers.ModelSerializer):
         # Expose the employee's email so the attendance view can show it and
         # duplicate/namesake rows can be told apart.
         return obj.employee.email if obj.employee else None
+
+    def get_employee_role(self, obj):
+        # A row that belongs to nobody has only its copy to go by.
+        return obj.employee.role if obj.employee else obj.role
 
     def _get_employee_for_user(self, user):
         try:
