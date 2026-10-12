@@ -1877,6 +1877,11 @@ class TrackingViewSet(viewsets.ViewSet):
                     "payroll_name": engineer.employee_name,
                     "matched": True,
                     "branch": engineer.branch,
+                    # So a board showing office staff beside the engineers can
+                    # say who is who, and filter by department. Added alongside;
+                    # nothing reads them otherwise.
+                    "role": engineer.role,
+                    "department": engineer.department,
                     "state": state,
                     "on_duty": state == "on_duty",
                     "duty_started_at": session.started_at if session else None,
@@ -1911,6 +1916,8 @@ class TrackingViewSet(viewsets.ViewSet):
                     "payroll_name": None,
                     "matched": False,
                     "branch": None,
+                    "role": None,
+                    "department": None,
                     "state": "unmatched",
                     "on_duty": False,
                     "duty_started_at": None,
