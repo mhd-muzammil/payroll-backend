@@ -13,7 +13,7 @@ the office's day (IST, every day but what is skipped below):
 | 10:05 | login reminder |
 | 10:30 | *the payroll marks everybody not logged in Absent* — then the final report (Absent first, then on leave, then present) |
 | 19:00 | report |
-| 19:15 | logout reminder — who logged in and has not logged out |
+| 20:30 | logout reminder — who logged in and has not logged out |
 | 21:00 | final report |
 
 The report:
@@ -86,7 +86,7 @@ those people under *Not logged in, not marked Absent yet*.
    REMINDER_TIMES=09:13,09:38,10:05
    MARK_TIMES=10:30
    FINAL_TIMES=10:30,21:00
-   LOGOUT_TIMES=19:15
+   LOGOUT_TIMES=20:30
    ```
 
    ```

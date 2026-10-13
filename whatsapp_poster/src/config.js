@@ -81,7 +81,7 @@ export const config = {
   //   09:35 report      09:38 login reminder
   //   10:00 report      10:05 login reminder
   //   10:30 the no-shows are marked Absent, then the final report
-  //   19:00 report      19:15 logout reminder
+  //   19:00 report      20:30 logout reminder
   //   21:00 final report
   runTimes: times(env.RUN_TIMES, "09:10,09:35,10:00,19:00"),
   // Who has not logged in yet, named, in each branch's group.
@@ -91,8 +91,9 @@ export const config = {
   markTimes: times(env.MARK_TIMES, "10:30"),
   // Absent first, then on leave, then present.
   finalTimes: times(env.FINAL_TIMES, "10:30,21:00"),
-  // Who logged in and has not logged out yet.
-  logoutTimes: times(env.LOGOUT_TIMES, "19:15"),
+  // Who logged in and has not logged out yet. 20:30: the office moved it from
+  // 19:15 on 13 Oct.
+  logoutTimes: times(env.LOGOUT_TIMES, "20:30"),
 
   // While trying it out: every post goes to this one chat instead of the
   // branch groups ("Message yourself" works -- type your own name).

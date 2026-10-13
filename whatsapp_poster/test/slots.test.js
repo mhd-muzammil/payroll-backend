@@ -5,8 +5,9 @@ import { config } from "../src/config.js";
 import { slotsOfTheDay } from "../src/slots.js";
 
 test("the office's day, in order", () => {
-  // The defaults, as the office set them on 12 Oct 2026. (A test run has no
-  // RUN_TIMES & co in its environment, unless somebody's shell sets them.)
+  // The defaults, as the office set them on 12 Oct 2026 -- with the logout
+  // reminder moved from 19:15 to 20:30 on 13 Oct. (A test run has no RUN_TIMES
+  // & co in its environment, unless somebody's shell sets them.)
   const day = slotsOfTheDay(config).map((s) => `${s.label} ${s.kind}`);
   assert.deepEqual(day, [
     "09:10 report",
@@ -18,7 +19,7 @@ test("the office's day, in order", () => {
     "10:30 mark",
     "10:30 final",
     "19:00 report",
-    "19:15 logout",
+    "20:30 logout",
     "21:00 final",
   ]);
 });

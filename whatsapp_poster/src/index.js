@@ -6,7 +6,7 @@
  *   09:35  report        09:38  login reminder
  *   10:00  report        10:05  login reminder
  *   10:30  mark: the payroll marks the no-shows Absent -- then the final report
- *   19:00  report        19:15  logout reminder: who has not logged out yet
+ *   19:00  report        20:30  logout reminder: who has not logged out yet
  *   21:00  final report
  *
  *   node src/index.js                          run for ever, on that schedule
