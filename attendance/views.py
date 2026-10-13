@@ -1272,12 +1272,29 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             "mark_absent by %s on %s: %s marked%s",
             user.username, day, len(people), f" (skipped: {skip})" if skip else "",
         )
+
+        # The same call marks the cycle's Sundays that are over, so the
+        # Monday's 10:30 writes the Sunday just gone -- nobody has to run a
+        # weekly job, and there is no schedule to forget. Its own try: the
+        # Absent rows above are already written, and a Sunday that could not
+        # be marked must not make the poster report the whole marking failed.
+        sundays, sunday_error = {}, None
+        try:
+            sundays = {d.isoformat(): len(p) for d, p in absence.mark_sundays(day).items()}
+            if any(sundays.values()):
+                logger.info("mark_absent by %s: Sundays marked %s", user.username, sundays)
+        except Exception as err:  # noqa: BLE001 -- reported, never swallowed silently
+            sunday_error = str(err)
+            logger.exception("mark_absent by %s: marking Sundays failed", user.username)
+
         return Response({
             "date": day.isoformat(),
             "cutoff": absence.CUTOFF.strftime("%H:%M"),
             "skip": skip,
             "count": len(people),
             "marked": marked,
+            "sundays": sundays,
+            "sundays_error": sunday_error,
         })
 
 

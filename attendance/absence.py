@@ -20,7 +20,9 @@ Absent is not a label here, it is pay: a payslip's loss-of-pay days are the
 count of Absent rows in its cycle. So every rule below is about who must NOT
 be marked:
 
-  * Sunday. It is marked Leave for everybody by mark_sunday_leave.
+  * Sunday. It is a day off, marked as one (Leave, shown as "Sunday") by
+    mark_sundays below -- the same 10:30 call marks the cycle's Sundays that
+    are over, so the Monday's marking writes the Sunday just gone.
   * A day nobody at all has logged in. That is a holiday, or the app was down,
     and a whole company of Absent rows is the one mistake that must not happen.
   * Anybody who could not have logged in: not 'active' (inactive, relieved,
@@ -30,7 +32,7 @@ be marked:
     office marked -- whatever it says.
 """
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from django.db import transaction
 from django.db.models import Q
@@ -142,6 +144,71 @@ def mark_absent(day, dry_run=False):
             ]
         )
     return people
+
+
+def cycle_start(day):
+    """The 25th that opened the pay cycle `day` falls in."""
+    if day.day >= 25:
+        return day.replace(day=25)
+    return (day.replace(day=1) - timedelta(days=1)).replace(day=25)
+
+
+def sundays_gone_by(today):
+    """Every Sunday of the current pay cycle that is already over.
+
+    Over, so never today: on the Sunday itself somebody may still come in,
+    and their day is a Login, not a day off -- the Sunday is marked the next
+    time anybody asks, which is the Monday's 10:30 marking. The whole cycle
+    rather than the last Sunday alone, so a week the poster was down is caught
+    up, and a register started mid-cycle fills its earlier Sundays.
+    """
+    start = cycle_start(today)
+    sunday = start + timedelta(days=(SUNDAY - start.weekday()) % 7)
+    sundays = []
+    while sunday < today:
+        sundays.append(sunday)
+        sunday += timedelta(days=7)
+    return sundays
+
+
+def mark_sunday(day, dry_run=False):
+    """Write a Sunday for everybody in `not_logged_in(day)` -- the same people
+    the 10:30 rule would mark Absent on a working day, so the week reads as one
+    list of people.
+
+    Stored as Leave at midnight, which is what a Sunday has always been in the
+    register: the attendance page shows a Leave on a Sunday as "Sunday", and
+    the payslip, which counts only Absent rows, pays it. Whoever has anything
+    on the day already -- somebody who came in -- keeps it, and running it
+    again marks nobody twice.
+    """
+    people = not_logged_in(day)
+    if dry_run or not people:
+        return people
+
+    marked_at = timezone.make_aware(datetime.combine(day, DAY_MARK))
+    with transaction.atomic():
+        Attendance.objects.bulk_create(
+            [
+                Attendance(
+                    employee=person,
+                    employee_name=person.employee_name,
+                    role=person.role,
+                    department=person.department,
+                    salary=person.salary,
+                    intime=marked_at,
+                    outtime=None,
+                    status="Leave",
+                )
+                for person in people
+            ]
+        )
+    return people
+
+
+def mark_sundays(today, dry_run=False):
+    """Mark every Sunday of the cycle gone by. Returns {sunday: people marked}."""
+    return {sunday: mark_sunday(sunday, dry_run=dry_run) for sunday in sundays_gone_by(today)}
 
 
 class TooEarly(Exception):

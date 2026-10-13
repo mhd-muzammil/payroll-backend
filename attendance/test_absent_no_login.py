@@ -353,3 +353,163 @@ class MarkAbsentEndpointTests(People, APITestCase):
         response = self._post(salem_office, _at(WEDNESDAY, 10, 30, 2))
         self.assertEqual(response.status_code, 403)
         self.assertFalse(Attendance.objects.filter(status="Absent").exists())
+
+
+MONDAY = datetime.date(2026, 10, 12)
+TUESDAY = datetime.date(2026, 10, 13)
+CYCLE_SUNDAYS = [datetime.date(2026, 9, 27), datetime.date(2026, 10, 4), SUNDAY]
+
+
+class SundayMarkingTests(People, APITestCase):
+    """The same 10:30 call marks the cycle's Sundays that are over -- so the
+    Monday's marking writes the Sunday just gone, with no weekly job to
+    schedule. A Sunday is a day off, stored as Leave and paid: never Absent."""
+
+    def setUp(self):
+        self.anand = self._person("Anand K")
+        self.bala = self._person("Bala M", branch="Salem")
+        self.chitra = self._person("Chitra R")
+        self.office = User.objects.create_user(username="office", password="x", role="admin")
+
+    def _post(self, moment):
+        self.client.force_authenticate(self.office)
+        with _clock(moment):
+            return self.client.post("/api/attendance/mark_absent/")
+
+    def _sunday_names(self, day):
+        return sorted(
+            Attendance.objects.filter(intime__date=day, status="Leave").values_list("employee_name", flat=True)
+        )
+
+    # ------------------------------------------------------------ what it does
+
+    def test_monday_marks_the_sunday_just_gone(self):
+        response = self._post(_at(MONDAY, 10, 30, 2))
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(self._sunday_names(SUNDAY), ["Anand K", "Bala M", "Chitra R"])
+        self.assertEqual(response.data["sundays"][SUNDAY.isoformat()], 3)
+        self.assertIsNone(response.data["sundays_error"])
+
+    def test_the_row_is_a_day_off_like_any_other(self):
+        self._post(_at(MONDAY, 10, 30, 2))
+        row = Attendance.objects.get(employee=self.anand, intime__date=SUNDAY)
+        self.assertEqual(row.status, "Leave", "a Sunday is paid: never Absent")
+        at = timezone.localtime(row.intime)
+        self.assertEqual((at.date(), at.hour, at.minute), (SUNDAY, 0, 0), "the date, not an arrival")
+        self.assertIsNone(row.outtime)
+        self.assertEqual(row.employee_name, "Anand K")
+        self.assertEqual(row.salary, self.anand.salary)
+        self.assertFalse(Attendance.objects.filter(status="Absent", intime__date=SUNDAY).exists())
+
+    def test_the_sunday_itself_is_left_for_the_monday(self):
+        # Somebody may still come in on the Sunday; their day is a Login.
+        response = self._post(_at(SUNDAY, 10, 30, 2))
+        self.assertEqual(response.data["skip"], "Sunday")
+        self.assertEqual(self._sunday_names(SUNDAY), [])
+        self.assertNotIn(SUNDAY.isoformat(), response.data["sundays"])
+
+    def test_the_cycle_is_caught_up_and_nothing_before_it(self):
+        self._post(_at(TUESDAY, 10, 30, 2))
+        for sunday in CYCLE_SUNDAYS:
+            self.assertEqual(self._sunday_names(sunday), ["Anand K", "Bala M", "Chitra R"], sunday)
+        # 20 September belongs to the cycle before (25 Aug - 24 Sep).
+        self.assertEqual(self._sunday_names(datetime.date(2026, 9, 20)), [])
+        self.assertEqual(Attendance.objects.count(), 9)
+
+    def test_the_absent_marking_is_unchanged_beside_it(self):
+        self._row(self.chitra, MONDAY, "Present", hour=9)
+        response = self._post(_at(MONDAY, 10, 30, 2))
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["marked"], {"Chennai": ["Anand K"], "Salem": ["Bala M"]})
+        self.assertEqual(
+            sorted(Attendance.objects.filter(status="Absent").values_list("employee_name", flat=True)),
+            ["Anand K", "Bala M"],
+        )
+        self.assertFalse(Attendance.objects.filter(status="Absent").exclude(intime__date=MONDAY).exists())
+
+    # -------------------------------------------------- what it must not touch
+
+    def test_somebody_who_came_in_on_the_sunday_keeps_their_day(self):
+        self._row(self.chitra, SUNDAY, "Present", hour=9)
+        self._post(_at(MONDAY, 10, 30, 2))
+        statuses = list(
+            Attendance.objects.filter(employee=self.chitra, intime__date=SUNDAY).values_list("status", flat=True)
+        )
+        self.assertEqual(statuses, ["Present"])
+
+    def test_a_row_the_office_saved_belonging_to_nobody_is_recognised_by_name(self):
+        self._row(self.bala, SUNDAY, "Leave", hour=0, link=False)
+        self._post(_at(MONDAY, 10, 30, 2))
+        self.assertEqual(
+            Attendance.objects.filter(employee_name="Bala M", intime__date=SUNDAY).count(), 1
+        )
+
+    def test_only_the_people_who_log_in_get_a_sunday(self):
+        cannot = [
+            self._person("Inactive One", status="inactive"),
+            self._person("Relieved One", status="relieved"),
+            self._person("No Account", account=False),
+            self._person("Admin Account", role="admin"),
+        ]
+        switched_off = self._person("Switched Off")
+        switched_off.user.is_active = False
+        switched_off.user.save()
+        cannot.append(switched_off)
+        self._post(_at(TUESDAY, 10, 30, 2))
+        for person in cannot:
+            self.assertFalse(Attendance.objects.filter(employee=person).exists(), person.employee_name)
+
+    def test_a_sunday_before_somebody_joined_is_not_theirs(self):
+        late = self._person("Late Joiner", date_of_joining=datetime.date(2026, 10, 5))
+        self._post(_at(TUESDAY, 10, 30, 2))
+        days = sorted(
+            timezone.localtime(at).date()
+            for at in Attendance.objects.filter(employee=late).values_list("intime", flat=True)
+        )
+        self.assertEqual(days, [SUNDAY], "4 October was before they joined")
+
+    def test_asked_again_marks_nobody_twice(self):
+        self._post(_at(MONDAY, 10, 30, 2))
+        first = Attendance.objects.count()
+        again = self._post(_at(TUESDAY, 10, 30, 2))
+        self.assertEqual(Attendance.objects.count(), first)
+        self.assertEqual(sum(again.data["sundays"].values()), 0)
+
+    def test_nothing_before_half_past_ten(self):
+        response = self._post(_at(MONDAY, 10, 29, 59))
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Attendance.objects.exists())
+
+    def test_a_sunday_that_cannot_be_marked_does_not_hide_the_absent_marking(self):
+        self._row(self.chitra, MONDAY, "Present", hour=9)
+        with mock.patch("attendance.absence.mark_sundays", side_effect=RuntimeError("database away")):
+            response = self._post(_at(MONDAY, 10, 30, 2))
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(response.data["sundays"], {})
+        self.assertIn("database away", response.data["sundays_error"])
+
+
+class CycleTests(TestCase):
+    def test_cycle_start_is_the_25th(self):
+        from attendance.absence import cycle_start
+
+        D = datetime.date
+        self.assertEqual(cycle_start(D(2026, 10, 13)), D(2026, 9, 25))
+        self.assertEqual(cycle_start(D(2026, 10, 24)), D(2026, 9, 25))
+        self.assertEqual(cycle_start(D(2026, 10, 25)), D(2026, 10, 25))
+        self.assertEqual(cycle_start(D(2026, 10, 31)), D(2026, 10, 25))
+        self.assertEqual(cycle_start(D(2027, 1, 10)), D(2026, 12, 25))
+        self.assertEqual(cycle_start(D(2026, 3, 3)), D(2026, 2, 25))
+
+    def test_the_sundays_gone_by(self):
+        from attendance.absence import sundays_gone_by
+
+        D = datetime.date
+        self.assertEqual(sundays_gone_by(MONDAY), CYCLE_SUNDAYS)
+        self.assertEqual(sundays_gone_by(SUNDAY), CYCLE_SUNDAYS[:2], "never the day itself")
+        self.assertEqual(sundays_gone_by(D(2026, 9, 25)), [])
+        self.assertEqual(sundays_gone_by(D(2026, 9, 28)), [D(2026, 9, 27)])
+        # A new cycle starts empty: 25 Oct is a Sunday and is the day itself.
+        self.assertEqual(sundays_gone_by(D(2026, 10, 25)), [])
+        self.assertEqual(sundays_gone_by(D(2026, 10, 26)), [D(2026, 10, 25)])
