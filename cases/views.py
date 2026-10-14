@@ -17,6 +17,7 @@ from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSeri
 from .pings import MAX_BATCH, PingRejected, build_ping, coerce_number, ingest_batch
 from .tracks import snapped_trail
 from . import places
+from . import olamaps, route_km
 from employees.models import Employee
 from authentication.models import get_allowed_branches
 
@@ -1246,7 +1247,13 @@ class CaseViewSet(viewsets.ModelViewSet):
             visit.punch_out_accuracy = extra.get("punch_out_accuracy", visit.punch_out_accuracy)
             if extra.get("resolution_notes"):
                 visit.resolution_notes = extra["resolution_notes"]
-        if visit.engineer_id is None:
+        if stamp_field == "reached_at" and case.assigned_to_id:
+            # Only the call's engineer can check in, so whoever holds it now is
+            # who made this visit -- also when it was booked to someone else
+            # earlier the same day and the day's row still names them. ROUTE KM
+            # credits the check-in by this; nothing else reads it.
+            visit.engineer = case.assigned_to
+        elif visit.engineer_id is None:
             visit.engineer = case.assigned_to
         if visit.assigned_at is None:
             visit.assigned_at = case.assigned_at
@@ -2428,3 +2435,205 @@ class TrackingViewSet(viewsets.ViewSet):
                 ],
             }
         )
+
+    # -- ROUTE KM -------------------------------------------------------------
+
+    @action(detail=False, methods=["post"], url_path="route_km")
+    def route_km(self, request):
+        """ROUTE KM for the KM report: every engineer's road distance, day by
+        day, through the places they marked -- Login, every Check in, Logout.
+
+        Body: {"engineers": [<employee id>, ...], "from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}
+
+        Measuring is a metered call to Ola, paced per minute, so one request
+        measures a few cells and says how many are still `pending`; the report
+        polls until that is 0. Which cells are measured, and when one is
+        measured again, is decided in cases/route_km.py.
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        data = request.data if isinstance(request.data, dict) else {}
+
+        raw_ids = data.get("engineers")
+        if not isinstance(raw_ids, list) or len(raw_ids) > route_km.MAX_ENGINEERS:
+            return Response(
+                {"detail": f"engineers must be a list of at most {route_km.MAX_ENGINEERS} ids."},
+                status=400,
+            )
+        ids = []
+        for raw in raw_ids:
+            # An id as JSON carries it, or as a string of digits. A bool is an
+            # int to Python, and a number past the database's integer would
+            # overflow the query instead of matching nobody, so neither is one.
+            # Its length is checked before int() is asked: Python refuses to
+            # read a string of more than 4,300 digits, and that would be a 500.
+            text = "" if isinstance(raw, bool) or not isinstance(raw, (int, str)) else str(raw)
+            if not (text.isascii() and text.isdigit()) or len(text) > 19 or int(text) >= 2**63:
+                return Response({"detail": "engineers must be a list of numeric ids."}, status=400)
+            if int(text) not in ids:
+                ids.append(int(text))
+
+        bounds = []
+        for name in ("from", "to"):
+            value = data.get(name)
+            try:
+                parsed = parse_date(value) if isinstance(value, str) else None
+            except ValueError:
+                parsed = None
+            if not parsed:
+                return Response({"detail": f"{name} must be YYYY-MM-DD."}, status=400)
+            bounds.append(parsed)
+        start, end = bounds
+        if start > end:
+            return Response({"detail": "from must not be after to."}, status=400)
+        if (end - start).days + 1 > route_km.MAX_DAYS:
+            return Response(
+                {"detail": f"from and to may cover at most {route_km.MAX_DAYS} days."},
+                status=400,
+            )
+
+        # Nothing after today: a day that has not happened has nothing marked.
+        end = min(end, timezone.localdate())
+        days = [start + timedelta(days=n) for n in range((end - start).days + 1)]
+        day_keys = [day.isoformat() for day in days]
+
+        if not olamaps.is_configured():
+            return Response(
+                {
+                    "configured": False,
+                    "days": day_keys,
+                    "engineers": [],
+                    "pending": 0,
+                    "rechecking": 0,
+                    "measured_now": 0,
+                }
+            )
+
+        # Only the engineers this user may see, as on the day view. An id that
+        # matches nobody is simply not in the answer.
+        branches = get_allowed_branches(request.user, "attendance")
+        visible = Employee.objects.filter(pk__in=ids)
+        if "All" not in branches:
+            visible = visible.filter(branch__in=branches)
+        visible = set(visible.values_list("pk", flat=True))
+        ids = [engineer_id for engineer_id in ids if engineer_id in visible]
+
+        # One clock for the work and the count, so a cell read in this request
+        # is never counted as still to be read.
+        now = timezone.now()
+        measured_now = route_km.refresh(ids, days, now=now)
+
+        stored = route_km.rows(ids, days)
+        # Two counts, so the report knows what it is waiting for: `pending`
+        # cells wait on Ola; `rechecking` ones are today's, measured, whose
+        # places may have moved since they were read. The report keeps asking
+        # while either is above 0, and shows the km it has meanwhile.
+        pending = 0
+        rechecking = 0
+        engineers = []
+        for engineer_id in ids:
+            cells = {}
+            for day in days:
+                row = stored.get((engineer_id, day))
+                if route_km.is_pending(row, now):
+                    pending += 1
+                elif route_km.is_rechecking(row, now):
+                    rechecking += 1
+                if row is None or row.status == "pending":
+                    cells[day.isoformat()] = {
+                        "km": None, "points": 0, "status": "pending", "office": False, "final": False
+                    }
+                    continue
+                cells[day.isoformat()] = {
+                    "km": row.km if row.status == "ready" else None,
+                    "points": len(row.points or []),
+                    "status": row.status,
+                    # A Login or Logout in it was put at the office, for want
+                    # of a fix -- so the table can say so beside the km.
+                    "office": any(point.get("office") for point in row.points or []),
+                    # Settled for good: a failed day that is will not be tried
+                    # again, and the table must not promise that it will.
+                    "final": row.final,
+                }
+            engineers.append({"engineer_id": engineer_id, "days": cells})
+
+        return Response(
+            {
+                "configured": True,
+                "days": day_keys,
+                "engineers": engineers,
+                "pending": pending,
+                "rechecking": rechecking,
+                "measured_now": measured_now,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="route_km_day")
+    def route_km_day(self, request):
+        """One ROUTE KM cell, for the map beside the table: the points in the
+        order they were marked, Ola's road route through them, and the km.
+
+        Query: ?engineer=<id>&date=YYYY-MM-DD
+
+        Asking measures this one cell if it is due and the minute's allowance
+        lasts. If it does not, the answer is "pending" with the points read now,
+        so the map can show where they were while the km is waited for.
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        raw_engineer = request.query_params.get("engineer") or ""
+        if not (raw_engineer.isascii() and raw_engineer.isdigit()) or int(raw_engineer) >= 2**63:
+            return Response({"detail": "engineer must be a numeric id."}, status=400)
+        engineer = Employee.objects.filter(pk=int(raw_engineer)).first()
+        if not engineer:
+            return Response({"detail": "Engineer not found."}, status=404)
+
+        branches = get_allowed_branches(request.user, "attendance")
+        if "All" not in branches and engineer.branch not in branches:
+            return Response({"detail": "Permission denied."}, status=403)
+
+        date_str = request.query_params.get("date")
+        try:
+            target_date = parse_date(date_str) if date_str else None
+        except ValueError:
+            target_date = None
+        if not target_date or target_date > timezone.localdate():
+            return Response({"detail": "date must be YYYY-MM-DD, today or earlier."}, status=400)
+
+        answer = {
+            "configured": True,
+            "engineer_id": engineer.id,
+            "date": target_date.isoformat(),
+            "status": "pending",
+            "km": None,
+            "points": [],
+            "path": [],
+            "error": "",
+            "final": False,
+        }
+        if not olamaps.is_configured():
+            answer["configured"] = False
+            return Response(answer)
+
+        route_km.refresh(
+            [engineer.id], [target_date], work_limit=1, measure_limit=1, time_budget=15.0
+        )
+        row = route_km.rows([engineer.id], [target_date]).get((engineer.id, target_date))
+        if row is None or row.status == "pending":
+            # Not measured yet: the minute's allowance is spent, or Ola has
+            # asked us to wait. The points cost nothing, so the map has them.
+            answer["points"] = route_km.key_points(engineer, target_date)
+            return Response(answer)
+
+        ready = row.status == "ready"
+        answer.update(
+            status=row.status,
+            km=row.km if ready else None,
+            points=row.points or [],
+            path=(row.path or []) if ready else [],
+            error=row.error if row.status == "failed" else "",
+            final=row.final,
+        )
+        return Response(answer)

@@ -504,3 +504,70 @@ class CaseVisit(models.Model):
 
     def __str__(self):
         return f"{self.case_id} on {self.plan_date}"
+
+
+class RouteKmDay(models.Model):
+    """One engineer's day, measured by road through the places they marked.
+
+    Login, every Check in, Logout -- in the order they happened -- and the road
+    distance through them, from Ola's Directions. It is the KM report's second
+    table, beside the GPS kilometres, and it answers a different question: not
+    how far the phone saw them go, but how far it is by road between the places
+    the engineer themselves said they were.
+
+    Measured ONCE and kept. Directions is metered and Ola throttles per minute,
+    and a bill cycle of twenty engineers is six hundred cells, so a cell is
+    measured again only when the points under it change -- `signature` is how
+    that is known without asking Ola. `final` is set once the day is settled,
+    and a final row is served as it is, its points never read again.
+    """
+
+    engineer = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="route_km_days",
+    )
+    # The IST calendar day, the way the KM report asks for it.
+    day = models.DateField(db_index=True)
+    # The points the km was measured through: [{"kind", "at", "latitude",
+    # "longitude", "case_number"}, ...] in time order, "at" as an ISO string.
+    # Kept beside the figure so the map drawn next to a km is the route that km
+    # is for, even while a later tap is waiting to be measured.
+    points = models.JSONField(default=list, blank=True)
+    # A hash of those points' kinds and places. The same signature on the next
+    # look means nothing has moved and the stored km still holds, so no request
+    # is spent finding that out.
+    signature = models.CharField(max_length=40, blank=True, default="")
+    # pending, ready, no_points (fewer than two places marked that day) or
+    # failed (Ola could not route it).
+    status = models.CharField(max_length=12, default="pending")
+    # Null unless ready. 0.0 is an answer, not a gap: every point in one place.
+    km = models.FloatField(null=True, blank=True)
+    # Ola's road route as [[lat, lon], ...], for the map. Empty unless ready.
+    path = models.JSONField(default=list, blank=True)
+    # Why Ola could not route it, when failed. Never carries the key -- see
+    # route_km._post. "rate limited by Ola" while Ola is making every worker
+    # wait, whatever the status.
+    error = models.CharField(max_length=200, blank=True, default="")
+    # How many times in a row Ola has failed this day. A settled day that has
+    # failed route_km.MAX_FAILED_ATTEMPTS times is final, not retried for ever.
+    attempts = models.PositiveSmallIntegerField(default=0)
+    # When the points were last read, and when Ola was last asked. The second
+    # is indexed because the per-minute throttle counts it, across every worker.
+    checked_at = models.DateTimeField(null=True, blank=True)
+    measured_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Set once the day is settled. A final row is never looked at again.
+    final = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["engineer", "day"], name="one_route_km_per_engineer_day"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["engineer", "day"]),
+        ]
+
+    def __str__(self):
+        return f"{self.engineer.employee_name} {self.day} ({self.status})"
