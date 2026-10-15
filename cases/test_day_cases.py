@@ -48,7 +48,9 @@ class CasesByDayTests(NoNetwork, TestCase):
         self.bala = make_engineer("Bala Cases", branch="Salem")
 
     def timeline(self, engineer, day):
-        """(cases, closed) as the board counts them from /day/."""
+        """(cases, closed, check-ins) as the board counts them from /day/: its
+        CASES rows, its "Closed" rows, and its CHECK-INS tile -- the punches
+        of kind "in"."""
         response = self.client.get("/api/tracking/day/", {"engineer": engineer.id, "date": day.isoformat()})
         self.assertEqual(response.status_code, 200)
         listed, closed = set(), set()
@@ -58,15 +60,18 @@ class CasesByDayTests(NoNetwork, TestCase):
                 listed.add(key)
                 if event["type"] == "completed":
                     closed.add(key)
-        return len(listed), len(closed)
+        checkins = sum(1 for punch in response.json()["punches"] if punch["kind"] == "in")
+        return len(listed), len(closed), checkins
 
     def assert_matches_the_timeline(self, engineers):
         counts = day_cases.cases_by_day([e.id for e in engineers], self.days, today=self.today)
         for engineer in engineers:
             for day in self.days:
                 with self.subTest(engineer=engineer.employee_name, day=day.isoformat()):
-                    cases, closed = self.timeline(engineer, day)
-                    self.assertEqual(counts[(engineer.id, day)], {"cases": cases, "closed": closed})
+                    cases, closed, checkins = self.timeline(engineer, day)
+                    self.assertEqual(
+                        counts[(engineer.id, day)], {"cases": cases, "closed": closed, "checkins": checkins}
+                    )
         return counts
 
     def test_every_way_a_call_belongs_to_a_day_counts_as_the_timeline_lists_it(self):
@@ -99,7 +104,7 @@ class CasesByDayTests(NoNetwork, TestCase):
         counts = self.assert_matches_the_timeline([self.anu, self.bala])
         self.assertEqual(counts[(self.anu.id, today)]["cases"], 2)
         self.assertEqual(counts[(self.anu.id, d2)]["cases"], 2)
-        self.assertEqual(counts[(self.bala.id, d1)], {"cases": 2, "closed": 1})
+        self.assertEqual(counts[(self.bala.id, d1)], {"cases": 2, "closed": 1, "checkins": 0})
 
     def test_closed_means_checked_out_that_day(self):
         d1, d2 = self.today - DAY, self.today - 2 * DAY
@@ -118,7 +123,25 @@ class CasesByDayTests(NoNetwork, TestCase):
         visit(open_call, self.anu, d1, checked_in_at=at(d1, 15))
 
         counts = self.assert_matches_the_timeline([self.anu])
-        self.assertEqual(counts[(self.anu.id, d1)], {"cases": 5, "closed": 3})
+        self.assertEqual(counts[(self.anu.id, d1)], {"cases": 5, "closed": 3, "checkins": 3})
+
+    def test_checkins_are_the_boards_check_ins(self):
+        d1, d2 = self.today - DAY, self.today - 2 * DAY
+        # A call with no visit row answers from its own Check in column.
+        call(self.anu, reached_at=at(d1, 10))
+        # Two trips to one call checked into on the same day: two check-ins.
+        twice = call(self.anu, assigned_at=at(d2, 9))
+        visit(twice, self.anu, d1, checked_in_at=at(d1, 11), checked_out_at=at(d1, 12))
+        visit(twice, self.anu, d2, checked_in_at=at(d1, 14))
+        # A visit row punched that day hides the call's own column for it.
+        both = call(self.anu, reached_at=at(d1, 16))
+        visit(both, self.anu, d1, checked_in_at=at(d1, 16))
+        # Checked out that day, into it the day before: no check-in that day.
+        out_only = call(self.anu, assigned_at=at(d2, 9))
+        visit(out_only, self.anu, d2, checked_in_at=at(d2, 10), checked_out_at=at(d1, 9))
+
+        counts = self.assert_matches_the_timeline([self.anu])
+        self.assertEqual((counts[(self.anu.id, d1)]["checkins"], counts[(self.anu.id, d2)]["checkins"]), (4, 1))
 
     def test_the_days_visit_is_the_first_by_plan_day_as_the_timeline_takes_it(self):
         d1, d2 = self.today - DAY, self.today - 2 * DAY
@@ -154,8 +177,8 @@ class CasesByDayTests(NoNetwork, TestCase):
         self.assertEqual(answer["days"], [day.isoformat() for day in self.days])
         self.assertEqual([row["engineer_id"] for row in answer["engineers"]], [self.anu.id, self.bala.id])
         anu = answer["engineers"][0]["days"]
-        self.assertEqual(anu[(self.today - DAY).isoformat()], {"cases": 1, "closed": 1})
-        self.assertEqual(anu[self.days[0].isoformat()], {"cases": 0, "closed": 0})
+        self.assertEqual(anu[(self.today - DAY).isoformat()], {"cases": 1, "closed": 1, "checkins": 0})
+        self.assertEqual(anu[self.days[0].isoformat()], {"cases": 0, "closed": 0, "checkins": 0})
         self.assertEqual(set(answer["engineers"][1]["days"]), {day.isoformat() for day in self.days})
 
     def test_days_after_today_are_not_asked_about(self):

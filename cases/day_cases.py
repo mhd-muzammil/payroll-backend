@@ -46,11 +46,21 @@ def _day_of(moment):
 
 
 def cases_by_day(engineer_ids, days, today=None) -> dict:
-    """{(engineer id, day): {"cases": n, "closed": m}} for every engineer and
-    every day asked about, zeros included."""
+    """{(engineer id, day): {"cases": n, "closed": m, "checkins": k}} for every
+    engineer and every day asked about, zeros included.
+
+    "checkins" is the board's "CHECK-INS" for the day: its punches of kind
+    "in", as views._punches_for_day finds them -- every visit row checked into
+    that day, and, for a call with no visit row punched that day, its own
+    Check in column (15 Oct 2026: the office reads this as the day's visits).
+    """
     ids = list(dict.fromkeys(engineer_ids))
     days = sorted(set(days))
-    counts = {(engineer_id, day): {"cases": 0, "closed": 0} for engineer_id in ids for day in days}
+    counts = {
+        (engineer_id, day): {"cases": 0, "closed": 0, "checkins": 0}
+        for engineer_id in ids
+        for day in days
+    }
     if not ids or not days:
         return counts
     today = today or timezone.localdate()
@@ -87,6 +97,11 @@ def cases_by_day(engineer_ids, days, today=None) -> dict:
     # The visit each call has for each day: the first, by plan day and id, of
     # the rows that match the day -- the timeline's own pick.
     visit_of = {}
+    # The day's punches (views._punches_for_day): every visit row checked into
+    # the day counts, and the calls with a row punched that day are
+    # `punched`, so their own columns are not read for it as well.
+    checkins = {}
+    punched = {}
     for visit in (
         CaseVisit.objects.filter(case__assigned_to_id__in=ids)
         .filter(
@@ -102,6 +117,21 @@ def cases_by_day(engineer_ids, days, today=None) -> dict:
                 visit_of[(visit.case_id, day)] = visit
                 if visit.case.status != "cancelled":
                     add(visit.case, day)
+        engineer_id = visit.case.assigned_to_id
+        for day in {_day_of(visit.checked_in_at), _day_of(visit.checked_out_at)}:
+            if day in wanted:
+                punched.setdefault((engineer_id, day), set()).add(visit.case_id)
+        checked_in = _day_of(visit.checked_in_at)
+        if checked_in in wanted:
+            checkins[(engineer_id, checked_in)] = checkins.get((engineer_id, checked_in), 0) + 1
+
+    # A call with no visit row punched that day answers from its own column.
+    for case in Case.objects.filter(
+        assigned_to_id__in=ids, reached_at__gte=start, reached_at__lt=end
+    ).only("assigned_to_id", "reached_at"):
+        cell = (case.assigned_to_id, _day_of(case.reached_at))
+        if cell[1] in wanted and case.pk not in punched.get(cell, set()):
+            checkins[cell] = checkins.get(cell, 0) + 1
 
     for (engineer_id, day), cases in listed.items():
         closed = 0
@@ -110,5 +140,8 @@ def cases_by_day(engineer_ids, days, today=None) -> dict:
             checked_out = (visit.checked_out_at or case.completed_at) if visit else case.completed_at
             if _day_of(checked_out) == day:
                 closed += 1
-        counts[(engineer_id, day)] = {"cases": len(cases), "closed": closed}
+        counts[(engineer_id, day)].update(cases=len(cases), closed=closed)
+    for cell, number in checkins.items():
+        if cell in counts:
+            counts[cell]["checkins"] = number
     return counts

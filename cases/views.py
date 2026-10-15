@@ -2573,13 +2573,13 @@ class TrackingViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["post"], url_path="cases_by_day")
     def cases_by_day(self, request):
         """The KM report's case counts: for every engineer and day, how many
-        calls the day timeline lists and how many were closed that day -- the
-        Live Tracking board's "CASES" and "Closed", for a whole cycle at once
-        (cases/day_cases.py).
+        calls the day timeline lists, how many were closed that day, and how
+        many check-ins the day had -- the Live Tracking board's "CASES",
+        "Closed" and "CHECK-INS", for a whole cycle at once (cases/day_cases.py).
 
         Body: {"engineers": [<employee id>, ...], "from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}
         Answer: {"configured": true, "days": [...], "engineers": [{"engineer_id",
-        "days": {"YYYY-MM-DD": {"cases": n, "closed": m}}}]}
+        "days": {"YYYY-MM-DD": {"cases": n, "closed": m, "checkins": k}}}]}
         """
         if not _is_staff_role(request.user):
             return Response({"detail": "Permission denied."}, status=403)
