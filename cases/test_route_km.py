@@ -276,12 +276,26 @@ class KeyPointsTests(NoNetwork, TestCase):
         ping(self.engineer, at(self.day - datetime.timedelta(days=1), 23, 58), 12.10)
         self.assertEqual(self.points(), [])
 
-    def test_an_auto_closed_logout_is_not_a_point(self):
-        """The system wrote that Logout; the engineer marked nothing there."""
+    def test_an_auto_closed_logout_is_at_its_nearest_fix(self):
+        """The Logout the system wrote after a forgotten one is on the rail, so
+        it is on the route (asked 15 Oct 2026), where the rail places it."""
         duty(self.engineer, at(self.day, 9, 0), at(self.day, 19, 0), auto_closed=True)
         ping(self.engineer, at(self.day, 9, 1), 12.10)
         ping(self.engineer, at(self.day, 19, 0), 12.20)  # right where it was stamped
-        self.assertEqual([p["kind"] for p in self.points()], ["login"])
+        self.assertEqual(
+            [(p["kind"], p["latitude"], p["office"]) for p in self.points()],
+            [("login", 12.10, False), ("logout", 12.20, False)],
+        )
+
+    def test_an_auto_closed_logout_with_no_fix_near_it_is_left_out_not_put_at_the_office(self):
+        self.assertIsNotNone(route_km.office_of(self.engineer))
+        duty(self.engineer, at(self.day, 9, 0), at(self.day, 19, 0), auto_closed=True)
+        ping(self.engineer, at(self.day, 9, 1), 12.10)
+        ping(self.engineer, at(self.day, 19, 15, 1), 12.20)  # 15 min 1 s after it
+        self.assertEqual(
+            [(p["kind"], p["latitude"], p["office"]) for p in self.points()],
+            [("login", 12.10, False)],
+        )
 
     def test_still_on_duty_has_no_logout_yet(self):
         duty(self.engineer, at(self.day, 9, 0))
@@ -309,10 +323,119 @@ class KeyPointsTests(NoNetwork, TestCase):
         self.assertEqual((points[1]["latitude"], points[1]["longitude"]), (12.40, 77.40))
         self.assertEqual((points[2]["latitude"], points[2]["longitude"]), (12.50, 77.50))
 
-    def test_a_check_in_with_no_position_is_left_out(self):
+    def test_a_check_in_with_no_position_is_at_the_customers_pin(self):
+        """As the timeline places it: the phone gave no position at Check In,
+        so the call's own pin stands in -- a half position as well."""
+        none = check_in(
+            self.engineer, at(self.day, 11, 0), None, None, latitude=12.45, longitude=77.45
+        )
+        half = check_in(
+            self.engineer, at(self.day, 12, 0), 12.60, None, latitude=12.55, longitude=77.55
+        )
+        ping(self.engineer, at(self.day, 11, 1), 12.99, 77.99)  # a fix does not beat the pin
+        self.assertEqual(
+            [
+                (p["kind"], p["latitude"], p["longitude"], p["case_number"], p["office"])
+                for p in self.points()
+            ],
+            [
+                ("checkin", 12.45, 77.45, none.case_number, False),
+                ("checkin", 12.55, 77.55, half.case_number, False),
+            ],
+        )
+
+    def test_a_punch_beats_the_pin(self):
+        case = check_in(
+            self.engineer, at(self.day, 11, 0), 12.40, 77.40, latitude=12.99, longitude=77.99
+        )
+        self.assertEqual(
+            [(p["latitude"], p["longitude"], p["case_number"]) for p in self.points()],
+            [(12.40, 77.40, case.case_number)],
+        )
+
+    def test_a_pin_with_no_longitude_places_it_nowhere_as_on_the_rail(self):
+        check_in(self.engineer, at(self.day, 11, 0), None, None, latitude=12.45)
+        ping(self.engineer, at(self.day, 11, 5), 12.35, 77.35)  # a fix is not taken
+        self.assertEqual(self.points(), [])
+
+    def test_a_pin_with_no_latitude_takes_the_nearest_fix_as_on_the_rail(self):
+        case = check_in(self.engineer, at(self.day, 11, 0), None, None, longitude=77.45)
+        ping(self.engineer, at(self.day, 11, 5), 12.35, 77.35)
+        self.assertEqual(
+            [(p["latitude"], p["longitude"], p["case_number"]) for p in self.points()],
+            [(12.35, 77.35, case.case_number)],
+        )
+
+    def test_as_before_15_oct_is_the_old_rule(self):
+        """No auto-closed Logout and no Check in without a position; the rest
+        as now -- a tapped Logout with no fix still at the office."""
+        duty(self.engineer, at(self.day, 9, 0), at(self.day, 12, 0))
+        duty(self.engineer, at(self.day, 13, 0), at(self.day, 19, 0), auto_closed=True)
+        ping(self.engineer, at(self.day, 9, 0), 12.10)
+        ping(self.engineer, at(self.day, 13, 0), 12.30)
+        ping(self.engineer, at(self.day, 19, 0), 12.40)
+        punched = check_in(self.engineer, at(self.day, 14, 0), 12.50, 77.50)
+        check_in(self.engineer, at(self.day, 15, 0), None, None, latitude=12.60, longitude=77.60)
+        # A fix near it, which the old rule must not take either.
+        ping(self.engineer, at(self.day, 15, 5), 12.65)
+
+        now = [(p["kind"], p["latitude"], p["office"]) for p in self.points()]
+        old = route_km.key_points(self.engineer, self.day, as_before_15_oct=True)
+        self.assertEqual(
+            now,
+            [
+                ("login", 12.10, False),
+                ("logout", 12.7242996, True),
+                ("login", 12.30, False),
+                ("checkin", 12.50, False),
+                ("checkin", 12.60, False),
+                ("logout", 12.40, False),
+            ],
+        )
+        self.assertEqual(
+            [(p["kind"], p["latitude"], p["office"], p["case_number"]) for p in old],
+            [
+                ("login", 12.10, False, None),
+                ("logout", 12.7242996, True, None),
+                ("login", 12.30, False, None),
+                ("checkin", 12.50, False, punched.case_number),
+            ],
+        )
+
+    def test_a_visit_checked_in_with_no_position_is_at_the_customers_pin(self):
+        case = check_in(
+            self.engineer,
+            at(self.day + datetime.timedelta(days=1), 10, 0),
+            13.00,
+            78.00,
+            latitude=12.45,
+            longitude=77.45,
+        )
+        CaseVisit.objects.create(
+            case=case, engineer=self.engineer, plan_date=self.day, checked_in_at=at(self.day, 10, 0)
+        )
+        self.assertEqual(
+            [(p["kind"], p["latitude"], p["longitude"]) for p in self.points()],
+            [("checkin", 12.45, 77.45)],
+        )
+
+    def test_a_check_in_with_no_position_and_no_pin_takes_the_nearest_fix(self):
+        case = check_in(self.engineer, at(self.day, 11, 0), None, None)
+        ping(self.engineer, at(self.day, 10, 50), 12.30, 77.30)  # 10 min before
+        ping(self.engineer, at(self.day, 11, 5), 12.35, 77.35)  # 5 min after: nearest
+        self.assertEqual(
+            [
+                (p["kind"], p["latitude"], p["longitude"], p["case_number"], p["office"])
+                for p in self.points()
+            ],
+            [("checkin", 12.35, 77.35, case.case_number, False)],
+        )
+
+    def test_a_check_in_placed_nowhere_is_left_out(self):
         placed = check_in(self.engineer, at(self.day, 10, 0), 12.40, 77.40)
         check_in(self.engineer, at(self.day, 11, 0), None, None)
         check_in(self.engineer, at(self.day, 12, 0), 12.60, None)
+        ping(self.engineer, at(self.day, 12, 15, 1), 12.70)  # 15 min 1 s after the last
         self.assertEqual([p["case_number"] for p in self.points()], [placed.case_number])
 
     def test_check_outs_are_not_points(self):
@@ -384,9 +507,9 @@ class KeyPointsTests(NoNetwork, TestCase):
 
 
 class ParityWithTheDayTimelineTests(NoNetwork, TestCase):
-    """The map beside a figure and the day rail must put Login and Logout in
-    the same place. Asked of /day itself, on the same day, rather than of a
-    copy of its rule."""
+    """The map beside a figure and the day rail must put Login, every Check in
+    and Logout in the same place. Asked of /day itself, on the same day, rather
+    than of a copy of its rule."""
 
     def setUp(self):
         super().setUp()
@@ -410,13 +533,34 @@ class ParityWithTheDayTimelineTests(NoNetwork, TestCase):
         # and a Logout with nothing near it at all.
         duty(engineer, at(day, 14, 0), at(day, 18, 0))
         ping(engineer, at(day, 14, 15), 12.74, 77.74)
-        # A third, closed by the system: its Logout is on the rail, placed, but
-        # it is not somewhere the engineer marked.
+        # A third, closed by the system: its Logout is on the rail, placed, and
+        # on the route there too (15 Oct 2026).
         duty(engineer, at(day, 19, 0), at(day, 20, 0), auto_closed=True)
         ping(engineer, at(day, 19, 1), 12.75, 77.75)
         ping(engineer, at(day, 20, 0), 12.76, 77.76)
-        # And a call checked into in between.
-        check_in(engineer, at(day, 11, 0), 12.80, 77.80)
+        # And calls checked into in between: one where the phone was (its pin
+        # elsewhere: the punch wins), one the phone gave no position for on a
+        # call with a pin, one with no pin either but a fix ten minutes on, one
+        # with nothing near at all, and one whose pin has a latitude only.
+        check_in(engineer, at(day, 11, 0), 12.80, 77.80, latitude=12.99, longitude=77.99)
+        check_in(engineer, at(day, 11, 30), None, None, latitude=12.81, longitude=77.81)
+        check_in(engineer, at(day, 15, 0), None, None)
+        ping(engineer, at(day, 15, 10), 12.82, 77.82)
+        check_in(engineer, at(day, 16, 30), None, None)
+        check_in(engineer, at(day, 17, 0), None, None, latitude=12.85)
+        ping(engineer, at(day, 17, 5), 12.86, 77.86)
+        # Two checked in the way the app does it now, through the day's visit
+        # row, the call's own columns holding a later trip: one with a pin,
+        # one with only a fix five minutes on.
+        tomorrow = day + datetime.timedelta(days=1)
+        for hour, pin in ((12, (12.83, 77.83)), (13, (None, None))):
+            case = check_in(
+                engineer, at(tomorrow, 10, 0), 13.00, 78.00, latitude=pin[0], longitude=pin[1]
+            )
+            CaseVisit.objects.create(
+                case=case, engineer=engineer, plan_date=day, checked_in_at=at(day, hour, 0)
+            )
+        ping(engineer, at(day, 13, 5), 12.84, 77.84)
 
     def test_login_logout_and_check_in_sit_where_the_timeline_puts_them(self):
         with ola_off():
@@ -428,14 +572,14 @@ class ParityWithTheDayTimelineTests(NoNetwork, TestCase):
 
         taps = [e for e in events if e["type"] in ("duty_start", "duty_end")]
         self.assertIn(
-            "Auto-closed (no Logout)",
-            [e["label"] for e in taps],
-            "the fixture's auto-closed duty is not on the rail",
+            ("Auto-closed (no Logout)", 12.76, 77.76),
+            [(e["label"], e.get("latitude"), e.get("longitude")) for e in taps],
+            "the fixture's auto-closed duty is not on the rail where it should be",
         )
         timeline = [
             ("login" if e["type"] == "duty_start" else "logout", e["latitude"], e["longitude"])
             for e in taps
-            if e["label"] != "Auto-closed (no Logout)" and e.get("latitude") is not None
+            if e.get("latitude") is not None
         ]
         points = route_km.key_points(self.engineer, self.day)
         mine = [
@@ -467,13 +611,25 @@ class ParityWithTheDayTimelineTests(NoNetwork, TestCase):
                 ("logout", 12.72, 77.72),
                 ("login", 12.74, 77.74),
                 ("login", 12.75, 77.75),
+                ("logout", 12.76, 77.76),
             ],
         )
 
-        reached = [(e["latitude"], e["longitude"]) for e in events if e["type"] == "reached"]
+        # Every Check in the rail places is on the route, at the same place;
+        # the two it places nowhere are on the rail and not on the route.
+        reached = [e for e in events if e["type"] == "reached"]
+        self.assertEqual(len(reached), 7)
+        placed = [
+            (e["latitude"], e["longitude"])
+            for e in reached
+            if e.get("latitude") is not None and e.get("longitude") is not None
+        ]
         checkins = [(p["latitude"], p["longitude"]) for p in points if p["kind"] == "checkin"]
-        self.assertEqual(checkins, reached)
-        self.assertEqual(checkins, [(12.80, 77.80)])
+        self.assertEqual(checkins, placed)
+        self.assertEqual(
+            checkins,
+            [(12.80, 77.80), (12.81, 77.81), (12.83, 77.83), (12.84, 77.84), (12.82, 77.82)],
+        )
 
 
 # -- signature and polyline ---------------------------------------------------

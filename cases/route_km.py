@@ -236,7 +236,7 @@ def _checkins_for_day(engineer, day):
     return out
 
 
-def key_points(engineer, day) -> list[dict]:
+def key_points(engineer, day, *, as_before_15_oct=False) -> list[dict]:
     """Where the engineer marked their day, in the order they marked it.
 
     Login, every Check in, Logout, each placed exactly where the day timeline
@@ -249,12 +249,25 @@ def key_points(engineer, day) -> list[dict]:
       marked "office" so the map can say so; with no office for the branch it
       is left out rather than guessed at.
 
-      A Logout the system wrote -- the auto-close after a forgotten one -- is
-      not a place the engineer marked, so it is not a point, office or not.
+      A Logout the system wrote -- the auto-close after a forgotten one,
+      stamped at the session's last fix -- is on the rail as "Auto-closed (no
+      Logout)" at its nearest fix, and is a point there too: the office asked
+      (15 Oct 2026) for every Login, Check in and Logout on the rail to be on
+      the route. Never at the office: nobody saw the engineer there, and a
+      trip to it would be km nobody travelled.
 
       A Check in is where the phone was when they pressed it, credited to the
-      engineer who made the visit (see _checkins_for_day). One whose position
-      was never captured cannot be routed through and is left out.
+      engineer who made the visit (see _checkins_for_day). One the phone gave
+      no position for is placed exactly as the timeline places it: at the
+      customer's pin on the call or, with no pin, at the day's nearest fix
+      within NEAREST_FIX_SECONDS. A pin with a latitude and no longitude
+      places it nowhere, there as here. One placed nowhere cannot be routed
+      through and is left out.
+
+    as_before_15_oct gives the points as they were made before those two were
+    asked for: no auto-closed Logout and no Check in without a position.
+    route_km_reread uses it to tell a settled cell the new rule changes from
+    one that moved for some other reason.
 
     Returns [{"kind", "at", "latitude", "longitude", "case_number", "office"},
     ...] with "at" as an ISO string, ready to be stored and served as it is.
@@ -268,14 +281,15 @@ def key_points(engineer, day) -> list[dict]:
         "started_at"
     )
     for session in sessions:
-        taps = [("login", session.started_at)]
-        if session.ended_at and not session.auto_closed:
-            taps.append(("logout", session.ended_at))
-        for kind, moment in taps:
+        # (kind, moment, whether the office may stand in for a missing fix)
+        taps = [("login", session.started_at, True)]
+        if session.ended_at and not (as_before_15_oct and session.auto_closed):
+            taps.append(("logout", session.ended_at, not session.auto_closed))
+        for kind, moment, office_stands_in in taps:
             fix = _nearest_fix(engineer, day, moment, NEAREST_FIX_SECONDS)
             if fix is not None:
                 (latitude, longitude), at_office = (fix.latitude, fix.longitude), False
-            elif office is not None:
+            elif office is not None and office_stands_in:
                 (latitude, longitude), at_office = office, True
             else:
                 continue
@@ -290,9 +304,33 @@ def key_points(engineer, day) -> list[dict]:
                 }
             )
 
-    for moment, latitude, longitude, case_number in _checkins_for_day(engineer, day):
+    checkins = _checkins_for_day(engineer, day)
+    # The customer's pin of each call checked into with no position.
+    unplaced = {
+        number
+        for _, latitude, longitude, number in checkins
+        if number and (latitude is None or longitude is None)
+    }
+    pins = {}
+    if unplaced and not as_before_15_oct:
+        for number, latitude, longitude in Case.objects.filter(
+            case_number__in=unplaced
+        ).values_list("case_number", "latitude", "longitude"):
+            pins[number] = (latitude, longitude)
+    for moment, latitude, longitude, case_number in checkins:
         if latitude is None or longitude is None:
-            continue
+            if as_before_15_oct:
+                continue
+            # As TrackingViewSet.day places it: the customer's pin, and the
+            # nearest fix only when the pin has no latitude.
+            latitude, longitude = pins.get(case_number, (None, None))
+            if latitude is None:
+                fix = _nearest_fix(engineer, day, moment, NEAREST_FIX_SECONDS)
+                if fix is None:
+                    continue
+                latitude, longitude = fix.latitude, fix.longitude
+            elif longitude is None:
+                continue
         points.append(
             {
                 "kind": "checkin",
