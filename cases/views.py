@@ -18,6 +18,7 @@ from .pings import MAX_BATCH, PingRejected, build_ping, coerce_number, ingest_ba
 from .tracks import snapped_trail
 from . import places
 from . import olamaps, route_km
+from . import day_cases
 from employees.models import Employee
 from authentication.models import get_allowed_branches
 
@@ -2566,6 +2567,86 @@ class TrackingViewSet(viewsets.ViewSet):
                 "pending": pending,
                 "rechecking": rechecking,
                 "measured_now": measured_now,
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="cases_by_day")
+    def cases_by_day(self, request):
+        """The KM report's case counts: for every engineer and day, how many
+        calls the day timeline lists and how many were closed that day -- the
+        Live Tracking board's "CASES" and "Closed", for a whole cycle at once
+        (cases/day_cases.py).
+
+        Body: {"engineers": [<employee id>, ...], "from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}
+        Answer: {"configured": true, "days": [...], "engineers": [{"engineer_id",
+        "days": {"YYYY-MM-DD": {"cases": n, "closed": m}}}]}
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        data = request.data if isinstance(request.data, dict) else {}
+
+        # The engineers and the days, checked exactly as route_km checks them --
+        # copied rather than shared, so ROUTE KM's own code is left as it is.
+        # Keep the two alike.
+        raw_ids = data.get("engineers")
+        if not isinstance(raw_ids, list) or len(raw_ids) > route_km.MAX_ENGINEERS:
+            return Response(
+                {"detail": f"engineers must be a list of at most {route_km.MAX_ENGINEERS} ids."},
+                status=400,
+            )
+        ids = []
+        for raw in raw_ids:
+            text = "" if isinstance(raw, bool) or not isinstance(raw, (int, str)) else str(raw)
+            if not (text.isascii() and text.isdigit()) or len(text) > 19 or int(text) >= 2**63:
+                return Response({"detail": "engineers must be a list of numeric ids."}, status=400)
+            if int(text) not in ids:
+                ids.append(int(text))
+
+        bounds = []
+        for name in ("from", "to"):
+            value = data.get(name)
+            try:
+                parsed = parse_date(value) if isinstance(value, str) else None
+            except ValueError:
+                parsed = None
+            if not parsed:
+                return Response({"detail": f"{name} must be YYYY-MM-DD."}, status=400)
+            bounds.append(parsed)
+        start, end = bounds
+        if start > end:
+            return Response({"detail": "from must not be after to."}, status=400)
+        if (end - start).days + 1 > route_km.MAX_DAYS:
+            return Response(
+                {"detail": f"from and to may cover at most {route_km.MAX_DAYS} days."},
+                status=400,
+            )
+
+        # Nothing after today: a day that has not happened has no calls worked.
+        today = timezone.localdate()
+        end = min(end, today)
+        days = [start + timedelta(days=n) for n in range((end - start).days + 1)]
+
+        # Only the engineers this user may see, as on the day view.
+        branches = get_allowed_branches(request.user, "attendance")
+        visible = Employee.objects.filter(pk__in=ids)
+        if "All" not in branches:
+            visible = visible.filter(branch__in=branches)
+        visible = set(visible.values_list("pk", flat=True))
+        ids = [engineer_id for engineer_id in ids if engineer_id in visible]
+
+        counts = day_cases.cases_by_day(ids, days, today=today)
+        return Response(
+            {
+                "configured": True,
+                "days": [day.isoformat() for day in days],
+                "engineers": [
+                    {
+                        "engineer_id": engineer_id,
+                        "days": {day.isoformat(): counts[(engineer_id, day)] for day in days},
+                    }
+                    for engineer_id in ids
+                ],
             }
         )
 
