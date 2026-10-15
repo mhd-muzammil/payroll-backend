@@ -21,3 +21,6 @@ test_*.py
 
 # The WhatsApp poster is its own Dokploy app with its own Dockerfile.
 whatsapp_poster
+
+# The FieldEZ KM worker runs on the office PC, never in this image.
+fieldez_km_worker

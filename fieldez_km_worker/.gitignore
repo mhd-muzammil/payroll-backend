@@ -1,0 +1,3 @@
+node_modules/
+# The FieldEZ password, if typed in, stays on the computer that runs this.
+.env

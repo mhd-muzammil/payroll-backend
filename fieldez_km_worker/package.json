@@ -1,0 +1,16 @@
+{
+  "name": "fieldez-km-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reads each checked-in work order's Problem Resolution location from FieldEZ for the KM Report's FIELDEZ table. Its own browser profile and login: the OpenCall fieldez-worker is not touched.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "once": "node src/index.js --once",
+    "probe": "node src/probe.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright": "1.64.0"
+  }
+}
