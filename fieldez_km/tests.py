@@ -44,7 +44,9 @@ from cases.test_route_km import (
 from . import km
 from .models import FieldezKmDay, FieldezWorkOrder
 from .points import (
+    AWAY_KM,
     MAX_WANTED_DAYS,
+    away_from_checkin,
     choose_resolution,
     clean_resolution,
     fieldez_points,
@@ -211,6 +213,88 @@ class ResolutionTests(SimpleTestCase):
 
 
 # -- the points ---------------------------------------------------------------
+
+
+
+class AwayTests(SimpleTestCase):
+    """A Problem Resolution pressed away from the call (asked 16 Oct 2026):
+    Mohan's 13 Oct, where the Anna Nagar call's was pressed at 8:30 PM from
+    the next call in Madha Nagar."""
+
+    def point(self, kind, at, lat, lon, case_number=None, **extra):
+        return {"kind": kind, "at": at, "latitude": lat, "longitude": lon, "case_number": case_number, **extra}
+
+    def test_a_check_in_placed_more_than_a_km_from_where_it_was_made_is_named(self):
+        route = [
+            self.point("login", "2026-10-13T03:33:00+00:00", 13.0055, 80.1094),
+            self.point("checkin", "2026-10-13T08:05:00+00:00", 13.0711963, 80.2412456, "OC-004698"),
+            self.point("checkin", "2026-10-13T11:01:00+00:00", 13.0906842, 80.2233519, "OC-004075"),
+        ]
+        fieldez = [
+            self.point("login", "2026-10-13T03:33:00+00:00", 13.0055, 80.1094),
+            # At the customer's: 2 m from the check-in.
+            self.point(
+                "checkin", "2026-10-13T08:05:00+00:00", 13.0712056, 80.2412661, "OC-004698",
+                wo="WO-036176428", resolved_at="2026-10-13T08:00:29+00:00", address="Gee Gee Universal",
+            ),
+            # From Madha Nagar, hours later.
+            self.point(
+                "checkin", "2026-10-13T11:01:00+00:00", 13.018215, 80.1449683, "OC-004075",
+                wo="WO-035990164", resolved_at="2026-10-13T15:00:39+00:00",
+                address="Madha Nagar Main Road, Mugalivakkam",
+            ),
+        ]
+        self.assertEqual(
+            away_from_checkin(fieldez, route),
+            [
+                {
+                    "case_number": "OC-004075",
+                    "wo": "WO-035990164",
+                    "at": "2026-10-13T11:01:00+00:00",
+                    "resolved_at": "2026-10-13T15:00:39+00:00",
+                    "address": "Madha Nagar Main Road, Mugalivakkam",
+                    "away_km": 11.7,
+                }
+            ],
+        )
+
+    def test_just_over_a_km_is_away_and_just_under_is_not(self):
+        # A degree of latitude is 111.195 km on haversine_km's earth.
+        step = AWAY_KM / 111.195
+        route = [self.point("checkin", "2026-10-13T08:00:00+00:00", 13.0, 80.0, "OC-1")]
+        over = [self.point("checkin", "2026-10-13T08:00:00+00:00", 13.0 + step * 1.01, 80.0, "OC-1")]
+        under = [self.point("checkin", "2026-10-13T08:00:00+00:00", 13.0 + step * 0.99, 80.0, "OC-1")]
+        self.assertEqual([item["away_km"] for item in away_from_checkin(over, route)], [1.0])
+        self.assertEqual(away_from_checkin(under, route), [])
+
+    def test_only_the_same_check_in_is_compared(self):
+        """Matched by case number and moment: a call checked into twice in a
+        day is two check-ins, and one ROUTE KM has no place for is not judged."""
+        route = [
+            self.point("checkin", "2026-10-13T05:00:00+00:00", 13.0, 80.0, "OC-1"),
+            self.point("checkin", "2026-10-13T09:00:00+00:00", 13.1, 80.1, "OC-1"),
+        ]
+        fieldez = [
+            # Both stand where the second visit was: only the first is away.
+            self.point("checkin", "2026-10-13T05:00:00+00:00", 13.1, 80.1, "OC-1"),
+            self.point("checkin", "2026-10-13T09:00:00+00:00", 13.1, 80.1, "OC-1"),
+            # ROUTE KM has no point for this one: not judged.
+            self.point("checkin", "2026-10-13T10:00:00+00:00", 14.0, 81.0, "OC-2"),
+            # Not check-ins at all.
+            self.point("logout", "2026-10-13T12:00:00+00:00", 15.0, 82.0),
+        ]
+        self.assertEqual(
+            [item["at"] for item in away_from_checkin(fieldez, route)], ["2026-10-13T05:00:00+00:00"]
+        )
+
+    def test_the_same_moment_written_two_ways_is_one_moment(self):
+        route = [self.point("checkin", "2026-10-13T08:05:00+00:00", 13.0, 80.0, "OC-1")]
+        fieldez = [self.point("checkin", "2026-10-13T13:35:00+05:30", 13.1, 80.0, "OC-1")]
+        self.assertEqual(len(away_from_checkin(fieldez, route)), 1)
+
+    def test_nothing_to_compare_is_nothing_away(self):
+        self.assertEqual(away_from_checkin([], []), [])
+        self.assertEqual(away_from_checkin(None, None), [])
 
 
 class PointsTests(NoNetwork, TestCase):
@@ -830,7 +914,7 @@ class EndpointTests(FieldezMixin, TestCase):
         first = self.range().json()
         self.assertEqual(first["waiting"], 1)
         self.assertEqual(first["engineers"][0]["days"][self.past.isoformat()], {
-            "km": None, "points": 2, "status": "waiting", "office": False, "final": False, "missing": 1,
+            "km": None, "points": 2, "status": "waiting", "office": False, "final": False, "missing": 1, "away": 0,
         })
 
         answer = self.post_results([
@@ -844,7 +928,7 @@ class EndpointTests(FieldezMixin, TestCase):
         second = self.range().json()
         cell = second["engineers"][0]["days"][self.past.isoformat()]
         self.assertEqual((second["waiting"], second["measured_now"]), (0, 1))
-        self.assertEqual(cell, {"km": 3.0, "points": 4, "status": "ready", "office": False, "final": False, "missing": 3})
+        self.assertEqual(cell, {"km": 3.0, "points": 4, "status": "ready", "office": False, "final": False, "missing": 3, "away": 0})
         self.assertEqual(self.ola.requests[-1], [(12.70, 77.70), (13.09206, 79.997763), (13.054051, 80.177763), (12.90, 77.90)])
 
         day = self.day().json()
@@ -875,6 +959,73 @@ class EndpointTests(FieldezMixin, TestCase):
         self.assertEqual((day["status"], day["km"], day["waiting"], day["path"]), ("waiting", None, 1, []))
         self.assertEqual([p["kind"] for p in day["points"]], ["login", "logout"])
         self.assertEqual([m["reason"] for m in day["missing"]], ["no_wo"])
+
+
+    def test_a_problem_resolution_pressed_away_from_the_call_is_marked(self):
+        """Mohan's 13 Oct: the Chetpet call's Problem Resolution at the
+        customer's, the Anna Nagar call's at 8:30 PM from Madha Nagar."""
+        logged_day(self.engineer, self.past)
+        visit(self.engineer, at(self.past, 13, 35), "WO-036176428", lat=13.0711963, lon=80.2412456)
+        far = visit(self.engineer, at(self.past, 16, 31), "WO-035990164", lat=13.0906842, lon=80.2233519)
+        order("WO-036176428", resolutions=[resolution(at(self.past, 13, 30), lat=13.0712056, lon=80.2412661)])
+        order(
+            "WO-035990164",
+            resolutions=[
+                resolution(
+                    at(self.past, 20, 30), lat=13.018215, lon=80.1449683,
+                    address="Madha Nagar Main Road, Mugalivakkam",
+                )
+            ],
+        )
+        self.route_km_cell()
+
+        cell = self.range().json()["engineers"][0]["days"][self.past.isoformat()]
+        self.assertEqual((cell["status"], cell["away"]), ("ready", 1))
+
+        away = self.day().json()["away"]
+        self.assertEqual(len(away), 1)
+        self.assertEqual(
+            (away[0]["case_number"], away[0]["wo"], away[0]["address"], away[0]["away_km"]),
+            (far.case_number, "WO-035990164", "Madha Nagar Main Road, Mugalivakkam", 11.7),
+        )
+        self.assertEqual(parse_datetime(away[0]["at"]), at(self.past, 16, 31))
+        self.assertEqual(parse_datetime(away[0]["resolved_at"]), at(self.past, 20, 30))
+
+    def route_km_cell(self):
+        """ROUTE KM's own cell for the day, as the report asks both tables
+        for it: where each check-in was made. Measured minutes ago, so FIELDEZ
+        does not give way to it."""
+        checked_in = route_km.key_points(self.engineer, self.past)
+        RouteKmDay.objects.create(
+            engineer=self.engineer,
+            day=self.past,
+            status="ready",
+            km=40.0,
+            points=checked_in,
+            signature=route_km.signature(checked_in),
+            checked_at=timezone.now() - 5 * MINUTE,
+            measured_at=timezone.now() - 5 * MINUTE,
+            final=True,
+        )
+
+    def test_with_no_route_km_cell_nothing_is_marked(self):
+        logged_day(self.engineer, self.past)
+        visit(self.engineer, at(self.past, 16, 31), "WO-035990164", lat=13.0906842, lon=80.2233519)
+        order("WO-035990164", resolutions=[resolution(at(self.past, 20, 30), lat=13.018215, lon=80.1449683)])
+
+        self.assertEqual(self.range().json()["engineers"][0]["days"][self.past.isoformat()]["away"], 0)
+        self.assertEqual(self.day().json()["away"], [])
+
+    def test_a_day_waiting_on_fieldez_names_what_it_can(self):
+        logged_day(self.engineer, self.past)
+        visit(self.engineer, at(self.past, 16, 31), "WO-035990164", lat=13.0906842, lon=80.2233519)
+        visit(self.engineer, at(self.past, 17, 0), "WO-000001601")  # not read yet
+        order("WO-035990164", resolutions=[resolution(at(self.past, 20, 30), lat=13.018215, lon=80.1449683)])
+        self.route_km_cell()
+
+        day = self.day().json()
+        self.assertEqual(day["status"], "waiting")
+        self.assertEqual([item["wo"] for item in day["away"]], ["WO-035990164"])
 
     def test_only_staff_may_ask(self):
         self.client.force_authenticate(User.objects.create_user(username="an-engineer", password="x", role="employee"))

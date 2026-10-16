@@ -6,10 +6,11 @@
   POST /api/fieldez_km/work_orders/  what the worker read from FieldEZ   staff who see every branch
 
 range and day answer as /api/tracking/route_km/ and /api/tracking/route_km_day/
-do, request for request, with FIELDEZ's two facts beside ROUTE KM's: `waiting`
-(check-ins whose WO the worker has not read) and `missing` (check-ins left out,
-and why). Which cells are measured, and when, is decided in km.py; where each
-point stands, in points.py.
+do, request for request, with FIELDEZ's facts beside ROUTE KM's: `waiting`
+(check-ins whose WO the worker has not read), `missing` (check-ins left out,
+and why) and `away` (check-ins whose Problem Resolution was pressed more than
+points.AWAY_KM from where the engineer checked in). Which cells are measured,
+and when, is decided in km.py; where each point stands, in points.py.
 """
 
 import logging
@@ -35,6 +36,7 @@ from .models import FieldezWorkOrder
 from .points import (
     MAX_RESOLUTIONS,
     MAX_WANTED_DAYS,
+    away_from_checkin,
     clean_resolution,
     fieldez_points,
     storable,
@@ -153,8 +155,10 @@ class FieldezKmViewSet(viewsets.ViewSet):
     def km_range(self, request):
         """FIELDEZ for the KM report: every engineer's road distance, day by
         day. The request and the answer are /api/tracking/route_km/'s, each
-        cell with `missing` (how many check-ins were left out) and the answer
-        with `waiting` (how many cells wait on the worker reading FieldEZ).
+        cell with `missing` (how many check-ins were left out) and `away` (how
+        many were pressed away from the call, points.away_from_checkin), and
+        the answer with `waiting` (how many cells wait on the worker reading
+        FieldEZ).
 
         Body: {"engineers": [<employee id>, ...], "from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}
         """
@@ -230,6 +234,8 @@ class FieldezKmViewSet(viewsets.ViewSet):
         measured_now = km.refresh(ids, days, now=now)
 
         stored = km.rows(ids, days)
+        # ROUTE KM's own cells: where each check-in was, for `away`.
+        route_rows = route_km.rows(ids, days)
         # ROUTE KM's two counts, and a third: `waiting` cells wait on the
         # worker reading their WOs from FieldEZ, not on Ola.
         pending = 0
@@ -254,8 +260,10 @@ class FieldezKmViewSet(viewsets.ViewSet):
                         "office": False,
                         "final": False,
                         "missing": 0,
+                        "away": 0,
                     }
                     continue
+                route_row = route_rows.get((engineer_id, day))
                 cells[day.isoformat()] = {
                     "km": row.km if row.status == "ready" else None,
                     "points": len(row.points or []),
@@ -264,6 +272,11 @@ class FieldezKmViewSet(viewsets.ViewSet):
                     "final": row.final,
                     # Check-ins left out of the km: FieldEZ had no place for them.
                     "missing": len(row.missing or []),
+                    # Check-ins whose Problem Resolution was pressed more than
+                    # AWAY_KM from where the engineer checked in.
+                    "away": len(
+                        away_from_checkin(row.points, route_row.points if route_row else [])
+                    ),
                 }
             engineers.append({"engineer_id": engineer_id, "days": cells})
 
@@ -332,6 +345,7 @@ class FieldezKmViewSet(viewsets.ViewSet):
             "final": False,
             "missing": [],
             "waiting": 0,
+            "away": [],
         }
         if not olamaps.is_configured():
             answer["configured"] = False
@@ -339,6 +353,9 @@ class FieldezKmViewSet(viewsets.ViewSet):
 
         km.refresh([engineer.id], [target_date], work_limit=1, measure_limit=1, time_budget=15.0)
         row = km.rows([engineer.id], [target_date]).get((engineer.id, target_date))
+        # Where each check-in was: ROUTE KM's cell for the day, as the range.
+        route_row = route_km.rows([engineer.id], [target_date]).get((engineer.id, target_date))
+        route_points = route_row.points if route_row else []
         if row is None or row.status in ("pending", "waiting"):
             # Not measured: the worker has not read a check-in's WO, or Ola
             # cannot be asked now. The points cost nothing, so the map has
@@ -349,6 +366,7 @@ class FieldezKmViewSet(viewsets.ViewSet):
                 points=points,
                 missing=missing,
                 waiting=waiting,
+                away=away_from_checkin(points, route_points),
             )
             return Response(answer)
 
@@ -361,6 +379,7 @@ class FieldezKmViewSet(viewsets.ViewSet):
             error=row.error if row.status == "failed" else "",
             final=row.final,
             missing=row.missing or [],
+            away=away_from_checkin(row.points, route_points),
         )
         return Response(answer)
 

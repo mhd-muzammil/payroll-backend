@@ -331,6 +331,56 @@ def fieldez_points(engineer, day, now=None):
     return points, [entry for _, entry in missing], waiting, len(checkins)
 
 
+# -- a Problem Resolution pressed away from the call --------------------------
+
+# How far from where the engineer checked in a Problem Resolution may stand
+# before the FIELDEZ table marks it (asked 16 Oct 2026). Pressed at the
+# customer's it stands metres away. One pressed later from somewhere else --
+# on 13 Oct, an Anna Nagar call's at 8:30 PM from the next call in Madha
+# Nagar, 11.7 km off -- stands where that was, and the road drawn through it
+# is not the one the engineer took.
+AWAY_KM = 1.0
+
+
+def away_from_checkin(fieldez, route):
+    """The FIELDEZ check-ins placed more than AWAY_KM from where the engineer
+    checked in, in the day's order: [{"case_number", "wo", "at",
+    "resolved_at", "address", "away_km"}].
+
+    `fieldez` is a FIELDEZ day's points and `route` the same day's ROUTE KM
+    points. A check-in's own place is ROUTE KM's point for it -- the one with
+    the same case number and moment, where the day timeline shows it. A
+    check-in ROUTE KM has no point for is not judged.
+    """
+    # Imported here, as route_km imports from views: views is the heavy end.
+    from cases.views import haversine_km
+
+    checked_in = {}
+    for point in route or []:
+        if point.get("kind") == "checkin":
+            checked_in[(point.get("case_number"), _when(point["at"]))] = point
+    away = []
+    for point in fieldez or []:
+        if point.get("kind") != "checkin":
+            continue
+        own = checked_in.get((point.get("case_number"), _when(point["at"])))
+        if own is None:
+            continue
+        km = haversine_km(own["latitude"], own["longitude"], point["latitude"], point["longitude"])
+        if km > AWAY_KM:
+            away.append(
+                {
+                    "case_number": point.get("case_number"),
+                    "wo": point.get("wo"),
+                    "at": point["at"],
+                    "resolved_at": point.get("resolved_at"),
+                    "address": point.get("address") or "",
+                    "away_km": round(km, 1),
+                }
+            )
+    return away
+
+
 # -- what the worker should read ----------------------------------------------
 
 
