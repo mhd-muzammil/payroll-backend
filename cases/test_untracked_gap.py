@@ -16,22 +16,37 @@ the gap threw away the journey after every long stop.
 Only the phone knows which it was. So the phone says: the first fix after
 tracking resumes carries `after_gap`, and the one segment ending at it is
 skipped. Everything on both sides of it still counts in full.
+
+That was the rule until km_rule's cutover, and it is still how a day recorded
+before it reads: UntrackedGapTests pins it, the cutover set after every fix in
+them. It turned out the flag said too little -- the app set it on every reload
+and every restart, and lost it on the way often enough -- so since the cutover
+the phone says it in so many words: a gps_off it SAW being switched, and the
+session row of a Login. NewRuleFlagTests reads the same trails that way.
 """
 import datetime
+import os
 from decimal import Decimal
+from unittest import mock
 
 from rest_framework.test import APITestCase
 from django.utils import timezone
 
 from authentication.models import User
-from cases.models import LocationPing
+from cases.models import DutySession, LocationPing, PhoneEvent
 from cases.views import _trail_km
 from employees.models import Employee
 
 CHENNAI_LAT = 13.0827
 CHENNAI_LON = 80.2707
 
+# km_rule's cutover, set where a test needs to say which rule reads its fixes:
+# after all of them (the old rule) or before all of them (the new one).
+OLD_RULE = {"KM_RULE_FROM": "2100-01-01T00:00:00+00:00"}
+NEW_RULE = {"KM_RULE_FROM": "2000-01-01T00:00:00+00:00"}
 
+
+@mock.patch.dict(os.environ, OLD_RULE)
 class UntrackedGapTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(
@@ -243,4 +258,150 @@ class UntrackedGapTests(APITestCase):
             accuracy=8, after_gap=True, timestamp=moment,
         )
         self.assertEqual(first.timestamp, resumed.timestamp)
+        self.assertEqual(_trail_km(self._trail()), 0.0)
+
+
+@mock.patch.dict(os.environ, NEW_RULE)
+class NewRuleFlagTests(APITestCase):
+    """The same trails, read by the rule since the cutover.
+
+    A flag alone no longer takes a line away. The app set it for reloads and
+    for Android restarting the tracker as much as for Location going off, so
+    the straight line counts: the least they can have travelled. What still
+    takes it away is the phone saying it SAW Location switched off, in time,
+    and a Login between the two fixes.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="rover-new", password="x", role="employee"
+        )
+        self.engineer = Employee.objects.create(
+            user=self.user,
+            employee_name="Rover New",
+            email="rover.new@example.com",
+            role="Field Engineer",
+            department="Service",
+            branch="Chennai",
+            salary=Decimal("20000"),
+        )
+        self.start = timezone.now().replace(microsecond=0)
+
+    def _at(self, minutes):
+        return self.start + datetime.timedelta(minutes=minutes)
+
+    def _ping(self, minutes, lat_offset, after_gap=False, accuracy=8):
+        return LocationPing.objects.create(
+            engineer=self.engineer,
+            latitude=CHENNAI_LAT + lat_offset,
+            longitude=CHENNAI_LON,
+            accuracy=accuracy,
+            after_gap=after_gap,
+            timestamp=self._at(minutes),
+            received_at=self._at(minutes),
+        )
+
+    def _event(self, kind, minutes, detail="", received_minutes=None):
+        return PhoneEvent.objects.create(
+            engineer=self.engineer,
+            kind=kind,
+            at=self._at(minutes),
+            received_at=self._at(minutes if received_minutes is None else received_minutes),
+            client_key=f"{kind}-{minutes}",
+            detail=detail,
+        )
+
+    def _trail(self):
+        return list(LocationPing.objects.filter(engineer=self.engineer))
+
+    def _the_fifty_km_hole(self):
+        self._ping(minutes=0, lat_offset=0.0)
+        self._ping(minutes=1, lat_offset=0.03)  # ~3.3 km, tracked
+        self._ping(minutes=45, lat_offset=0.50, after_gap=True)  # ~52 km on
+        self._ping(minutes=46, lat_offset=0.53)  # ~3.3 km, tracked again
+
+    def test_a_flag_alone_counts_the_straight_line(self):
+        """A reload, a restart: nothing says Location went off."""
+        self._the_fifty_km_hole()
+        self.assertGreater(_trail_km(self._trail()), 50.0)
+
+    def test_a_switch_off_the_phone_saw_is_not_counted(self):
+        self._the_fifty_km_hole()
+        self._event("gps_off", minutes=2, detail="switched")
+
+        km = _trail_km(self._trail())
+        self.assertGreater(km, 6.0)
+        self.assertLess(km, 7.5)
+
+    def test_location_found_off_counts_like_a_reopened_app(self):
+        """Found off when the app looked is not a switch anybody saw: the app
+        may have been closed for an hour of driving before it."""
+        self._the_fifty_km_hole()
+        self._event("gps_off", minutes=2, detail="found_off")
+
+        self.assertGreater(_trail_km(self._trail()), 50.0)
+
+    def test_a_switch_off_after_the_phone_stopped_the_app_counts(self):
+        """The app was stopped first: the stretch is the phone's doing."""
+        self._the_fifty_km_hole()
+        self._event("tracker_stopped", minutes=1.5)
+        self._event("gps_off", minutes=2, detail="switched")
+
+        self.assertGreater(_trail_km(self._trail()), 50.0)
+
+    def test_a_switch_off_that_arrived_after_the_stretch_was_counted_stays_counted(self):
+        """Word that turns up later cannot take back a line already shown."""
+        self._the_fifty_km_hole()
+        self._event("gps_off", minutes=2, detail="switched", received_minutes=45.5)
+
+        self.assertGreater(_trail_km(self._trail()), 50.0)
+
+    def test_a_login_in_between_is_not_counted(self):
+        """The drive to work, flag or no flag."""
+        self._the_fifty_km_hole()
+        DutySession.objects.create(engineer=self.engineer, started_at=self._at(44))
+
+        km = _trail_km(self._trail())
+        self.assertGreater(km, 6.0)
+        self.assertLess(km, 7.5)
+
+    def test_only_the_one_segment_is_skipped(self):
+        for i in range(4):  # ~3.3 km
+            self._ping(minutes=i * 0.5, lat_offset=i * 0.01)
+        self._event("gps_off", minutes=2, detail="switched")
+        self._ping(minutes=40, lat_offset=0.40, after_gap=True)  # the hole
+        for i in range(1, 4):  # ~3.3 km more
+            self._ping(minutes=40 + i * 0.5, lat_offset=0.40 + i * 0.01)
+
+        km = _trail_km(self._trail())
+        self.assertGreater(km, 6.0)
+        self.assertLess(km, 7.5)
+
+    def test_a_noisy_first_fix_after_the_switch_on_still_leaves_the_hole_out(self):
+        """The fix the accuracy filter drops is still the first one after."""
+        self._ping(minutes=0, lat_offset=0.0)
+        self._ping(minutes=1, lat_offset=0.01)
+        self._event("gps_off", minutes=2, detail="switched")
+        self._ping(minutes=45, lat_offset=0.50, after_gap=True, accuracy=5000)
+        self._ping(minutes=46, lat_offset=0.50)
+        self._ping(minutes=47, lat_offset=0.51)
+
+        self.assertLess(_trail_km(self._trail()), 3.0, "the 50km jump must not be counted")
+
+    def test_two_fixes_sharing_a_timestamp_across_a_login(self):
+        """The clock is not fine enough to say which came first; the arrival
+        and the session row are."""
+        moment = self.start
+        LocationPing.objects.create(
+            engineer=self.engineer, latitude=CHENNAI_LAT, longitude=CHENNAI_LON,
+            accuracy=8, timestamp=moment, received_at=moment,
+        )
+        DutySession.objects.create(
+            engineer=self.engineer, started_at=moment + datetime.timedelta(seconds=5)
+        )
+        LocationPing.objects.create(
+            engineer=self.engineer, latitude=CHENNAI_LAT + 0.5, longitude=CHENNAI_LON,
+            accuracy=8, after_gap=True, timestamp=moment,
+            received_at=moment + datetime.timedelta(seconds=10),
+        )
         self.assertEqual(_trail_km(self._trail()), 0.0)

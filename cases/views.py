@@ -1,11 +1,13 @@
 import logging
 import math
 import re
+from bisect import bisect_left, bisect_right
 from datetime import datetime, time, timedelta
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from django.db.models import Max, Q
+from django.db import IntegrityError, transaction
+from django.db.models import OuterRef, Q, Subquery
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException
@@ -13,12 +15,22 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import Case, CaseVisit, DutySession, EngineerAlias, EngineerScorecard, LocationPing
+from .models import EngineerScorecardDay
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
-from .pings import MAX_BATCH, PingRejected, build_ping, coerce_number, ingest_batch
+from .pings import (
+    MAX_BATCH,
+    MAX_EVENTS,
+    PingRejected,
+    build_ping,
+    coerce_number,
+    ingest_batch,
+    ingest_events,
+)
 from .tracks import snapped_trail
 from . import places
 from . import olamaps, route_km
 from . import day_cases
+from . import km_rule
 from employees.models import Employee
 from authentication.models import get_allowed_branches
 
@@ -107,8 +119,11 @@ def _moving_trail(pings):
     Used for distance and for the road-snapped line. NOT used for the points
     list itself: stop detection needs the stationary fixes, since a cluster of
     them sitting in one place is exactly what a stop IS.
+
+    Put in km_rule.trail_order first, whatever order the caller had them in,
+    so fixes sharing a second are walked the same way on every read.
     """
-    clean = _usable_pings(pings)
+    clean = _usable_pings(sorted(pings, key=km_rule.trail_order))
     if not clean:
         return []
 
@@ -122,56 +137,98 @@ def _moving_trail(pings):
     return kept
 
 
-def _trail_km(pings):
-    """Total distance along an ordered trail, in km.
-
-    Three things are deliberately NOT counted.
+def _trail_km(pings, context=None):
+    """Total distance along a trail, in km.
 
     Low-accuracy fixes are dropped, and so is wander: standing still is 0.00,
     not the sum of however many metres the GPS drifted while nobody moved.
 
-    And travel nobody measured. A fix carrying `after_gap` is the first one
-    after the phone stopped tracking -- its location switched off, its
-    permission withdrawn -- so whatever happened between the fix before it and
-    this one was never seen. Joining them would charge a straight line across
-    it: shorter than the road they drove, invented either way. That one segment
-    is skipped; everything on both sides of it still counts in full.
+    Which straight lines between the fixes that are left count is decided in
+    cases/km_rule.py: all of them, except the trip to a Login and a stretch
+    with Location switched off -- and, for what had arrived before that rule
+    began, the old rule of skipping the line into every flagged fix.
 
     Deliberately NOT inferred from the time gap. An engineer standing still
     produces no new rows either, so a 40-minute hole is either 40 minutes of
     untracked driving or 40 minutes of work at one customer, and guessing threw
-    away the journey after every long stop. Only the phone knows, so the phone
-    says.
+    away the journey after every long stop.
 
-    Shared by /live, /path and /day so the number on an engineer's row is
-    computed exactly the same way as the one in their detail view.
+    `context` is the km_rule.TrailContext the caller loaded for the request;
+    without one it is read here. Shared by /live, /path, /day, the roster and
+    the app's own duty so the number on an engineer's row is computed exactly
+    the same way as the one in their detail view and on their phone.
     """
-    # The times tracking came back, taken from ALL the fixes rather than from
-    # the ones that survive filtering. The first fix after the GPS wakes up is
-    # routinely the noisiest of the day, so it is exactly the one the accuracy
-    # filter drops -- and reading the flag only off the kept points would lose
-    # it there and quietly count the straight line anyway.
-    resumed_at = [
-        ping.timestamp for ping in pings if getattr(ping, "after_gap", False)
-    ]
-    # And by identity as well as by time. Two fixes can carry the SAME timestamp
-    # -- a phone's clock granularity is coarser than the gap between two quick
-    # sends -- and then "is a resumed fix strictly after prev" is false for the
-    # resumed fix itself, and the untracked stretch is charged to the engineer
-    # after all. The id says what the clock cannot.
-    resumed_ids = {
-        ping.id for ping in pings if getattr(ping, "after_gap", False) and ping.id
-    }
-
+    pings = sorted(pings, key=km_rule.trail_order)
     moving = _moving_trail(pings)
+    if len(moving) < 2:
+        return 0.0
+    if context is None:
+        context = km_rule.context_for(pings)
+    rule = km_rule.SegmentRule(pings, context)
+    usable = _usable_pings(pings)
     total = 0.0
     for prev, cur in zip(moving, moving[1:]):
-        if cur.id in resumed_ids or any(
-            prev.timestamp < when <= cur.timestamp for when in resumed_at
-        ):
+        start = rule.counted_from(prev, cur, usable)
+        if start is None:
             continue
-        total += haversine_km(prev.latitude, prev.longitude, cur.latitude, cur.longitude)
+        total += haversine_km(start.latitude, start.longitude, cur.latitude, cur.longitude)
     return round(total, 2)
+
+
+class _DayKm:
+    """One local day's kilometres, for one engineer or a whole board.
+
+    The one place an engineer-day's km is read: every fix each of them took
+    that day, in trail order, and the Logins and phone events the km rule reads
+    beside them, handed to _trail_km. The roster, the app's "Travelled today"
+    and the engineer's history all go through here, so the office's KM report,
+    the phone and the history cannot come to three figures for one day.
+
+    Fixes are asked for between the day's two instants rather than by
+    timestamp__date: the same rows, as a range the (engineer, timestamp) index
+    answers directly instead of a date cast of every row's timestamp.
+
+    Three queries whatever the number of engineers. `kinds` widens the events
+    for a caller that reads them for something else as well; the km come out
+    the same, since the rule reads only what RULE_EVENT_KINDS holds.
+    """
+
+    def __init__(self, engineer_ids, day, kinds=km_rule.RULE_EVENT_KINDS):
+        ids = list(engineer_ids)
+        start, end = km_rule.day_bounds(day)
+        self.contexts = km_rule.load_contexts(ids, start, end, kinds=kinds)
+        self.trails = {}
+        for ping in LocationPing.objects.filter(
+            engineer_id__in=ids, timestamp__gte=start, timestamp__lt=end
+        ).order_by("timestamp", "id"):
+            self.trails.setdefault(ping.engineer_id, []).append(ping)
+
+    def km(self, engineer_id):
+        return _trail_km(self.trails.get(engineer_id, []), self.contexts[engineer_id])
+
+
+def _js_round2(value):
+    """Rounded to two decimals as the office's KM report rounds a total:
+    JavaScript's Math.round(x * 100) / 100, halves up. Python's round() takes
+    a half to even and lands a cent lower on 2.125."""
+    scaled = value * 100
+    whole = math.floor(scaled)
+    if scaled - whole >= 0.5:
+        whole += 1
+    return whole / 100
+
+
+def _counted_across(rule, moving, usable, start, end):
+    """Whether the kilometres take the straight line across start..end, the
+    span of an entry on the day rail: read off the kept pair around it --
+    the line _trail_km adds -- by the same rule, so the board says "counted
+    as a straight line" only where the number counted it. False while no
+    line runs across it yet."""
+    index = bisect_right([ping.timestamp for ping in moving], start)
+    if index == 0 or index == len(moving) or moving[index].timestamp < end:
+        return False
+    origin = rule.counted_from(moving[index - 1], moving[index], usable)
+    return origin is not None and origin.timestamp <= start
 
 
 # Below this a gap is the ordinary jitter of a phone handing the GPS back and
@@ -204,18 +261,23 @@ def duration_words(minutes):
 
 
 def _offline_event(first, last):
-    """BOTH ends of a stretch the phone spent with no network.
+    """BOTH ends of a stretch the phone held its fixes before sending them.
 
     Measured from when the first held fix was TAKEN to when the last one was
     finally DELIVERED -- that is the window the office saw nothing in.
 
-    Two entries, not one. "No network 19 min" says a hole opened; it does not
-    say the phone came back, and somebody reading the rail at 11:11 had to work
-    out for themselves whether 11:30 was still dark. The moment it reconnected
-    is a fact we hold -- it is when the held fixes arrived -- so it is written
-    down rather than left to be inferred.
+    Two entries, not one. A hole that opens has to be shown closing, or
+    somebody reading the rail at 11:11 has to work out for themselves whether
+    11:30 was still dark. The moment the fixes were sent is a fact we hold, so
+    it is written down rather than left to be inferred.
 
-    The reconnection carries no position on purpose. Where the phone WAS when
+    Named for what is known, not for the network. The phone may have had no
+    network; it may equally have been in a pocket with the app asleep, its
+    fixes waiting for the app to wake -- and calling that "No network" sent the
+    office after a signal that was fine. When the phone reports the network
+    itself, the day view leaves this out for its Net entries.
+
+    The second end carries no position on purpose. Where the phone WAS when
     the delivery went through is not where the last held fix was taken, so the
     nearest-fix pass in the day view answers it instead, and leaves it blank
     rather than guessing when nothing is close enough in time.
@@ -232,7 +294,7 @@ def _offline_event(first, last):
         {
             "at": first.timestamp,
             "type": "no_network",
-            "label": f"No network \u00b7 {duration_words(minutes)}",
+            "label": f"Kept on the phone \u00b7 {duration_words(minutes)}",
             "minutes": minutes,
             "latitude": first.latitude,
             "longitude": first.longitude,
@@ -240,12 +302,146 @@ def _offline_event(first, last):
         {
             "at": last.received_at,
             "type": "network_back",
-            "label": "Network back",
+            "label": "Sent from the phone",
             "minutes": minutes,
             "latitude": None,
             "longitude": None,
         },
     ]
+
+
+# The phone's own events that explain a silence in the fixes: with one of
+# these in it, the rail lets the phone say what happened instead of guessing.
+# app_opened is not one of them -- it only says the app had been closed.
+EXPLAINING_KINDS = (
+    "gps_off",
+    "gps_on",
+    "net_off",
+    "net_on",
+    "tracker_stopped",
+    "tracker_started",
+)
+
+# How far either side of a gap the phone's word about it may fall and still be
+# about it. Events carry the phone's own clock, and the fixes either side of a
+# gap are seconds, not minutes, from when it opened and closed.
+EVENT_SLACK = timedelta(minutes=1)
+# How close to the first fix after a gap the app must have been opened for the
+# gap to have been the app being closed.
+APP_OPENED_SLACK = timedelta(minutes=2)
+# A network that dropped and came back within this was a blip, not an outage,
+# and forty blips nobody reads are the same as none.
+NET_BLIP = timedelta(minutes=2)
+
+# Each "off" the phone reports, with the "on" that ends it.
+PAIRED_KINDS = (
+    ("gps_off", "gps_on"),
+    ("net_off", "net_on"),
+    ("tracker_stopped", "tracker_started"),
+)
+
+PHONE_EVENT_LABELS = {
+    "gps_off": "GPS off",
+    "gps_on": "GPS on",
+    "net_off": "Net off",
+    "net_on": "Net on",
+    "tracker_stopped": "Phone stopped the app",
+    "tracker_started": "App tracking again",
+}
+
+
+def _any_between(moments, start, end):
+    """Whether any of the sorted `moments` falls within [start, end]."""
+    index = bisect_left(moments, start)
+    return index < len(moments) and moments[index] <= end
+
+
+def _phone_event_entries(events, sessions, pings, day_start, day_end):
+    """The rail entries for what the phone said about itself on the day.
+
+    GPS off and on, Net off and on, the phone stopping the app and the app
+    tracking again -- each where the phone put it, and how long it lasted
+    when both ends are known. Only what happened on the day and on duty, like
+    every other entry (Location from just before a Login: _phone_on_duty).
+    app_opened has no entry of its own; it names a hole.
+
+    `found` marks GPS the phone found already off (or on) when it looked,
+    rather than saw being switched: only a switch takes kilometres away.
+
+    A net_off and net_on under NET_BLIP apart are left out together. The
+    phone stopping the app is measured to the app tracking again, or failing
+    that to the first fix after it, or to the end of the duty it fell in.
+    """
+    ordered = sorted(events, key=lambda event: (event.at, event.pk or 0))
+    lasted = {}
+    for off_kind, on_kind in PAIRED_KINDS:
+        opened = None
+        for event in ordered:
+            if event.kind == off_kind and opened is None:
+                opened = event
+            elif event.kind == on_kind and opened is not None:
+                lasted[id(opened)] = lasted[id(event)] = event.at - opened.at
+                opened = None
+
+    entries = []
+    for event in ordered:
+        label = PHONE_EVENT_LABELS.get(event.kind)
+        if label is None:
+            continue
+        if not (day_start <= event.at < day_end) or not _phone_on_duty(sessions, event):
+            continue
+        span = lasted.get(id(event))
+        if event.kind in ("net_off", "net_on") and span is not None and span < NET_BLIP:
+            continue
+        if event.kind == "tracker_stopped" and span is None:
+            span = _until_tracking_again(event.at, sessions, pings, day_end) - event.at
+        minutes = max(0, int(span.total_seconds() // 60)) if span is not None else None
+        if event.kind == "tracker_stopped":
+            label = f"{label} \u00b7 {duration_words(minutes)}"
+        entry = {
+            "at": event.at,
+            "type": event.kind,
+            "label": label,
+            "latitude": event.latitude,
+            "longitude": event.longitude,
+        }
+        if minutes is not None:
+            entry["minutes"] = minutes
+        if event.kind in ("gps_off", "gps_on"):
+            entry["found"] = (event.detail or "").strip() in ("found_off", "found_on")
+        entries.append(entry)
+    return entries
+
+
+def _net_outages(entries):
+    """The network outages the rail itself shows, as (off, on) -- `on` None
+    for one still off. Paired from the rail's own Net entries, so a blip left
+    off the rail is no outage here either."""
+    outages = []
+    opened = None
+    for entry in sorted(entries, key=lambda e: e["at"]):
+        if entry["type"] == "net_off" and opened is None:
+            opened = entry["at"]
+        elif entry["type"] == "net_on" and opened is not None:
+            outages.append((opened, entry["at"]))
+            opened = None
+    if opened is not None:
+        outages.append((opened, None))
+    return outages
+
+
+def _until_tracking_again(moment, sessions, pings, day_end):
+    """When the trail picked up again after the phone stopped the app: the
+    first fix after it, or else the end of the duty it fell in (now, for one
+    still open). With no duty on record at all, the end of the day."""
+    for ping in pings:
+        if ping.timestamp > moment:
+            return ping.timestamp
+    now = timezone.now()
+    for session in sessions:
+        if session.started_at <= moment <= (session.ended_at or now):
+            return session.ended_at or now
+    return min(now, day_end)
 
 
 def _on_duty_at(sessions, moment):
@@ -262,6 +458,20 @@ def _on_duty_at(sessions, moment):
         if session.started_at <= moment <= (session.ended_at or timezone.now()):
             return True
     return False
+
+
+def _phone_on_duty(sessions, event):
+    """On duty at the event's own time -- or, for what the phone says about
+    Location, up to km_rule.CLOCK_SKEW before a Login. The phone looks at
+    Location when the duty starts and stamps it by its own clock, and the
+    board's "GPS off since" (_gps_off_since) reads the event from there: the
+    rail has to say what the board does."""
+    if _on_duty_at(sessions, event.at):
+        return True
+    return event.kind in ("gps_off", "gps_on") and any(
+        session.started_at - km_rule.CLOCK_SKEW <= event.at < session.started_at
+        for session in sessions
+    )
 
 
 def _usable_pings(pings):
@@ -524,6 +734,97 @@ def _phone_state(ping):
     }
 
 
+# Every phone on duty sends a fix every thirty seconds and a heartbeat every
+# minute, and the board only asks whether it heard from one in the last ten
+# minutes. Writing each of them to the session would be a write per request for
+# nothing; one every half minute answers the same question.
+CONTACT_EVERY_SECONDS = 30
+
+
+def _note_contact(employee):
+    """Write down that the engineer's phone was just heard from.
+
+    Called only for what proves something is recording: a fix we had not got
+    before, and a post to events/ (an empty one is the heartbeat). Not for a
+    duty read, a Login or a re-sent fix -- a page asks for its duty every
+    minute even when the tracker behind it has stopped, and counting that kept
+    a phone that recorded nothing green on the board all day.
+
+    One UPDATE on the open session, skipped while the last one is under
+    CONTACT_EVERY_SECONDS old. Never fails the request: this is bookkeeping
+    about the phone, and losing a fix over it would be the wrong way round.
+    """
+    now = timezone.now()
+    try:
+        with transaction.atomic():
+            DutySession.objects.filter(engineer=employee, ended_at__isnull=True).filter(
+                Q(last_contact_at__isnull=True)
+                | Q(last_contact_at__lt=now - timedelta(seconds=CONTACT_EVERY_SECONDS))
+            ).update(last_contact_at=now)
+    except Exception:  # noqa: BLE001 - never cost anybody a fix
+        logger.exception("could not note contact for engineer %s", employee.pk)
+
+
+def _contact(session, latest):
+    """When this phone was last heard from: its session's own record of that,
+    or when its newest fix arrived, whichever is later. None if never."""
+    moments = []
+    if session is not None and session.last_contact_at is not None:
+        moments.append(session.last_contact_at)
+    if latest is not None:
+        moments.append(km_rule.arrival(latest))
+    return max(moments) if moments else None
+
+
+def _minutes_since(moment, now):
+    if moment is None:
+        return None
+    return max(0, int((now - moment).total_seconds() // 60))
+
+
+def _gps_off_since(session, events, latest):
+    """When Location went off on this duty's phone, if nothing since says it is
+    back: no gps_on after it, and no fix taken after it.
+
+    Only for an open duty, and only from its own events -- an old switch-off
+    from an earlier duty, never followed by a gps_on because nobody was
+    watching by then, must not paint today red. A few minutes before the Login
+    still counts: the phone says what it found at Login on its own clock.
+    """
+    if session is None or session.ended_at is not None:
+        return None
+    since = session.started_at - km_rule.CLOCK_SKEW
+    off = None
+    for event in events:
+        if event.kind == "gps_off" and event.at >= since:
+            off = event
+    if off is None:
+        return None
+    if any(event.kind == "gps_on" and event.at > off.at for event in events):
+        return None
+    if latest is not None and latest.timestamp > off.at:
+        return None
+    return off.at
+
+
+def _no_signal(session, latest, contact, gps_off_since, now):
+    """`stale` for an on-duty row: the board's "No signal".
+
+    Nothing heard from the phone for LIVE_WINDOW_MINUTES; or heard from, but
+    not one fix since the Login and the Login is that old -- a page can keep
+    talking while the tracker behind it records nothing; or Location is off,
+    which the board names in its own words, and an older board reads as No
+    signal rather than as live.
+    """
+    window = timedelta(minutes=LIVE_WINDOW_MINUTES)
+    if contact is None or now - contact > window:
+        return True
+    fixed_since_login = latest is not None and km_rule.arrival(latest) >= session.started_at
+    if not fixed_since_login and now - session.started_at > window:
+        return True
+    return gps_off_since is not None
+
+
 def _case_for(case_id):
     """The case a fix is tagged with, or None.
 
@@ -647,6 +948,66 @@ def resolve_engineer(data):
             if len(prefix) == 1:
                 return prefix[0]
     return None
+
+
+# Most days one history push may carry: a week of the whole register several
+# times over, small enough that one request cannot tie up the database.
+MAX_SCORECARD_DAYS = 2000
+
+# How far back a history push may write. The engineer sees three months; this
+# is room for a backfill of more without letting a stray date rewrite years.
+SCORECARD_DAYS_BACK = 400
+
+# The longest span my_history answers at once: two bill cycles, the same limit
+# the office's KM report puts on a range.
+MAX_HISTORY_DAYS = 62
+
+
+def _query_day(raw):
+    """A YYYY-MM-DD value as a date, or None when it is missing or is not one."""
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        return parse_date(raw)
+    except ValueError:
+        return None
+
+
+def _store_history_day(employee, day, values, today):
+    """Write one day's numbers from the history push: "stored" for a new row,
+    "updated" for one rewritten, "kept" for today's live row, left as it is.
+
+    Today belongs to the live push. The check and the write happen under the
+    row's lock, and an insert that loses a race to the live push's own insert
+    reads the row again and applies the same rule, so a history push never
+    overwrites a live row for today, whichever of the two gets there first.
+    """
+    for attempt in range(2):
+        try:
+            with transaction.atomic():
+                row = (
+                    EngineerScorecardDay.objects.select_for_update()
+                    .filter(engineer=employee, day=day)
+                    .first()
+                )
+                if row is None:
+                    EngineerScorecardDay.objects.create(
+                        engineer=employee,
+                        day=day,
+                        source=EngineerScorecardDay.SOURCE_HISTORY,
+                        **values,
+                    )
+                    return "stored"
+                if day == today and row.source == EngineerScorecardDay.SOURCE_LIVE:
+                    return "kept"
+                for field, value in values.items():
+                    setattr(row, field, value)
+                row.source = EngineerScorecardDay.SOURCE_HISTORY
+                row.save()
+                return "updated"
+        except IntegrityError:
+            if attempt:
+                raise
 
 
 class CaseViewSet(viewsets.ModelViewSet):
@@ -847,7 +1208,7 @@ class CaseViewSet(viewsets.ModelViewSet):
                 })
                 continue
 
-            EngineerScorecard.objects.update_or_create(
+            card, _ = EngineerScorecard.objects.update_or_create(
                 engineer=employee,
                 defaults={
                     "as_of": as_of,
@@ -857,6 +1218,21 @@ class CaseViewSet(viewsets.ModelViewSet):
                     "month_closed": _as_count(raw.get("month_closed")),
                     "daily_target": daily_target,
                     "monthly_target": monthly_target,
+                },
+            )
+            # The same numbers filed under their day, for the engineer's
+            # history. The zeroing below is the live card's alone: it never
+            # touches these rows, and nothing here ever deletes one.
+            EngineerScorecardDay.objects.update_or_create(
+                engineer=employee,
+                day=as_of,
+                defaults={
+                    "assigned": card.assigned,
+                    "attended": card.attended,
+                    "closed": card.closed,
+                    "daily_target": daily_target,
+                    "monthly_target": monthly_target,
+                    "source": EngineerScorecardDay.SOURCE_LIVE,
                 },
             )
             seen.add(employee.id)
@@ -873,6 +1249,143 @@ class CaseViewSet(viewsets.ModelViewSet):
         )
 
         return Response({"saved": saved, "zeroed": zeroed, "skipped": skipped})
+
+    @action(detail=False, methods=["post"], url_path="scorecard_days")
+    def scorecard_days(self, request):
+        """Receive past days' per-engineer counts from OpenCall, for each
+        engineer's history.
+
+        Body: {"days": [ {engineer_name?/engineer_email?/engineer_phone?/engineer_id?,
+                          day: "YYYY-MM-DD", assigned, attended, closed,
+                          daily_target, monthly_target}, ... ]}
+
+        One row per (engineer, day), rewritten in place and marked "history".
+        The live card is never touched, and neither is today's row the live
+        push wrote: today belongs to that push. Engineers are matched exactly
+        as the scorecards push matches them. An unmatched one is named in
+        `unmatched`, and an item that cannot be stored is listed in `rejected`
+        by its index, rather than failing everybody else's days.
+
+        Optional "complete_days": ["YYYY-MM-DD", ...] -- days this request
+        carries ALL of, every engineer that day's productivity lists. For such
+        a day before today, anybody else's row is set to zero (never deleted):
+        an engineer whose calls went to somebody else later in the day kept the
+        morning's count otherwise, and History read more than Productivity --
+        an overcount, which is the worse way to be wrong. Nothing is zeroed for
+        a day none of whose engineers matched, because that is a lookup that
+        failed, not a day nobody worked.
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Only admin/HR can push scorecards."}, status=403)
+
+        items = request.data.get("days") if hasattr(request.data, "get") else None
+        if not isinstance(items, list):
+            return Response({"detail": 'Body must be {"days": [ ... ]}.'}, status=400)
+        if len(items) > MAX_SCORECARD_DAYS:
+            return Response(
+                {
+                    "detail": "a push may carry at most %d days." % MAX_SCORECARD_DAYS,
+                    "max_days": MAX_SCORECARD_DAYS,
+                },
+                status=400,
+            )
+
+        today = timezone.localdate()
+        oldest = today - timedelta(days=SCORECARD_DAYS_BACK)
+        identity_keys = ("engineer_name", "engineer_email", "engineer_phone", "engineer_id")
+        stored = updated = 0
+        unmatched = []
+        rejected = []
+        # A week of the register names each engineer seven times; each name is
+        # looked up once.
+        matches = {}
+        # Who this request matched, per day, for the complete-day rule.
+        matched_on = {}
+
+        for index, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                rejected.append({"index": index, "reason": "each day must be an object."})
+                continue
+            day = _query_day(raw.get("day"))
+            if day is None:
+                rejected.append({"index": index, "reason": "day must be YYYY-MM-DD."})
+                continue
+            if day > today:
+                rejected.append({"index": index, "reason": "day is in the future."})
+                continue
+            if day < oldest:
+                rejected.append(
+                    {"index": index, "reason": "day is older than %d days." % SCORECARD_DAYS_BACK}
+                )
+                continue
+            # How the push named the engineer: the name, else whichever key it
+            # gave, which is what the unmatched list reports.
+            named = [str(raw.get(key) or "").strip() for key in identity_keys]
+            if not any(named):
+                rejected.append({"index": index, "reason": "no engineer given."})
+                continue
+
+            identity = tuple(repr(raw.get(key)) for key in identity_keys)
+            if identity not in matches:
+                matches[identity] = resolve_engineer(raw)
+            employee = matches[identity]
+            if employee is None:
+                name = next(value for value in named if value)
+                if name not in unmatched:
+                    unmatched.append(name)
+                continue
+
+            matched_on.setdefault(day, set()).add(employee.id)
+            outcome = _store_history_day(
+                employee,
+                day,
+                {
+                    "assigned": _as_count(raw.get("assigned")),
+                    "attended": _as_count(raw.get("attended")),
+                    "closed": _as_count(raw.get("closed")),
+                    "daily_target": _as_count(raw.get("daily_target")),
+                    "monthly_target": _as_count(raw.get("monthly_target")),
+                },
+                today,
+            )
+            if outcome == "stored":
+                stored += 1
+            elif outcome == "updated":
+                updated += 1
+            else:
+                rejected.append(
+                    {"index": index, "reason": "today's numbers come from the live push."}
+                )
+
+        zeroed = 0
+        complete = request.data.get("complete_days") if hasattr(request.data, "get") else None
+        for raw_day in complete if isinstance(complete, list) else []:
+            day = _query_day(raw_day)
+            # Only a finished day, and only one this request matched somebody on.
+            if day is None or day >= today or day < oldest or not matched_on.get(day):
+                continue
+            zeroed += (
+                EngineerScorecardDay.objects.filter(day=day)
+                .exclude(engineer_id__in=matched_on[day])
+                .filter(Q(assigned__gt=0) | Q(attended__gt=0) | Q(closed__gt=0))
+                .update(
+                    assigned=0,
+                    attended=0,
+                    closed=0,
+                    source=EngineerScorecardDay.SOURCE_HISTORY,
+                    updated_at=timezone.now(),
+                )
+            )
+
+        return Response(
+            {
+                "stored": stored,
+                "updated": updated,
+                "unmatched": unmatched,
+                "rejected": rejected,
+                "zeroed": zeroed,
+            }
+        )
 
     @action(detail=False, methods=["get"], url_path="my_scorecard")
     def my_scorecard(self, request):
@@ -898,6 +1411,86 @@ class CaseViewSet(viewsets.ModelViewSet):
             "daily_target": card.daily_target if card else 0,
             "monthly_target": card.monthly_target if card else 0,
             "updated_at": card.updated_at if card else None,
+        })
+
+    @action(detail=False, methods=["get"], url_path="my_history")
+    def my_history(self, request):
+        """The caller's own past days, for the History view on their Cases
+        screen: km, Assigned / Attended / Closed and the targets, per day.
+
+        Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD. Like my_scorecard there is no
+        engineer to pass: it only ever answers about you. `to` stops at today,
+        and a range is at most MAX_HISTORY_DAYS days.
+
+        Every calendar day in the range, oldest first. A day's km is read by
+        _DayKm, so it is the roster's distance_km for that day -- the office
+        KM report's figure -- and today's is "Travelled today". The total is
+        added up and rounded the way the KM report adds up a row.
+        """
+        employee = _get_employee(request.user)
+        if not employee:
+            raise NoEmployeeProfile()
+
+        first = _query_day(request.query_params.get("from"))
+        last = _query_day(request.query_params.get("to"))
+        if first is None or last is None:
+            return Response({"detail": "from and to must be YYYY-MM-DD."}, status=400)
+        if first > last:
+            return Response({"detail": "from must not be after to."}, status=400)
+        # A day that has not happened yet has nothing to show; a range wholly
+        # after today is answered with no days.
+        last = min(last, timezone.localdate())
+        span = (last - first).days + 1
+        if span > MAX_HISTORY_DAYS:
+            return Response(
+                {
+                    "detail": "at most %d days at a time." % MAX_HISTORY_DAYS,
+                    "max_days": MAX_HISTORY_DAYS,
+                },
+                status=400,
+            )
+
+        # A duty nobody stopped is closed first, as the roster closes it before
+        # it reads a day.
+        TrackingViewSet._close_forgotten_sessions()
+
+        scores = {
+            row.day: row
+            for row in EngineerScorecardDay.objects.filter(
+                engineer=employee, day__gte=first, day__lte=last
+            )
+        }
+        days = []
+        km_total = 0.0
+        for offset in range(max(span, 0)):
+            day = first + timedelta(days=offset)
+            km = _DayKm([employee.id], day).km(employee.id)
+            score = scores.get(day)
+            days.append({
+                "day": day.isoformat(),
+                "km": km,
+                "assigned": score.assigned if score else 0,
+                "attended": score.attended if score else 0,
+                "closed": score.closed if score else 0,
+                "daily_target": score.daily_target if score else 0,
+                "has_score": score is not None,
+            })
+            # Oldest first, as the KM report adds a row's days.
+            km_total += km
+
+        newest = max(scores.values(), key=lambda row: row.day, default=None)
+        return Response({
+            "from": first.isoformat(),
+            "to": last.isoformat(),
+            "days": days,
+            "totals": {
+                "km": _js_round2(km_total),
+                "days_tracked": sum(1 for entry in days if entry["km"] > 0),
+                "assigned": sum(entry["assigned"] for entry in days),
+                "attended": sum(entry["attended"] for entry in days),
+                "closed": sum(entry["closed"] for entry in days),
+                "monthly_target": newest.monthly_target if newest else 0,
+            },
         })
 
     @action(detail=False, methods=["post"])
@@ -1410,16 +2003,16 @@ class TrackingViewSet(viewsets.ViewSet):
         # office's board uses — so an engineer asking "how far have I gone" and
         # a manager asking the same about them cannot get two answers.
         today = timezone.localdate()
-        pings = list(
-            LocationPing.objects.filter(engineer=employee, timestamp__date=today)
-            .order_by("timestamp")
-        )
+        # The day's fixes, Logins and phone events, read by the one helper the
+        # roster and the engineer's history read a day with, and the way the
+        # day view reads them, so all of them come to the same figure.
+        today_km = _DayKm([employee.id], today).km(employee.id)
         return {
             "on_duty": session is not None,
             "session_id": session.id if session else None,
             "started_at": session.started_at if session else None,
             "duration_minutes": session.duration_minutes() if session else 0,
-            "today_km": _trail_km(pings),
+            "today_km": today_km,
         }
 
     @action(detail=False, methods=["get"])
@@ -1512,6 +2105,7 @@ class TrackingViewSet(viewsets.ViewSet):
                 return Response(LocationPingSerializer(existing).data, status=200)
 
         ping.save()
+        _note_contact(employee)
         return Response(LocationPingSerializer(ping).data, status=201)
 
     @action(detail=False, methods=["post"], url_path="ping/batch")
@@ -1540,6 +2134,40 @@ class TrackingViewSet(viewsets.ViewSet):
         except PingRejected as exc:
             return Response({"detail": str(exc), "max_batch": MAX_BATCH}, status=400)
 
+        if result["stored"]:
+            _note_contact(employee)
+        return Response(result, status=201)
+
+    @action(detail=False, methods=["post"], url_path="events")
+    def events(self, request):
+        """What the phone noticed about itself: Location off and on, the
+        network gone and back, the app stopped and running again, the app
+        opened. Body: {"events": [{kind, at, client_key, latitude?,
+        longitude?, detail?}, ...]}.
+
+        The same gates as a fix, because two of these change the kilometres.
+        An empty list is the phone's heartbeat: nothing new to say, but alive
+        and recording, which is what keeps a parked engineer off "No signal".
+        """
+        employee = _get_employee(request.user)
+        if not employee:
+            return Response({"detail": "No employee profile linked to this user."}, status=400)
+        if not _from_the_app(request):
+            return Response(
+                {
+                    "detail": "Only the RTPL app can record a position.",
+                    "app_only": True,
+                },
+                status=403,
+            )
+
+        posted = request.data.get("events") if hasattr(request.data, "get") else None
+        try:
+            result = ingest_events(employee, posted)
+        except PingRejected as exc:
+            return Response({"detail": str(exc), "max_batch": MAX_EVENTS}, status=400)
+
+        _note_contact(employee)
         return Response(result, status=201)
 
     @action(detail=False, methods=["get"])
@@ -1574,35 +2202,49 @@ class TrackingViewSet(viewsets.ViewSet):
 
         engineer_ids = [s.engineer_id for s in sessions]
 
-        # Latest ping per on-duty engineer. NOTE: .order_by() is required —
-        # LocationPing has Meta.ordering = ["-timestamp"], which Django would
-        # otherwise fold into the GROUP BY, breaking the per-engineer
-        # aggregation and returning one row per ping instead of per engineer.
+        # Latest fix per on-duty engineer: the newest by when it was TAKEN,
+        # the id breaking a tie. Not the highest id -- a late batch is stored
+        # after the live fixes it was taken before, and reading it as the
+        # newest moved the marker back down the road and called a live phone
+        # stale.
+        newest = (
+            LocationPing.objects.filter(engineer_id=OuterRef("pk"))
+            .order_by("-timestamp", "-id")
+            .values("id")[:1]
+        )
         latest_ids = (
-            LocationPing.objects.filter(engineer_id__in=engineer_ids)
-            .order_by()
-            .values("engineer")
-            .annotate(last_id=Max("id"))
+            Employee.objects.filter(pk__in=engineer_ids)
+            .annotate(last_id=Subquery(newest))
             .values_list("last_id", flat=True)
         )
         latest_by_engineer = {
             p.engineer_id: p
-            for p in LocationPing.objects.select_related("case").filter(id__in=list(latest_ids))
+            for p in LocationPing.objects.select_related("case").filter(
+                id__in=[last_id for last_id in latest_ids if last_id is not None]
+            )
         }
 
         # Distance covered since each duty started, from that session's own
         # pings — so the number resets with the duty instead of carrying over
         # yesterday's, and matches what "this shift" means to the operator.
         now = timezone.now()
+        contexts = km_rule.load_contexts(
+            engineer_ids,
+            min(s.started_at for s in sessions),
+            now,
+            kinds=km_rule.STATE_EVENT_KINDS,
+        )
         rows = []
         for session in sessions:
             ping = latest_by_engineer.get(session.engineer_id)
-            trail = LocationPing.objects.filter(
-                engineer_id=session.engineer_id, timestamp__gte=session.started_at
-            ).order_by("timestamp")
-            last_seen_minutes = (
-                int((now - ping.timestamp).total_seconds() // 60) if ping else None
+            context = contexts[session.engineer_id]
+            trail = list(
+                LocationPing.objects.filter(
+                    engineer_id=session.engineer_id, timestamp__gte=session.started_at
+                ).order_by("timestamp", "id")
             )
+            contact = _contact(session, ping)
+            gps_off_since = _gps_off_since(session, context.events, ping)
             rows.append(
                 {
                     "engineer_id": session.engineer_id,
@@ -1611,11 +2253,16 @@ class TrackingViewSet(viewsets.ViewSet):
                     "on_duty": True,
                     "duty_started_at": session.started_at,
                     "duty_minutes": session.duration_minutes(),
-                    # No fix yet, or the last one is older than the live window:
-                    # still on duty, just not currently reporting.
-                    "stale": ping is None or (now - ping.timestamp) > timedelta(minutes=LIVE_WINDOW_MINUTES),
-                    "last_seen_minutes": last_seen_minutes,
-                    "distance_km": _trail_km(trail),
+                    # Still on duty, just not currently reporting -- see
+                    # _no_signal for what that means.
+                    "stale": _no_signal(session, ping, contact, gps_off_since, now),
+                    # Since the phone was last heard from; last_fix_minutes is
+                    # since the position on the map was taken.
+                    "last_seen_minutes": _minutes_since(contact, now),
+                    "last_fix_minutes": _minutes_since(ping.timestamp if ping else None, now),
+                    "gps_off_since": gps_off_since,
+                    "last_contact_at": contact,
+                    "distance_km": _trail_km(trail, context),
                     "latitude": ping.latitude if ping else None,
                     "longitude": ping.longitude if ping else None,
                     "accuracy": ping.accuracy if ping else None,
@@ -1676,7 +2323,7 @@ class TrackingViewSet(viewsets.ViewSet):
             if target_date:
                 qs = qs.filter(timestamp__date=target_date)
 
-        pings = list(qs.order_by("timestamp"))
+        pings = list(qs.order_by("timestamp", "id"))
 
         payload = {
             "count": len(pings),
@@ -1827,44 +2474,47 @@ class TrackingViewSet(viewsets.ViewSet):
                 len(unmatched_names),
             )
 
+        # Every session of theirs that overlaps the day, and what their phones
+        # said about Location and the app: two queries for the whole board.
+        # The km rule needs EVERY Login of the day -- holding only one session
+        # per engineer, the board missed a second Login and read more km than
+        # the day view and the engineer's own phone. Read with the day's fixes
+        # by _DayKm, which the phone's own km and its history read a day with.
+        day_km = _DayKm(ids, target_date, kinds=km_rule.STATE_EVENT_KINDS)
+        contexts = day_km.contexts
+
         # That day's duty, per engineer: the open one if there is one, otherwise
         # the last that ended.
         sessions_by_engineer = {}
-        for session in DutySession.objects.filter(
-            engineer_id__in=ids, started_at__date=target_date
-        ).order_by("started_at"):
-            current = sessions_by_engineer.get(session.engineer_id)
-            # An open session always wins; otherwise keep the latest.
-            if current is None or session.ended_at is None or current.ended_at is not None:
-                sessions_by_engineer[session.engineer_id] = session
+        for engineer_id, context in contexts.items():
+            for session in context.sessions:
+                if timezone.localtime(session.started_at).date() != target_date:
+                    continue
+                current = sessions_by_engineer.get(engineer_id)
+                # An open session always wins; otherwise keep the latest.
+                if current is None or session.ended_at is None or current.ended_at is not None:
+                    sessions_by_engineer[engineer_id] = session
 
-        # Their last fix of that day, for the marker and the "last seen" age.
-        latest_ids = (
-            LocationPing.objects.filter(engineer_id__in=ids, timestamp__date=target_date)
-            .order_by()
-            .values("engineer")
-            .annotate(last_id=Max("id"))
-            .values_list("last_id", flat=True)
-        )
+        # One pass over the day's fixes, loaded with the contexts above, so
+        # distance costs a single query rather than one per engineer.
+        trails = day_km.trails
+
+        # Their last fix of that day, for the marker and the "last seen" age:
+        # the newest by when it was taken, not the highest id, which a late
+        # batch would win.
         latest_by_engineer = {
             p.engineer_id: p
-            for p in LocationPing.objects.select_related("case").filter(id__in=list(latest_ids))
+            for p in LocationPing.objects.select_related("case").filter(
+                id__in=[trail[-1].id for trail in trails.values()]
+            )
         }
-
-        # One pass over the day's fixes so distance costs a single query rather
-        # than one per engineer.
-        trails = {}
-        for ping in LocationPing.objects.filter(
-            engineer_id__in=ids, timestamp__date=target_date
-        ).order_by("timestamp"):
-            trails.setdefault(ping.engineer_id, []).append(ping)
 
         now = timezone.now()
         rows = []
         for engineer, asked_as in resolved:
             session = sessions_by_engineer.get(engineer.id)
             ping = latest_by_engineer.get(engineer.id)
-            trail = trails.get(engineer.id, [])
+            context = contexts[engineer.id]
 
             if session and session.ended_at is None:
                 state = "on_duty"
@@ -1873,9 +2523,8 @@ class TrackingViewSet(viewsets.ViewSet):
             else:
                 state = "absent"
 
-            last_seen_minutes = (
-                int((now - ping.timestamp).total_seconds() // 60) if ping else None
-            )
+            contact = _contact(session, ping)
+            gps_off_since = _gps_off_since(session, context.events, ping)
             rows.append(
                 {
                     "engineer_id": engineer.id,
@@ -1896,12 +2545,19 @@ class TrackingViewSet(viewsets.ViewSet):
                     "duty_ended_at": session.ended_at if session else None,
                     "duty_minutes": session.duration_minutes() if session else 0,
                     "auto_closed": bool(session.auto_closed) if session else False,
-                    "distance_km": _trail_km(trail),
+                    "distance_km": day_km.km(engineer.id),
                     # Only meaningful while on duty; a checked-out engineer is
-                    # not expected to be reporting.
+                    # not expected to be reporting. The name is kept for the
+                    # boards already reading it.
                     "stale": state == "on_duty"
-                    and (ping is None or (now - ping.timestamp) > timedelta(minutes=LIVE_WINDOW_MINUTES)),
-                    "last_seen_minutes": last_seen_minutes,
+                    and _no_signal(session, ping, contact, gps_off_since, now),
+                    # Since the phone was last heard from, and since the fix on
+                    # the map was taken: an engineer standing still is heard
+                    # from every minute and has not moved for an hour.
+                    "last_seen_minutes": _minutes_since(contact, now),
+                    "last_fix_minutes": _minutes_since(ping.timestamp if ping else None, now),
+                    "gps_off_since": gps_off_since,
+                    "last_contact_at": contact,
                     "latitude": ping.latitude if ping else None,
                     "longitude": ping.longitude if ping else None,
                     "accuracy": ping.accuracy if ping else None,
@@ -1935,6 +2591,9 @@ class TrackingViewSet(viewsets.ViewSet):
                     "distance_km": 0.0,
                     "stale": False,
                     "last_seen_minutes": None,
+                    "last_fix_minutes": None,
+                    "gps_off_since": None,
+                    "last_contact_at": None,
                     "latitude": None,
                     "longitude": None,
                     "accuracy": None,
@@ -1986,12 +2645,35 @@ class TrackingViewSet(viewsets.ViewSet):
         pings = list(
             LocationPing.objects.select_related("case")
             .filter(engineer=engineer, timestamp__date=target_date)
-            .order_by("timestamp")
+            .order_by("timestamp", "id")
         )
-        sessions = list(
-            DutySession.objects.filter(engineer=engineer, started_at__date=target_date).order_by(
-                "started_at"
-            )
+        day_start, day_end = km_rule.day_bounds(target_date)
+        # Every session that overlaps the day, and everything the phone said
+        # about itself around it: two queries, read by the km rule, the rail
+        # and the on-duty test alike.
+        context = km_rule.load_contexts([engineer.id], day_start, day_end, kinds=None)[
+            engineer.id
+        ]
+        rule = km_rule.SegmentRule(pings, context)
+        # The day's own Logins and Logouts are the sessions that began on it --
+        # the same ones ROUTE KM routes through.
+        sessions = [
+            s for s in context.sessions if timezone.localtime(s.started_at).date() == target_date
+        ]
+        # Whether they were on duty at a moment is asked of every session that
+        # overlaps the day, so a duty that ran past midnight still covers the
+        # small hours it ran into. A day with no Login of its own is left
+        # alone, as it always was (see _on_duty_at): a duty from the night
+        # before ending in the small hours must not hide the rest of a day the
+        # phone went on recording.
+        on_duty = (
+            [
+                s
+                for s in context.sessions
+                if s.started_at < day_end and (s.ended_at is None or s.ended_at >= day_start)
+            ]
+            if sessions
+            else []
         )
         # STANDING STILL OFF DUTY IS THEIR OWN TIME.
         #
@@ -2002,7 +2684,7 @@ class TrackingViewSet(viewsets.ViewSet):
         stops = [
             stop
             for stop in _detect_stops(pings)
-            if _on_duty_at(sessions, stop["arrived_at"])
+            if _on_duty_at(on_duty, stop["arrived_at"])
         ]
         punches = _punches_for_day(engineer, target_date)
 
@@ -2042,18 +2724,50 @@ class TrackingViewSet(viewsets.ViewSet):
                     "case_ref": stop.get("case_ref"),
                 }
             )
+        # WHAT THE PHONE SAID ABOUT ITSELF: Location off and on, the network
+        # gone and back, the phone stopping the app and the app tracking again.
+        # Each one is a fact the phone reported, so it goes on the rail in its
+        # own words -- and the guesses below give way to it.
+        phone_entries = _phone_event_entries(context.events, on_duty, pings, day_start, day_end)
+        events.extend(phone_entries)
+
+        # What the rail itself says, and nothing else: an event left off it --
+        # a Net blip, something off duty -- cannot be what explains a gap.
+        def said(*kinds):
+            return sorted(entry["at"] for entry in phone_entries if entry["type"] in kinds)
+
+        gps_said = said("gps_off", "gps_on")
+        phone_said = said(*EXPLAINING_KINDS)
+        net_down = _net_outages(phone_entries)
+        opened_at = sorted(event.at for event in context.events if event.kind == "app_opened")
+
+        # Whether the kilometres take the straight line across a stretch, for
+        # the entries that would otherwise leave the board to guess.
+        moving = _moving_trail(pings)
+        steady = _usable_pings(pings)
+
+        def counted_across(start, end):
+            return _counted_across(rule, moving, steady, start, end)
+
+        for entry in phone_entries:
+            if entry["type"] == "gps_off":
+                entry["counted"] = counted_across(entry["at"], entry["at"])
+
         # WHERE THE DAY WENT DARK, and which kind of dark it was.
         #
-        # Two facts already in the database and shown nowhere, which is why the
-        # office could see short kilometres and not why:
+        # Two facts already in the database, which is why the office could see
+        # short kilometres and not why:
         #
-        #   Location off -- the phone flags the first fix after tracking stopped
-        #     and started again. Whatever happened in between was never measured
-        #     and _trail_km counts it as zero, deliberately. This is the entry
-        #     that explains a missing stretch.
-        #   No network -- a fix taken at two and delivered at four sat on the
-        #     phone. The kilometres are honest; only the board was empty at the
-        #     time. Nothing is missing and nobody needs chasing.
+        #   Tracking stopped -- the phone flagged the first fix after tracking
+        #     stopped and started again. Older apps flagged every reload and
+        #     every restart, so this no longer means Location was off: a Login
+        #     is said by the Login entry, Location by the phone's own GPS
+        #     entries, and what is left is the app having stopped. `counted`
+        #     says whether the kilometres took the straight line across it
+        #     (km_rule) -- they do since the new rule, and did not before it.
+        #   Kept on the phone -- a fix taken at two and delivered at four sat
+        #     on the phone. The kilometres are honest; only the board was empty
+        #     at the time. Nothing is missing and nobody needs chasing.
         #
         # Five minutes is the floor. Below it these are the ordinary jitter of a
         # phone handing the GPS back and forth, and forty entries nobody reads
@@ -2067,8 +2781,15 @@ class TrackingViewSet(viewsets.ViewSet):
             # Off duty, nobody was asking the phone for anything. Judged on
             # where the stretch STARTS, so both ends of it are kept or dropped
             # together.
-            if not _on_duty_at(sessions, previous.timestamp):
+            if not _on_duty_at(on_duty, previous.timestamp):
                 continue
+            if rule.crosses_login(previous, current):
+                continue  # the trip to work; the Login entry says it
+            if _any_between(
+                gps_said, previous.timestamp - EVENT_SLACK, current.timestamp + EVENT_SLACK
+            ):
+                continue  # the phone's GPS entries say it, in better words
+            counted = not rule.skips(previous, current)
             events.append(
                 {
                     # Stamped where the trail STOPS, not where it resumes: that
@@ -2076,10 +2797,11 @@ class TrackingViewSet(viewsets.ViewSet):
                     # happened after four o'clock.
                     "at": previous.timestamp,
                     "type": "location_off",
-                    "label": f"Location off \u00b7 {duration_words(dark)}",
+                    "label": f"Tracking stopped \u00b7 {duration_words(dark)}",
                     "minutes": dark,
                     "latitude": previous.latitude,
                     "longitude": previous.longitude,
+                    "counted": counted,
                 }
             )
             # And the moment it came back. Without this the rail says a hole
@@ -2088,23 +2810,21 @@ class TrackingViewSet(viewsets.ViewSet):
             # difference is whether anybody needs chasing.
             #
             # Honest about what it knows: the phone started reporting again at
-            # this moment. Whether the engineer switched location back on or
-            # simply walked back into a signal, only they can say, so the label
-            # says what happened and not why.
+            # this moment, and the label says that and not why.
             events.append(
                 {
                     "at": current.timestamp,
                     "type": "location_back",
-                    "label": "Location back on",
+                    "label": "Tracking back",
                     "minutes": dark,
                     "latitude": current.latitude,
                     "longitude": current.longitude,
+                    "counted": counted,
                 }
             )
 
-        # AND THE SILENCES THE APP NEVER ADMITTED TO.
+        # AND THE SILENCES NOTHING FLAGGED.
         #
-        # The entry above needs the phone to have FLAGGED that tracking stopped.
         # An app that is killed -- swiped off the recents list, or stopped by
         # the phone to save battery -- flags nothing: there is no error to
         # catch, the fixes simply stop. Hours could pass with nothing on this
@@ -2115,11 +2835,17 @@ class TrackingViewSet(viewsets.ViewSet):
         # that as "Waiting"; this is for a stretch they travelled with nothing
         # watching. Read off the fixes that survive the accuracy filter, so one
         # wild reading from a cold GPS cannot invent a journey.
+        #
+        # Never "Not tracked": the kilometres count this straight line, so it
+        # is not missing, and the office read the words as a fault in the app.
+        # `counted` says whether they did -- before the cutover a flag the
+        # accuracy filter dropped still took the line, and the board must not
+        # claim it. When the app was opened just as the fixes resumed, the app
+        # had been closed and says so; otherwise only the silence is known.
         flagged = {id(ping) for ping in pings if getattr(ping, "after_gap", False)}
-        steady = _usable_pings(pings)
         for previous, current in zip(steady, steady[1:]):
             if id(current) in flagged:
-                continue  # already said, and better said, as Location off
+                continue  # already said, and better said, as Tracking stopped
             dark = int((current.timestamp - previous.timestamp).total_seconds() // 60)
             if dark < MIN_DARK_MINUTES:
                 continue
@@ -2133,16 +2859,27 @@ class TrackingViewSet(viewsets.ViewSet):
             # An engineer who logs out at half past eleven and comes back at
             # seven is not being tracked in between, and should not be told off
             # for it. Without this the board read "Not tracked - 7h 40m" across
-            # somebody's own afternoon.
-            if not _on_duty_at(sessions, previous.timestamp):
+            # somebody's own afternoon. A stretch with a Login in it is the same
+            # afternoon, ended: not counted, and said by the Login entry.
+            if not _on_duty_at(on_duty, previous.timestamp):
                 continue
+            if rule.crosses_login(previous, current):
+                continue
+            if _any_between(
+                phone_said, previous.timestamp - EVENT_SLACK, current.timestamp + EVENT_SLACK
+            ):
+                continue  # the phone said what happened, on its own entries
+            closed = _any_between(
+                opened_at, current.timestamp - APP_OPENED_SLACK, current.timestamp + APP_OPENED_SLACK
+            )
+            what = "App was closed" if closed else "No positions"
             events.append(
                 {
-                    # Where the trail stops, like Location off: that is the
+                    # Where the trail stops, like Tracking stopped: that is the
                     # moment somebody is looking for.
                     "at": previous.timestamp,
                     "type": "untracked",
-                    "label": f"Not tracked \u00b7 {duration_words(dark)}",
+                    "label": f"{what} \u00b7 {duration_words(dark)}",
                     "minutes": dark,
                     # How far they had moved by the time it came back. The
                     # kilometres count this straight line -- the least they can
@@ -2150,11 +2887,24 @@ class TrackingViewSet(viewsets.ViewSet):
                     "moved_km": round(metres / 1000, 1),
                     "latitude": previous.latitude,
                     "longitude": previous.longitude,
+                    "counted": counted_across(previous.timestamp, current.timestamp),
                 }
             )
 
         # One entry per OUTAGE, not per delayed fix: a phone offline for an hour
         # delivers a hundred of them at once and each one is the same fact.
+        # Left to the phone's own Net entries when they cover it -- the network
+        # off by the time the first held fix was taken and back by when the
+        # last was delivered: one outage, said once. Net entries inside it only
+        # say part of it, and the rest is still worth saying.
+        def outage(first, last):
+            for off, on in net_down:
+                if off <= first.timestamp + EVENT_SLACK and (
+                    on is None or on >= last.received_at - EVENT_SLACK
+                ):
+                    return []
+            return _offline_event(first, last)
+
         outage_start = None
         outage_end = None
         for ping in pings:
@@ -2167,17 +2917,17 @@ class TrackingViewSet(viewsets.ViewSet):
                 # Only what happened on duty. A phone catching up hours after
                 # the engineer logged out is not an outage anybody worked
                 # through.
-                if outage_start is None and not _on_duty_at(sessions, ping.timestamp):
+                if outage_start is None and not _on_duty_at(on_duty, ping.timestamp):
                     continue
                 if outage_start is None:
                     outage_start = ping
                 outage_end = ping
                 continue
             if outage_start is not None:
-                events.extend(_offline_event(outage_start, outage_end))
+                events.extend(outage(outage_start, outage_end))
                 outage_start = outage_end = None
         if outage_start is not None:
-            events.extend(_offline_event(outage_start, outage_end))
+            events.extend(outage(outage_start, outage_end))
 
         # What the engineer did to their cases that day, so a stop can be read
         # against the job it belongs to. The four moments and their labels live
@@ -2406,7 +3156,7 @@ class TrackingViewSet(viewsets.ViewSet):
                 "engineer_name": engineer.employee_name,
                 "branch": engineer.branch,
                 "date": target_date,
-                "total_km": _trail_km(pings),
+                "total_km": _trail_km(pings, context),
                 "duty_minutes": sum(s.duration_minutes() for s in sessions),
                 "first_seen": clean[0].timestamp if clean else None,
                 "last_seen": clean[-1].timestamp if clean else None,

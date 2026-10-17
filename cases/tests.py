@@ -723,9 +723,16 @@ class DutyAndLiveTrackingTests(TestCase):
         )
         self.assertEqual(res.status_code, 201, res.data)
         if minutes_ago:
+            # Sent that long ago: taken, received and heard from then, the way
+            # a phone that has gone quiet since leaves it.
+            then = timezone.now() - timedelta(minutes=minutes_ago)
             ping = LocationPing.objects.latest("id")
-            ping.timestamp = timezone.now() - timedelta(minutes=minutes_ago)
-            ping.save(update_fields=["timestamp"])
+            ping.timestamp = then
+            ping.received_at = then
+            ping.save(update_fields=["timestamp", "received_at"])
+            DutySession.objects.filter(engineer=self.engineer, ended_at__isnull=True).update(
+                last_contact_at=then
+            )
         return res.data
 
     # -- the core promise -----------------------------------------------------

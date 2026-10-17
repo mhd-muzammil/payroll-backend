@@ -4,8 +4,12 @@ Snapping is a metered call, and the tracking board asks for a trail every 30
 seconds. So the promise these tests protect is that a fix is sent to Ola exactly
 once in its life, however many times anybody looks at it — and that when Ola
 cannot be reached, the trail still draws.
+
+And the route is drawn in the order it was travelled, however late a fix
+arrives: a fix the phone held is put where it was taken, not at the end.
 """
 import datetime
+import urllib.parse
 from decimal import Decimal
 from unittest import mock
 
@@ -52,10 +56,45 @@ def make_pings(engineer, day, count, start_hour=9):
     return pings
 
 
+def travel_order(pings):
+    """The order the views hand a trail over in: when taken, then id."""
+    return sorted(pings, key=lambda p: (p.timestamp, p.id))
+
+
+def late_fix(engineer, before, after, dlat=0.0, dlon=0.0):
+    """A fix taken between `before` and `after` but stored after every other
+    fix, so its id is the highest -- what a phone's held queue delivers.
+
+    Halfway between them, moved by (dlat, dlon) degrees when a test needs it
+    clear of the wander filter."""
+    return LocationPing.objects.create(
+        engineer=engineer,
+        latitude=(before.latitude + after.latitude) / 2 + dlat,
+        longitude=(before.longitude + after.longitude) / 2 + dlon,
+        accuracy=10,
+        timestamp=before.timestamp + (after.timestamp - before.timestamp) / 2,
+    )
+
+
 # ~11 m north: enough to tell a snapped point from a raw one in an assertion,
 # small enough to be the kind of correction a real snap makes. A bigger offset
 # would (rightly) be refused by the implausible-snap guard.
 SNAP_NUDGE = 0.0001
+
+
+def snapped(pings):
+    """The route points FakeSnapper makes of these fixes."""
+    return [[p.latitude + SNAP_NUDGE, p.longitude] for p in pings]
+
+
+def raw(pings):
+    """The route points of these fixes left where the phone put them."""
+    return [[p.latitude, p.longitude] for p in pings]
+
+
+def sent(pings):
+    """The batch FakeSnapper records when it is asked to snap these fixes."""
+    return [(p.latitude, p.longitude) for p in pings]
 
 
 class FakeSnapper:
@@ -103,10 +142,11 @@ class SnappedTrailTests(TestCase):
     def test_a_fix_is_sent_to_ola_once_however_often_the_board_asks(self):
         """The board polls every 30 seconds. Ten reads of the same closed day
         must cost exactly one day's snapping, not ten."""
-        pings = make_pings(self.engineer, self.yesterday, 120)
+        # As much as one read sends (RequestCapTests has longer days).
+        pings = make_pings(self.engineer, self.yesterday, 2 * BATCH)
 
         _, first = self._run(self.yesterday, pings)
-        self.assertEqual(first.points_sent, 120)
+        self.assertEqual(first.points_sent, 2 * BATCH)
 
         for _ in range(9):
             _, again = self._run(self.yesterday, pings)
@@ -123,11 +163,12 @@ class SnappedTrailTests(TestCase):
 
     def test_every_pending_fix_goes_in_one_handoff(self):
         """tracks decides WHICH fixes to send; olamaps decides how many requests
-        that takes. See BatchingTests below for the split into requests."""
-        pings = make_pings(self.engineer, self.yesterday, 120)
+        that takes. See BatchingTests below for the split into requests, and
+        RequestCapTests for the most one read sends."""
+        pings = make_pings(self.engineer, self.yesterday, 2 * BATCH)
         _, snapper = self._run(self.yesterday, pings)
         self.assertEqual(snapper.calls, 1)
-        self.assertEqual(snapper.points_sent, 120)
+        self.assertEqual(snapper.points_sent, 2 * BATCH)
 
     # -- today's tail ---------------------------------------------------------
 
@@ -384,6 +425,21 @@ class DayEndpointTests(APITestCase):
         self.assertEqual(snapper.points_sent, 60, "a noise fix was sent to Ola")
         self.assertEqual(len(response.data["road_path"]["points"]), 60)
 
+    def test_a_late_fix_is_drawn_where_it_was_taken(self):
+        """A held fix reaches the server after the day's route was snapped. The
+        road route puts it between the two fixes it was taken between, not at
+        the end of the day."""
+        self._get()
+        # Off the straight line, so the wander filter keeps it.
+        late = late_fix(self.engineer, self.pings[20], self.pings[21], dlat=0.0002, dlon=-0.0001)
+
+        response, snapper = self._get()
+
+        trail = travel_order(self.pings + [late])
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(snapper.batches, [sent(trail[21:])])
+        self.assertEqual(response.data["road_path"]["points"], snapped(trail))
+
 
 class SharedCacheTests(APITestCase):
     """/path and /day both cache under one track per engineer-day, so they must
@@ -472,3 +528,271 @@ class ImplausibleSnapTests(TestCase):
         from .tracks import MAX_MEAN_SHIFT_METERS
 
         self.assertEqual(MAX_MEAN_SHIFT_METERS, 200.0)
+
+
+class TravelOrderTests(TestCase):
+    """A phone that held its fixes -- offline, or with the app closed --
+    delivers them late: higher ids, earlier times. Appending them by id drew
+    them at the END of the route, and the line jumped back across the map to
+    reach them. The road route follows the trail it is handed, in its order."""
+
+    def setUp(self):
+        self.engineer = make_engineer("Order Tester")
+        self.today = timezone.localdate()
+        self.yesterday = self.today - datetime.timedelta(days=1)
+
+    def _run(self, day, pings, snapper=None):
+        snapper = snapper or FakeSnapper()
+        with mock.patch.object(olamaps, "is_configured", return_value=True), mock.patch.object(
+            olamaps, "snap_to_road", snapper
+        ):
+            result = snapped_trail(self.engineer.id, day, pings)
+        return result, snapper
+
+    def _track(self, day):
+        return SnappedTrack.objects.get(engineer=self.engineer, day=day)
+
+    def test_a_late_fix_is_snapped_again_from_where_it_was_taken(self):
+        pings = make_pings(self.engineer, self.yesterday, 60)
+        self._run(self.yesterday, pings)
+
+        late = late_fix(self.engineer, pings[20], pings[21])
+        trail = travel_order(pings + [late])
+        self.assertIs(trail[21], late)
+
+        result, snapper = self._run(self.yesterday, trail)
+
+        # From the late fix on is sent again; nothing before it is.
+        self.assertEqual(snapper.batches, [sent(trail[21:])])
+        self.assertEqual(result["points"], snapped(trail))
+        self.assertEqual(result["source"], "ola")
+        self.assertEqual(result["points"][-1], snapped(pings[-1:])[0], "the route ends at the late fix")
+
+        track = self._track(self.yesterday)
+        self.assertEqual(track.ping_ids, [p.id for p in trail])
+        self.assertEqual(track.points, snapped(trail))
+        self.assertEqual(track.last_ping_id, late.id)
+
+    def test_today_the_stretch_after_a_late_fix_waits_for_whole_batches(self):
+        pings = make_pings(self.engineer, self.today, 2 * BATCH + 10)
+        self._run(self.today, pings)
+
+        late = late_fix(self.engineer, pings[30], pings[31])
+        trail = travel_order(pings + [late])
+        result, snapper = self._run(self.today, trail)
+
+        # 81 fixes from the late one on: one whole batch goes, the rest wait raw.
+        cut = 31 + BATCH
+        self.assertEqual(snapper.batches, [sent(trail[31:cut])])
+        self.assertEqual(result["points"], snapped(trail[:cut]) + raw(trail[cut:]))
+        self.assertEqual(result["snapped"], cut)
+        self.assertEqual(result["raw"], len(trail) - cut)
+        self.assertEqual(result["source"], "partial")
+        self.assertEqual(self._track(self.today).ping_ids, [p.id for p in trail[:cut]])
+
+    def test_an_outage_draws_the_raw_trail_in_travel_order(self):
+        pings = make_pings(self.engineer, self.yesterday, 60)
+        self._run(self.yesterday, pings)
+        late = late_fix(self.engineer, pings[20], pings[21])
+        trail = travel_order(pings + [late])
+
+        result, _ = self._run(self.yesterday, trail, snapper=FakeSnapper(fail=True))
+
+        self.assertEqual(result["source"], "raw")
+        self.assertEqual(result["points"], raw(trail))
+        self.assertEqual(result["raw"], len(trail))
+
+        # The stored route is as it was, so the next read redoes the late
+        # stretch and no more.
+        track = self._track(self.yesterday)
+        self.assertEqual(track.ping_ids, [p.id for p in pings])
+        self.assertEqual(track.points, snapped(pings))
+        _, snapper = self._run(self.yesterday, trail)
+        self.assertEqual(snapper.batches, [sent(trail[21:])])
+
+    def test_a_reply_that_does_not_line_up_with_the_fixes_is_not_stored(self):
+        """Each stored point names its fix, so a reply with a different number
+        of points cannot be stored. The trail draws raw instead."""
+        pings = make_pings(self.engineer, self.yesterday, 10)
+
+        def one_short(points, enhance_path=False):
+            return [(lat + SNAP_NUDGE, lon) for lat, lon in points][:-1]
+
+        result, _ = self._run(self.yesterday, pings, snapper=one_short)
+
+        self.assertEqual(result["source"], "raw")
+        self.assertEqual(result["points"], raw(pings))
+        self.assertFalse(
+            SnappedTrack.objects.filter(engineer=self.engineer).exclude(points=[]).exists(),
+            "a reply that could not be lined up was cached",
+        )
+
+
+class LegacyTrackTests(TestCase):
+    """Tracks stored before ping_ids: points appended by id, with no record of
+    which fix each one is. Every track in production is one of these."""
+
+    def setUp(self):
+        self.engineer = make_engineer("Legacy Tester")
+        self.today = timezone.localdate()
+        self.yesterday = self.today - datetime.timedelta(days=1)
+
+    def _run(self, day, pings, snapper=None):
+        snapper = snapper or FakeSnapper()
+        with mock.patch.object(olamaps, "is_configured", return_value=True), mock.patch.object(
+            olamaps, "snap_to_road", snapper
+        ):
+            result = snapped_trail(self.engineer.id, day, pings)
+        return result, snapper
+
+    def _legacy(self, day, points, last_ping_id):
+        """A row as the old code left it: points and last_ping_id, no ping_ids."""
+        return SnappedTrack.objects.create(
+            engineer=self.engineer, day=day, points=points, last_ping_id=last_ping_id
+        )
+
+    def _track(self, day):
+        return SnappedTrack.objects.get(engineer=self.engineer, day=day)
+
+    def test_a_track_that_still_fits_is_kept_without_asking_ola(self):
+        pings = make_pings(self.engineer, self.yesterday, 60)
+        self._legacy(self.yesterday, snapped(pings), pings[-1].id)
+
+        result, snapper = self._run(self.yesterday, pings)
+
+        self.assertEqual(snapper.calls, 0)
+        self.assertEqual(result["points"], snapped(pings))
+        self.assertEqual(result["source"], "ola")
+        track = self._track(self.yesterday)
+        self.assertEqual(track.ping_ids, [p.id for p in pings])
+        self.assertEqual(track.points, snapped(pings))
+        self.assertEqual(track.last_ping_id, pings[-1].id)
+
+        # Adopted once; later reads are ordinary ones and cost nothing either.
+        _, again = self._run(self.yesterday, pings)
+        self.assertEqual(again.calls, 0)
+
+    def test_todays_track_is_kept_and_its_short_tail_still_waits(self):
+        pings = make_pings(self.engineer, self.today, BATCH + 7)
+        self._legacy(self.today, snapped(pings[:BATCH]), pings[BATCH - 1].id)
+
+        result, snapper = self._run(self.today, pings)
+
+        self.assertEqual(snapper.calls, 0)
+        self.assertEqual(result["points"], snapped(pings[:BATCH]) + raw(pings[BATCH:]))
+        self.assertEqual(result["source"], "partial")
+        self.assertEqual(self._track(self.today).ping_ids, [p.id for p in pings[:BATCH]])
+
+    def test_a_late_fix_since_the_last_snap_is_snapped_in_its_place(self):
+        pings = make_pings(self.engineer, self.yesterday, 60)
+        self._legacy(self.yesterday, snapped(pings), pings[-1].id)
+        late = late_fix(self.engineer, pings[20], pings[21])
+        trail = travel_order(pings + [late])
+
+        result, snapper = self._run(self.yesterday, trail)
+
+        # Kept up to the late fix; only the stretch from it on is sent.
+        self.assertEqual(snapper.batches, [sent(trail[21:])])
+        self.assertEqual(result["points"], snapped(trail))
+        self.assertEqual(self._track(self.yesterday).ping_ids, [p.id for p in trail])
+
+    def test_a_late_fix_the_old_code_appended_is_put_back_in_its_place(self):
+        """What production holds today: the late fix was appended after the
+        day's last fix, so the stored route ends with a jump back. Its id is
+        within last_ping_id, so the fixes up to last_ping_id are the right ones
+        and the right number -- in the wrong order. Kept only up to where the
+        late fix belongs."""
+        pings = make_pings(self.engineer, self.yesterday, 60)
+        late = late_fix(self.engineer, pings[20], pings[21])
+        self._legacy(self.yesterday, snapped(pings + [late]), late.id)
+        trail = travel_order(pings + [late])
+
+        result, snapper = self._run(self.yesterday, trail)
+
+        self.assertEqual(snapper.batches, [sent(trail[21:])])
+        self.assertEqual(result["points"], snapped(trail))
+        self.assertEqual(result["points"][-1], snapped(pings[-1:])[0], "the jump back is still there")
+
+    def test_fixes_stamped_in_one_second_are_not_trusted_to_their_stored_order(self):
+        """The old reads ordered by time alone, so fixes sharing a second came
+        back in no fixed order and were stored in whatever order that was."""
+        pings = make_pings(self.engineer, self.yesterday, 60)
+        pings[31].timestamp = pings[30].timestamp
+        pings[31].save(update_fields=["timestamp"])
+        stored_order = pings[:30] + [pings[31], pings[30]] + pings[32:]
+        self._legacy(self.yesterday, snapped(stored_order), pings[-1].id)
+        trail = travel_order(pings)
+
+        result, snapper = self._run(self.yesterday, trail)
+
+        self.assertEqual(snapper.batches, [sent(trail[30:])])
+        self.assertEqual(result["points"], snapped(trail))
+
+
+class RequestCapTests(TestCase):
+    """Ola limits requests per minute and the board reads every 30 seconds, so
+    one read sends at most two requests; a longer backlog is worked through
+    over the reads that follow. Counted at the HTTP boundary, where a request
+    is a request."""
+
+    def setUp(self):
+        self.engineer = make_engineer("Cap Tester")
+        self.today = timezone.localdate()
+        self.yesterday = self.today - datetime.timedelta(days=1)
+
+    def _reads(self, day, pings, count):
+        """`count` reads of the trail; the request sizes each one sent, and
+        what each one returned."""
+        requests = []
+
+        def fetch(url):
+            # The key is in that URL, so only the points are read from it.
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            pairs = [
+                tuple(float(v) for v in pair.split(","))
+                for pair in query["points"][0].split("|")
+            ]
+            requests.append(len(pairs))
+            return {
+                "status": "SUCCESS",
+                "snapped_points": [
+                    {"location": {"lat": lat + SNAP_NUDGE, "lng": lon},
+                     "snapped_type": "Nearest", "original_index": i}
+                    for i, (lat, lon) in enumerate(pairs)
+                ],
+            }
+
+        per_read, results = [], []
+        with mock.patch.object(olamaps, "_fetch", fetch), mock.patch.object(
+            olamaps, "api_key", return_value="test-key"
+        ), mock.patch.object(olamaps, "BATCH_PAUSE_SECONDS", 0):
+            for _ in range(count):
+                before = len(requests)
+                results.append(snapped_trail(self.engineer.id, day, pings))
+                per_read.append(requests[before:])
+        return per_read, results
+
+    def test_a_long_closed_day_takes_two_requests_a_read_final_part_batch_and_all(self):
+        pings = make_pings(self.engineer, self.yesterday, 5 * BATCH + 10)
+
+        per_read, results = self._reads(self.yesterday, pings, 4)
+
+        self.assertEqual(per_read, [[BATCH, BATCH], [BATCH, BATCH], [BATCH, 10], []])
+        self.assertEqual(
+            [r["snapped"] for r in results], [2 * BATCH, 4 * BATCH, len(pings), len(pings)]
+        )
+        self.assertEqual([r["source"] for r in results], ["partial", "partial", "ola", "ola"])
+        # Every read: the snapped part, then the rest raw, in travel order.
+        self.assertEqual(
+            results[0]["points"], snapped(pings[: 2 * BATCH]) + raw(pings[2 * BATCH :])
+        )
+        self.assertEqual(results[-1]["points"], snapped(pings))
+
+    def test_today_a_read_sends_at_most_two_whole_batches(self):
+        pings = make_pings(self.engineer, self.today, 3 * BATCH + 7)
+
+        per_read, results = self._reads(self.today, pings, 3)
+
+        self.assertEqual(per_read, [[BATCH, BATCH], [BATCH], []])
+        self.assertEqual([r["raw"] for r in results], [BATCH + 7, 7, 7])
+        self.assertEqual(results[-1]["points"], snapped(pings[: 3 * BATCH]) + raw(pings[3 * BATCH :]))

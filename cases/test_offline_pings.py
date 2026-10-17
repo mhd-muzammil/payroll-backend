@@ -93,6 +93,13 @@ class TimestampTrustTests(TestCase):
         with self.assertRaises(PingRejected):
             resolve_timestamp("yesterday", self.now)
 
+    def test_a_time_that_cannot_exist_is_refused_like_gibberish(self):
+        """25:61 is shaped like a time, so the parser gets as far as building
+        it and then raises; that has to be a refusal, not a crash."""
+        for impossible in ("2026-10-17T25:61:00Z", "2026-02-31T10:00:00+05:30"):
+            with self.subTest(impossible=impossible), self.assertRaises(PingRejected):
+                resolve_timestamp(impossible, self.now)
+
 
 class PingEndpointTests(APITestCase):
     def setUp(self):
@@ -140,6 +147,11 @@ class PingEndpointTests(APITestCase):
         ahead = (timezone.now() + datetime.timedelta(hours=2)).isoformat()
         response = self._post(timestamp=ahead)
         self.assertEqual(response.status_code, 400)
+        self.assertFalse(LocationPing.objects.exists())
+
+    def test_a_time_that_cannot_exist_is_refused_not_a_crash(self):
+        response = self._post(timestamp="2026-10-17T25:61:00Z")
+        self.assertEqual(response.status_code, 400, response.content[:300])
         self.assertFalse(LocationPing.objects.exists())
 
     def test_coordinates_are_still_required(self):
@@ -234,6 +246,15 @@ class BatchEndpointTests(APITestCase):
         response = self._post(fixes + fixes)
         self.assertEqual(response.data["stored"], 5)
         self.assertEqual(response.data["duplicates"], 5)
+
+    def test_a_fix_whose_time_cannot_exist_does_not_lose_the_rest(self):
+        fixes = self._fixes(5)
+        fixes[2]["timestamp"] = "2026-10-17T25:61:00Z"
+        response = self._post(fixes)
+
+        self.assertEqual(response.status_code, 201, response.content[:300])
+        self.assertEqual(response.data["stored"], 4)
+        self.assertEqual([item["index"] for item in response.data["rejected"]], [2])
 
     def test_one_bad_fix_does_not_lose_the_rest(self):
         fixes = self._fixes(5)

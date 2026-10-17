@@ -103,7 +103,14 @@ class LiveEngineerSerializer(serializers.Serializer):
     duty_started_at = serializers.DateTimeField()
     duty_minutes = serializers.IntegerField()
     stale = serializers.BooleanField()
+    # Minutes since the phone was last heard from (a new fix or its
+    # heartbeat), and since the fix on the map was taken. They differ for an
+    # engineer standing still: heard from a minute ago, last moved an hour ago.
     last_seen_minutes = serializers.IntegerField(allow_null=True)
+    last_fix_minutes = serializers.IntegerField(allow_null=True)
+    # When Location went off on this duty, while it still is; null otherwise.
+    gps_off_since = serializers.DateTimeField(allow_null=True)
+    last_contact_at = serializers.DateTimeField(allow_null=True)
     distance_km = serializers.FloatField()
 
     latitude = serializers.FloatField(allow_null=True)

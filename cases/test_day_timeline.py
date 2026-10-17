@@ -274,9 +274,12 @@ class DarkStretchTests(TestCase):
     """Where the day went dark, and which kind of dark it was.
 
     The office could see short kilometres and not why. Two different facts:
-    location switched off (the stretch is genuinely unmeasured, and counts as
-    zero km) versus no network (the kilometres are honest, only the live board
-    was empty). Both were in the database and shown nowhere.
+    tracking stopped (the phone flagged the first fix after it) versus fixes
+    kept on the phone and sent later (the kilometres are honest, only the live
+    board was empty). Both were in the database and shown nowhere.
+
+    Named for what is known since the phone reports its own events: "Not
+    tracked" and "No network" said more than the fixes alone can.
     """
 
     def setUp(self):
@@ -335,16 +338,16 @@ class DarkStretchTests(TestCase):
 
         dark = self._events("location_off")
         self.assertEqual(len(dark), 1, dark)
-        self.assertEqual(dark[0]["label"], "Location off · 4h 30m")
+        self.assertEqual(dark[0]["label"], "Tracking stopped · 4h 30m")
         self.assertEqual(dark[0]["minutes"], 270)
 
     def test_the_moment_location_came_back_is_on_the_rail_too(self):
         """A hole that opens has to be shown closing.
 
-        Without this the rail says "Location off 4h 30m" at 09:30 and nothing
-        else, so whether the phone returned at two o'clock or stayed dark until
-        the logout has to be worked out by eye -- and that difference is
-        whether anybody needs chasing.
+        Without this the rail says "Tracking stopped 4h 30m" at 09:30 and
+        nothing else, so whether the phone returned at two o'clock or stayed
+        dark until the logout has to be worked out by eye -- and that
+        difference is whether anybody needs chasing.
         """
         self._ping(9, 0, lat=11.00)
         self._ping(9, 30, lat=11.05)
@@ -352,7 +355,7 @@ class DarkStretchTests(TestCase):
 
         back = self._events("location_back")
         self.assertEqual(len(back), 1, back)
-        self.assertEqual(back[0]["label"], "Location back on")
+        self.assertEqual(back[0]["label"], "Tracking back")
         # At the moment it started reporting again, not where it stopped.
         came_back = self._local(back[0]["at"])
         self.assertEqual((came_back.hour, came_back.minute), (14, 0), back[0]["at"])
@@ -385,7 +388,7 @@ class DarkStretchTests(TestCase):
 
         back = self._events("network_back")
         self.assertEqual(len(back), 1, back)
-        self.assertEqual(back[0]["label"], "Network back")
+        self.assertEqual(back[0]["label"], "Sent from the phone")
         # Stamped when the held fixes actually arrived.
         arrived = self._local(back[0]["at"])
         self.assertEqual((arrived.hour, arrived.minute), (11, 30), back[0]["at"])
@@ -409,8 +412,8 @@ class DarkStretchTests(TestCase):
     def test_a_silence_the_app_never_admitted_to_is_still_shown(self):
         """An app that is killed flags nothing.
 
-        "Location off" needs the phone to say tracking stopped. Swipe the app
-        away and there is no error to catch -- the fixes simply stop -- so one
+        "Tracking stopped" needs the phone to flag it. Swipe the app away and
+        there is no error to catch -- the fixes simply stop -- so one
         engineer's day carried a hundred and thirteen minutes of nothing and
         the board said not a word about it.
         """
@@ -420,7 +423,7 @@ class DarkStretchTests(TestCase):
 
         dark = self._events("untracked")
         self.assertEqual(len(dark), 1, dark)
-        self.assertEqual(dark[0]["label"], "Not tracked · 2h")
+        self.assertEqual(dark[0]["label"], "No positions · 2h")
         self.assertEqual(dark[0]["minutes"], 120)
         # How far they had got by the time it came back: the size of what
         # nothing was watching.
@@ -544,7 +547,7 @@ class DarkStretchTests(TestCase):
 
         offline = self._events("no_network")
         self.assertEqual(len(offline), 1, offline)
-        self.assertEqual(offline[0]["label"], "No network · 45 min")
+        self.assertEqual(offline[0]["label"], "Kept on the phone · 45 min")
 
     def test_a_late_fix_and_a_lost_stretch_are_different_entries(self):
         self._ping(9, 0)

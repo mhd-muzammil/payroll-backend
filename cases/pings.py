@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -40,6 +42,10 @@ MAX_BACKLOG_HOURS = 48
 # roughly half a day — enough for a real outage, small enough that one request
 # cannot tie up the database.
 MAX_BATCH = 500
+
+# Most events one post may carry. A phone notices a handful of things in a day;
+# this is room for a long outage's worth, held and sent at once.
+MAX_EVENTS = 500
 
 
 class PingRejected(ValueError):
@@ -112,7 +118,13 @@ def resolve_timestamp(raw, now=None) -> datetime.datetime:
     if raw in (None, ""):
         return now
 
-    when = parse_datetime(raw) if isinstance(raw, str) else raw
+    try:
+        when = parse_datetime(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        # Shaped like a time but not one, like 25:61: the parser builds it and
+        # raises. Let through, that failed the whole post with a 500, and the
+        # phone sent the same post again on every try.
+        when = None
     if not isinstance(when, datetime.datetime):
         raise PingRejected("timestamp must be an ISO 8601 datetime.")
     if timezone.is_naive(when):
@@ -149,9 +161,9 @@ def build_ping(employee, payload, case_lookup, now=None):
         timestamp=resolve_timestamp(payload.get("timestamp"), now),
         received_at=now,
         client_key=key,
-        # The phone telling us it had stopped tracking before this fix. Trusted
-        # because it is the only thing that can know, and because getting it
-        # wrong costs the engineer distance rather than earning them any.
+        # The phone telling us it had stopped tracking before this fix. It
+        # marks the rail; since km_rule's cutover it no longer takes the
+        # straight line across out of the kilometres -- see km_rule.
         # bool(), not _flag() alone: _flag returns None for anything it does not
         # recognise, and this column is NOT NULL. Every ping from an app that
         # predates the flag omits it entirely, so None is the ORDINARY case and
@@ -210,3 +222,98 @@ def ingest_batch(employee, payloads, case_lookup):
 
     LocationPing.objects.bulk_create(fresh, batch_size=200)
     return {"stored": len(fresh), "duplicates": duplicates, "rejected": rejected}
+
+
+def _place(value):
+    """A coordinate, or None. Never an error: where the phone was is a nicety
+    on an event, not what it is for."""
+    number = coerce_number(value)
+    return number if number is not None and math.isfinite(number) else None
+
+
+def build_event(employee, payload, now):
+    """An unsaved PhoneEvent from one posted event. Raises PingRejected."""
+    from .models import PhoneEvent
+
+    kind = str(payload.get("kind") or "").strip().lower()
+    if kind not in PhoneEvent.KINDS:
+        raise PingRejected("unknown kind.")
+    key = payload.get("client_key")
+    if key in (None, ""):
+        raise PingRejected("client_key is required.")
+
+    return PhoneEvent(
+        engineer=employee,
+        kind=kind,
+        # Held events arrive late like held fixes, and are checked the same
+        # way: the future and the distant past are refused, not stored.
+        at=resolve_timestamp(payload.get("at"), now),
+        received_at=now,
+        client_key=str(key)[:64],
+        latitude=_place(payload.get("latitude")),
+        longitude=_place(payload.get("longitude")),
+        detail=str(payload.get("detail") or "")[:120],
+    )
+
+
+def ingest_events(employee, payloads):
+    """Store what the phone noticed about itself. Returns counts, like a batch.
+
+    Duplicates are filtered first, as for fixes. Two posts of the same event
+    racing each other can still both pass that filter, so the insert falls
+    back to one row at a time and counts the loser as a duplicate rather than
+    failing the phone's whole post.
+    """
+    from .models import PhoneEvent
+
+    if not isinstance(payloads, list):
+        raise PingRejected("events must be a list.")
+    if len(payloads) > MAX_EVENTS:
+        raise PingRejected("a post may carry at most %d events." % MAX_EVENTS)
+    if not payloads:
+        return {"stored": 0, "duplicates": 0, "rejected": []}
+
+    now = timezone.now()
+    candidates = []
+    rejected = []
+    for index, payload in enumerate(payloads):
+        if not isinstance(payload, dict):
+            rejected.append({"index": index, "reason": "each event must be an object."})
+            continue
+        try:
+            candidates.append(build_event(employee, payload, now))
+        except PingRejected as exc:
+            rejected.append({"index": index, "reason": str(exc)})
+
+    already = set(
+        PhoneEvent.objects.filter(
+            engineer=employee, client_key__in=[e.client_key for e in candidates]
+        ).values_list("client_key", flat=True)
+    )
+    fresh = []
+    duplicates = 0
+    seen_here = set()
+    for candidate in candidates:
+        if candidate.client_key in already or candidate.client_key in seen_here:
+            duplicates += 1
+            continue
+        seen_here.add(candidate.client_key)
+        fresh.append(candidate)
+
+    try:
+        with transaction.atomic():
+            PhoneEvent.objects.bulk_create(fresh, batch_size=200)
+        stored = len(fresh)
+    except IntegrityError:
+        stored = 0
+        for candidate in fresh:
+            # A batch of the bulk insert may have handed out ids before the
+            # whole of it was rolled back; each row is inserted afresh.
+            candidate.pk = None
+            try:
+                with transaction.atomic():
+                    candidate.save(force_insert=True)
+                stored += 1
+            except IntegrityError:
+                duplicates += 1
+    return {"stored": stored, "duplicates": duplicates, "rejected": rejected}

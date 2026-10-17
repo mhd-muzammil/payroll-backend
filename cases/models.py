@@ -209,6 +209,14 @@ class DutySession(models.Model):
     ended_at = models.DateTimeField(null=True, blank=True)
     # Set when MAX_DURATION_HOURS closed it instead of the engineer.
     auto_closed = models.BooleanField(default=False)
+    # The last time the phone was heard from on this duty: a fix it had not
+    # sent before, or a post to events/ (an empty one is the heartbeat).
+    #
+    # Not a page load, a Login or a re-sent fix. Those prove a page is open,
+    # not that anything is recording: a phone whose tracker had stopped kept
+    # asking for its duty every minute and would have read as live all day.
+    # Null until the first.
+    last_contact_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-started_at"]
@@ -315,6 +323,11 @@ class LocationPing(models.Model):
     # driving or 40 minutes of work at one customer. Guessing from the gap alone
     # threw away the journey after every long stop. Only the phone knows which
     # it was, so the phone says.
+    #
+    # What it is worth changed with km_rule's cutover. Older apps set it on
+    # every reload and restart as well, and it was often lost on the way, so
+    # since then it only marks the rail; the kilometres read the Login and the
+    # phone's own gps_off events (PhoneEvent) instead.
     after_gap = models.BooleanField(default=False)
 
     class Meta:
@@ -334,6 +347,63 @@ class LocationPing(models.Model):
         return f"{self.engineer.employee_name} @ {self.timestamp:%Y-%m-%d %H:%M}"
 
 
+class PhoneEvent(models.Model):
+    """Something the engineer's phone noticed about itself, and when.
+
+    A hole in the trail used to be read off the fixes alone, and fixes cannot
+    say why they stopped. Location switched off, the network gone, the phone
+    closing the app, or simply an engineer standing still all leave the same
+    silence. The phone knows which it was, so it says: one row per thing it
+    noticed, posted to /api/tracking/events/.
+
+    Two of them change the kilometres (cases/km_rule.py): Location switched
+    off while the duty was running, and the phone stopping the app. The rest
+    only explain the day on the rail.
+    """
+
+    KINDS = (
+        "gps_off",
+        "gps_on",
+        "net_off",
+        "net_on",
+        "tracker_stopped",
+        "tracker_started",
+        "app_opened",
+    )
+
+    engineer = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="phone_events",
+    )
+    kind = models.CharField(max_length=24)
+    # When it happened, as the phone says -- held events arrive late, like
+    # held fixes -- checked the way a fix's timestamp is.
+    at = models.DateTimeField(db_index=True)
+    # When we got it. Ours. Whether the reason for a gap was already here when
+    # the fix after it arrived is what keeps kilometres from going down.
+    received_at = models.DateTimeField()
+    # The phone's own id for it, so an event posted twice is stored once.
+    client_key = models.CharField(max_length=64)
+    # Where the phone last was, when it knew.
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+    # "switched" (seen changing while the duty ran) or "found_off" /
+    # "found_on" (already so when the phone looked) for GPS; free words for
+    # the rest.
+    detail = models.CharField(max_length=120, blank=True, default="")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["engineer", "client_key"], name="one_phone_event_per_client_key"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.engineer.employee_name} {self.kind} @ {self.at:%Y-%m-%d %H:%M}"
+
+
 class SnappedTrack(models.Model):
     """One engineer's day, with every fix already moved onto a road.
 
@@ -342,9 +412,12 @@ class SnappedTrack(models.Model):
     the tracking board polls every 30 seconds: one board left open for an hour
     would spend an hour's quota on one engineer.
 
-    `last_ping_id` is how "once" is enforced. Only fixes newer than it are sent,
-    and their snapped positions are appended, so the cost over a month is
-    (fixes / 50) requests no matter how often anyone looks.
+    `ping_ids` is how "once" is enforced. A read sends only the fixes past the
+    stored points that still match its trail, so the cost over a month is about
+    (fixes / 50) requests no matter how often anyone looks. A late fix -- held
+    on the phone, delivered after fixes taken later than it -- cuts the stored
+    route where it belongs, and the fixes after it are snapped again, so the
+    route stays in the order it was travelled (cases/tracks.py).
     """
 
     engineer = models.ForeignKey(
@@ -362,6 +435,10 @@ class SnappedTrack(models.Model):
     # The highest LocationPing id already represented in `points`. 0 means
     # nothing has been snapped yet.
     last_ping_id = models.BigIntegerField(default=0)
+    # The LocationPing behind each stored point, one for one and in the same
+    # order: points[i] is fix ping_ids[i] put on a road. Empty on a track
+    # stored before this field existed; tracks.py adopts those on first read.
+    ping_ids = models.JSONField(default=list, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -424,6 +501,65 @@ class EngineerScorecard(models.Model):
         return (
             f"{self.engineer.employee_name} {self.as_of}: "
             f"{self.assigned}/{self.attended}/{self.closed}"
+        )
+
+
+class EngineerScorecardDay(models.Model):
+    """One engineer's Assigned / Attended / Closed and targets for one day, kept.
+
+    The live card above stays one row per engineer, overwritten every sync.
+    This is the record of each day beside it, for the engineer's own history:
+    the same OpenCall numbers, filed under the day they belong to.
+
+    Two writers. The live push (POST scorecards/) writes today's row with the
+    card, every two minutes -- source "live". OpenCall's history push (POST
+    scorecard_days/) rewrites the last few days after late Evening edits and a
+    Final EOD, and backfills older ones -- source "history". Today belongs to
+    the live push: a history push never overwrites today's live row.
+
+    One row per (engineer, day), updated in place, and only ever read for one
+    engineer over a range of days, through the index on exactly that. It grows
+    by a row per engineer per day, and no read of it scans the rest.
+    """
+
+    SOURCE_LIVE = "live"
+    SOURCE_HISTORY = "history"
+
+    engineer = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="scorecard_days",
+    )
+    # The IST day the numbers are for, as OpenCall's reports count days.
+    day = models.DateField()
+
+    assigned = models.PositiveIntegerField(default=0)
+    attended = models.PositiveIntegerField(default=0)
+    closed = models.PositiveIntegerField(default=0)
+
+    # Kept on each day, so a later change of target does not rewrite what the
+    # engineer was measured against on the day.
+    daily_target = models.PositiveIntegerField(default=0)
+    monthly_target = models.PositiveIntegerField(default=0)
+
+    # SOURCE_LIVE or SOURCE_HISTORY: which push wrote it last.
+    source = models.CharField(max_length=16)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["engineer", "day"], name="one_scorecard_per_engineer_day"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["engineer", "day"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.engineer.employee_name} {self.day}: "
+            f"{self.assigned}/{self.attended}/{self.closed} ({self.source})"
         )
 
 
