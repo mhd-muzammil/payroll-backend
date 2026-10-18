@@ -1,5 +1,5 @@
 from django.conf import settings
-from django.db.models import Q
+from django.db.models import OuterRef, Q, Subquery
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -11,6 +11,27 @@ from .task_serializer import TaskSerializer
 from .performance_serializer import PerformanceSerializer
 from .asset_serializer import AssetSerializer
 from authentication.models import get_allowed_branches
+from cases.models import PhoneStatus
+
+# The most phone-history entries App Usage shows for one employee, newest first.
+HISTORY_LIMIT = 200
+
+
+def _phone_view(status):
+    """One phone report as App Usage reads it, or None when the phone never said."""
+    if status is None:
+        return None
+    return {
+        "app_version": status.app_version,
+        "android_version": status.android_version,
+        "battery_exempt": status.battery_exempt,
+        "location_permission": status.location_permission,
+        "notification_permission": status.notification_permission,
+        "gps_on": status.gps_on,
+        "first_seen_at": status.first_seen_at,
+        "last_seen_at": status.last_seen_at,
+    }
+
 
 class EmployeeViewSet(viewsets.ModelViewSet):
     queryset = Employee.objects.all()
@@ -57,6 +78,20 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         if "All" not in branches:
             employees = employees.filter(branch__in=branches)
 
+        # Each phone as it is now: the newest of its reports. Looked up once per
+        # employee, not once per report, so a long history costs nothing here.
+        newest = (
+            PhoneStatus.objects.filter(employee_id=OuterRef("pk"))
+            .order_by("-first_seen_at", "-id")
+            .values("id")[:1]
+        )
+        phone_ids = [
+            phone_id
+            for phone_id in employees.annotate(phone_id=Subquery(newest)).values_list("phone_id", flat=True)
+            if phone_id
+        ]
+        phones = {status.employee_id: status for status in PhoneStatus.objects.filter(id__in=phone_ids)}
+
         rows = []
         for employee in employees:
             account = employee.user
@@ -79,10 +114,18 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 # uses the app that reads as "not updated yet".
                 "app_version": (account.app_version or "") if account else "",
                 "app_version_at": account.app_version_at if account else None,
+                # How the phone is set up to record: battery, Location,
+                # notifications, GPS. None until the app has reported.
+                "phone": _phone_view(phones.get(employee.id)),
             })
 
         using = [r for r in rows if r["uses_app"]]
         no_account = [r for r in rows if not r["has_login"]]
+        # Every phone that has reported, whatever the login record says: an
+        # engineer still signed in from before the app logins were recorded
+        # reports like anybody else, and the battery counts must agree with the
+        # rows the page lists under them.
+        reported = [r["phone"] for r in rows if r["phone"]]
         # Signed in from a browser but never from the app -- they have the
         # credentials and have not installed it, which is a nudge, not a setup job.
         browser_only = [
@@ -107,7 +150,45 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             "current_app_version": current,
             "on_current_version": len(on_current),
             "behind_version": len(using) - len(on_current),
+            # Of the phones that have reported, which leave the app alone in the
+            # background, which do not, and which cannot say (an APK before 1.5).
+            "phones_reported": len(reported),
+            "battery_allowed": sum(1 for phone in reported if phone["battery_exempt"] is True),
+            "battery_not_allowed": sum(1 for phone in reported if phone["battery_exempt"] is False),
+            "battery_cannot_tell": sum(1 for phone in reported if phone["battery_exempt"] is None),
             "rows": rows,
+        })
+
+    @action(detail=True, methods=["get"], url_path="app_history")
+    def app_history(self, request, pk=None):
+        """Every change in how this employee's phone was set up, newest first:
+        app version, battery, Location, notifications, GPS, each with when it
+        was first and last reported. Staff-only, for an employee the caller may
+        see, exactly as App Usage."""
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, "role", "employee")
+        if role not in ("superadmin", "admin", "hr"):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        try:
+            employee = Employee.objects.filter(pk=int(pk)).first()
+        except (TypeError, ValueError):
+            employee = None
+        branches = get_allowed_branches(user, "employees")
+        if employee is None or ("All" not in branches and employee.branch not in branches):
+            return Response({"detail": "Not found."}, status=404)
+
+        history = PhoneStatus.objects.filter(employee=employee).order_by("-first_seen_at", "-id")
+        total = history.count()
+        statuses = history[:HISTORY_LIMIT]
+        return Response({
+            "employee_id": employee.id,
+            "employee_name": employee.employee_name,
+            "total": total,
+            # Said, so the page can say the oldest changes are not shown rather
+            # than let the last row read as the first the phone ever reported.
+            "truncated": total > HISTORY_LIMIT,
+            "rows": [_phone_view(status) for status in statuses],
         })
 
     def get_queryset(self):

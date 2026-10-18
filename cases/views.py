@@ -6,7 +6,7 @@ from datetime import datetime, time, timedelta
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.models import OuterRef, Q, Subquery
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -16,6 +16,7 @@ from rest_framework.response import Response
 
 from .models import Case, CaseVisit, DutySession, EngineerAlias, EngineerScorecard, LocationPing
 from .models import EngineerScorecardDay
+from .models import PhoneStatus
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
 from .pings import (
     MAX_BATCH,
@@ -870,6 +871,51 @@ def _from_the_app(request):
     useLiveTracking; this is the half that cannot be bypassed by a page.
     """
     return (request.META.get(APP_CLIENT_HEADER) or "").strip().lower() == "app"
+
+
+# The phone-status report's advisory lock: this namespace in the high half of
+# the key, the employee id in the low half.
+PHONE_STATUS_LOCK = 7401
+
+_PHONE_STATUS_KEYS = (
+    "app_version",
+    "android_version",
+    "battery_exempt",
+    "location_permission",
+    "notification_permission",
+    "gps_on",
+)
+
+
+def _phone_status_values(data):
+    """A phone-status report's fields, cleaned. A value of the wrong kind or an
+    unknown permission word reads as "the phone did not say", never as an error:
+    one odd field must not cost the office the rest of the report."""
+
+    def text(key, limit):
+        value = data.get(key)
+        if not isinstance(value, str):
+            return ""
+        # Control characters and lone surrogates: Postgres refuses a NUL in
+        # text and a surrogate cannot be encoded, so either would be a 500.
+        return re.sub(r"[\x00-\x1f\x7f\ud800-\udfff]", "", value).strip()[:limit]
+
+    def flag(key):
+        value = data.get(key)
+        return value if isinstance(value, bool) else None
+
+    def permission(key):
+        value = data.get(key)
+        return value if value in PhoneStatus.PERMISSIONS else ""
+
+    return {
+        "app_version": text("app_version", 40),
+        "android_version": text("android_version", 20),
+        "battery_exempt": flag("battery_exempt"),
+        "location_permission": permission("location_permission"),
+        "notification_permission": permission("notification_permission"),
+        "gps_on": flag("gps_on"),
+    }
 
 
 # Shared by case dispatch AND the tracking roster, so an engineer who can be
@@ -2169,6 +2215,53 @@ class TrackingViewSet(viewsets.ViewSet):
 
         _note_contact(employee)
         return Response(result, status=201)
+
+    @action(detail=False, methods=["post"], url_path="phone_status")
+    def phone_status(self, request):
+        """How this phone is set up to record, posted by the app when it opens:
+        {app_version, android_version, battery_exempt, location_permission,
+        notification_permission, gps_on}.
+
+        From the app only, like a fix: a browser signed in as an engineer is not
+        that engineer's phone. A report that changes nothing moves last_seen_at;
+        one that changes anything starts a new row, so the rows are the history
+        App Usage shows. It touches nothing else: not the duty, not the contact
+        the board reads, not the kilometres.
+        """
+        employee = _get_employee(request.user)
+        if not employee:
+            return Response({"detail": "No employee profile linked to this user."}, status=400)
+        if not _from_the_app(request):
+            return Response(
+                {"detail": "Only the RTPL app can report the phone's settings.", "app_only": True},
+                status=403,
+            )
+
+        # A report says something. An empty body, or anything not an object,
+        # would otherwise be stored as "the phone said nothing" and replace
+        # what the office sees.
+        data = request.data
+        if not isinstance(data, dict) or not any(key in data for key in _PHONE_STATUS_KEYS):
+            return Response({"detail": "Nothing to report."}, status=400)
+        values = _phone_status_values(data)
+        # One report at a time per employee. Two arriving together -- a retry
+        # behind a token refresh, say -- would otherwise both read the same
+        # latest row and both add one, and the history would show the same
+        # set-up twice. An advisory lock, not the employee's row: locking the
+        # row would make a report wait behind anything else holding it, and
+        # could deadlock with deleting the employee. Nothing else takes this
+        # lock, so nothing else ever waits on it. SQLite (the tests) has none.
+        with transaction.atomic():
+            if connection.vendor == "postgresql":
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_xact_lock(%s)", [(PHONE_STATUS_LOCK << 32) + employee.pk])
+            now = timezone.now()
+            latest = PhoneStatus.objects.filter(employee=employee).order_by("-first_seen_at", "-id").first()
+            if latest is not None and all(getattr(latest, field) == value for field, value in values.items()):
+                PhoneStatus.objects.filter(pk=latest.pk).update(last_seen_at=now)
+                return Response({"changed": False})
+            PhoneStatus.objects.create(employee=employee, first_seen_at=now, last_seen_at=now, **values)
+        return Response({"changed": True}, status=201)
 
     @action(detail=False, methods=["get"])
     def live(self, request):

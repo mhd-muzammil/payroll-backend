@@ -707,3 +707,45 @@ class RouteKmDay(models.Model):
 
     def __str__(self):
         return f"{self.engineer.employee_name} {self.day} ({self.status})"
+
+
+class PhoneStatus(models.Model):
+    """How an employee's phone is set up to record, one row per change.
+
+    The office could not see it. A battery left to the phone's optimiser stops
+    the app in the background and the kilometres go with it; Location and
+    notifications can be refused; GPS can be off. The app reports these when it
+    opens (/api/tracking/phone_status/). A report that changes nothing only
+    moves last_seen_at, so the rows are the history of what changed and when,
+    and the newest row is the phone as it is.
+    """
+
+    PERMISSIONS = ("granted", "denied", "prompt", "prompt-with-rationale")
+
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="phone_statuses",
+    )
+    app_version = models.CharField(max_length=40, blank=True, default="")
+    android_version = models.CharField(max_length=20, blank=True, default="")
+    # None: the phone could not say. Only APK 1.5 reports the battery; an older
+    # one says GPS only when the Location plugin's answer gives it away.
+    battery_exempt = models.BooleanField(null=True)
+    # One of PERMISSIONS, or "" when the phone did not say.
+    location_permission = models.CharField(max_length=24, blank=True, default="")
+    notification_permission = models.CharField(max_length=24, blank=True, default="")
+    gps_on = models.BooleanField(null=True)
+    # The first report with these values, and the latest one still saying them.
+    first_seen_at = models.DateTimeField(default=timezone.now)
+    last_seen_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-first_seen_at", "-id"]
+        indexes = [
+            # The newest row per employee, read once per employee by App Usage.
+            models.Index(fields=["employee", "-first_seen_at", "-id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.employee.employee_name} phone at {self.first_seen_at:%Y-%m-%d %H:%M}"
