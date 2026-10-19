@@ -1,3 +1,4 @@
+import logging
 import mimetypes
 from pathlib import Path
 
@@ -14,8 +15,10 @@ from rest_framework.response import Response
 
 from authentication.permissions import IsHRStaff
 from .candidate_import import build_candidates, UnreadableUpload
-from .models import Onboarding, OnboardingInvite, Candidate, new_invite_token
-from .serializers import DOCUMENT_FIELDS, OnboardingSerializer, CandidateSerializer
+from .models import Onboarding, OnboardingInvite, Candidate, OfferLetter, new_invite_token
+from .serializers import DOCUMENT_FIELDS, OnboardingSerializer, CandidateSerializer, OfferLetterSerializer
+
+logger = logging.getLogger(__name__)
 
 # Big enough for the lead exports HR actually has (the largest is ~400 KB and
 # 680 rows) with plenty of room, small enough that a wrong file cannot tie up a
@@ -285,3 +288,95 @@ class CandidateViewSet(viewsets.ModelViewSet):
                 if incoming and not float(getattr(candidate, field) or 0):
                     fills.append((candidate, field, incoming))
         return fills
+
+
+# Letters before Payroll made them were numbered by hand; 2026's had reached 140.
+# Every other year starts at 1.
+FIRST_OFFER_SERIAL = {2026: 141}
+
+
+class OfferLetterViewSet(viewsets.ModelViewSet):
+    """Offer letters made in the Hiring Portal. HR only, like the candidates they
+    are written for: a letter states somebody's pay."""
+
+    queryset = OfferLetter.objects.select_related("created_by").all()
+    serializer_class = OfferLetterSerializer
+    permission_classes = [IsAuthenticated, IsHRStaff]
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    @action(detail=False, methods=["get"], url_path="next_ref")
+    def next_ref(self, request):
+        """The reference the next letter should carry, RTPL/NJ/<year>/<serial>:
+        one past this year's highest. HR can still type another."""
+        year = timezone.localdate().year
+        prefix = f"RTPL/NJ/{year}/"
+        highest = 0
+        for ref in OfferLetter.objects.filter(ref_no__startswith=prefix).values_list("ref_no", flat=True):
+            tail = ref[len(prefix):]
+            if tail.isdigit():
+                highest = max(highest, int(tail))
+        serial = max(highest + 1, FIRST_OFFER_SERIAL.get(year, 1))
+        return Response({"ref_no": f"{prefix}{serial}"})
+
+    # The PDF opens by plain navigation -- in the app that is the only way a file
+    # reaches the phone (see payrollpayslip.payslip_pdf) -- and a navigation
+    # carries no JWT. So, as for payslips: a signed ticket for one letter, minted
+    # over the authenticated channel and spent within five minutes.
+    PDF_TICKET_SALT = "offer-letter.pdf.download"
+    PDF_TICKET_MAX_AGE = 300  # seconds
+
+    @action(detail=True, methods=["get"], url_path="pdf_ticket")
+    def pdf_ticket(self, request, pk=None):
+        from django.core import signing
+
+        letter = self.get_object()
+        ticket = signing.dumps(
+            {"offer_letter": letter.id, "user": request.user.id}, salt=self.PDF_TICKET_SALT
+        )
+        return Response({
+            "ticket": ticket,
+            "path": f"/api/offer-letters/{letter.id}/pdf/?t={ticket}",
+            "expires_in": self.PDF_TICKET_MAX_AGE,
+        })
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="pdf",
+        permission_classes=[AllowAny],
+        authentication_classes=[],
+    )
+    def pdf(self, request, pk=None):
+        """The letter as a PDF, authorised by the ticket above."""
+        from django.core import signing
+        from django.http import HttpResponse
+
+        from .offer_letter import offer_letter_filename, render_offer_letter_pdf
+
+        ticket = request.query_params.get("t") or ""
+        try:
+            payload = signing.loads(ticket, salt=self.PDF_TICKET_SALT, max_age=self.PDF_TICKET_MAX_AGE)
+        except signing.SignatureExpired:
+            return Response({"detail": "This download link has expired. Please try again."}, status=403)
+        except signing.BadSignature:
+            return Response({"detail": "Invalid download link."}, status=403)
+        # The ticket names its letter; trusting the URL instead would let one
+        # ticket fetch every letter in the table.
+        if str(payload.get("offer_letter")) != str(pk):
+            return Response({"detail": "Invalid download link."}, status=403)
+
+        letter = OfferLetter.objects.filter(pk=pk).first()
+        if letter is None:
+            return Response({"detail": "Offer letter not found."}, status=404)
+        try:
+            pdf_bytes = render_offer_letter_pdf(letter)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller below
+            logger.exception("offer letter PDF render failed for %s", pk)
+            return Response({"detail": f"Could not build the PDF: {exc}"}, status=500)
+
+        response = HttpResponse(pdf_bytes, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{offer_letter_filename(letter)}"'
+        response["Cache-Control"] = "no-store"
+        return response

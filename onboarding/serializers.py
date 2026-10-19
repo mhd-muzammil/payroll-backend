@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
@@ -5,7 +6,7 @@ from django.conf import settings
 from django.urls import reverse
 from rest_framework import serializers
 
-from .models import Onboarding, Candidate, employee_already_holding
+from .models import Onboarding, Candidate, OfferLetter, employee_already_holding
 
 
 DOCUMENT_FIELDS = (
@@ -207,3 +208,87 @@ class CandidateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Candidate
         fields = '__all__'
+
+
+# The longest each line of the letter can take before it runs into the next
+# word or off the page. Names longer than this are very rare; a role this long
+# would push "the following terms and conditions:" past the margin.
+OFFER_LETTER_MAX = {"name": 60, "designation": 40}
+# No single monthly line on a field engineer's letter comes near this. A typo
+# with an extra zero should be refused, not printed and sent.
+OFFER_LETTER_MAX_AMOUNT = 10_00_000
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class OfferLetterSerializer(serializers.ModelSerializer):
+    """An offer letter, with Annexure-I's sums worked out from its monthly lines.
+    gross, net and ctc are read-only: they are never typed, so they cannot
+    disagree with the lines they add up."""
+
+    gross = serializers.SerializerMethodField()
+    net = serializers.SerializerMethodField()
+    ctc = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OfferLetter
+        fields = [
+            "id", "ref_no", "name", "designation", "joining_date",
+            "basic", "hra", "conveyance", "cea", "personal_allowance",
+            "professional_tax", "insurance", "petrol_allowance",
+            "gross", "net", "ctc", "created_by_name", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def _sums(self, obj):
+        from .offer_letter import annexure
+
+        return annexure(obj)
+
+    def get_gross(self, obj):
+        return self._sums(obj)["gross"]
+
+    def get_net(self, obj):
+        return self._sums(obj)["net"]
+
+    def get_ctc(self, obj):
+        return self._sums(obj)["ctc"]
+
+    def get_created_by_name(self, obj):
+        user = obj.created_by
+        return (user.get_full_name() or user.username) if user else ""
+
+    def _text(self, value, field):
+        value = _CONTROL.sub("", value or "").strip()
+        value = re.sub(r"\s+", " ", value)
+        if not value:
+            raise serializers.ValidationError("This cannot be empty.")
+        if len(value) > OFFER_LETTER_MAX[field]:
+            raise serializers.ValidationError(
+                f"At most {OFFER_LETTER_MAX[field]} characters fit on the letter."
+            )
+        return value
+
+    def validate_name(self, value):
+        return self._text(value, "name")
+
+    def validate_designation(self, value):
+        return self._text(value, "designation")
+
+    def validate_ref_no(self, value):
+        value = (value or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9/._-]{3,40}", value):
+            raise serializers.ValidationError("Use letters, digits and / - . _ only, like RTPL/NJ/2026/141.")
+        return value
+
+    def validate(self, attrs):
+        for field in (
+            "basic", "hra", "conveyance", "cea", "personal_allowance",
+            "professional_tax", "insurance", "petrol_allowance",
+        ):
+            if field in attrs and attrs[field] > OFFER_LETTER_MAX_AMOUNT:
+                raise serializers.ValidationError({field: "That is more than any monthly line should be."})
+        basic = attrs.get("basic", getattr(self.instance, "basic", None))
+        if basic is not None and basic <= 0:
+            raise serializers.ValidationError({"basic": "Basic must be more than zero."})
+        return attrs

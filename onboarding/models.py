@@ -1,5 +1,6 @@
 import secrets
 
+from django.conf import settings
 from django.db import models
 
 
@@ -300,6 +301,43 @@ class Candidate(models.Model):
 
     def __str__(self):
         return f"{self.name} - {self.segment} ({self.action})"
+
+
+class OfferLetter(models.Model):
+    """An offer letter made in Payroll: HR's own six-page letter with only these
+    filled in (see onboarding/offer_letter). Every amount is per month, in
+    rupees; Annexure-I's totals and yearly column are worked out from them, so
+    a letter can never add up wrong."""
+
+    ref_no = models.CharField(max_length=40, unique=True)
+    name = models.CharField(max_length=60)
+    designation = models.CharField(max_length=40, default="Service engineer")
+    joining_date = models.DateField()
+
+    basic = models.PositiveIntegerField()
+    hra = models.PositiveIntegerField()
+    conveyance = models.PositiveIntegerField(default=1600)
+    cea = models.PositiveIntegerField(default=200)
+    personal_allowance = models.PositiveIntegerField()
+    professional_tax = models.PositiveIntegerField(default=208)
+    insurance = models.PositiveIntegerField(default=207)
+    petrol_allowance = models.PositiveIntegerField(default=3000)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="offer_letters_made",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.ref_no} {self.name}"
 
 
 import logging

@@ -1,0 +1,195 @@
+"""Offer letters made in the Hiring Portal.
+
+The letter is HR's own six pages with five things filled in, so most of what is
+below is about those five: the Annexure adding up, the numbers written the way
+the sample writes them, the right person's details on the page and nobody
+else's (the sample's included), and the letter staying with HR.
+"""
+import io
+from datetime import date
+from unittest import mock
+
+from django.test import TestCase
+from pypdf import PdfReader
+from rest_framework.test import APIClient
+
+from authentication.models import User
+
+from .models import OfferLetter
+from .offer_letter import TEMPLATE, annexure, field_texts, indian, offer_letter_filename, render_offer_letter_pdf
+
+# The sample letter HR gave: Kumar V, Service engineer, joining 31.08.2026.
+KUMAR = dict(
+    ref_no="RTPL/NJ/2026/140", name="Kumar V", designation="Service engineer",
+    joining_date=date(2026, 8, 31),
+    basic=12104, hra=6052, conveyance=1600, cea=200, personal_allowance=4252,
+    professional_tax=208, insurance=207, petrol_allowance=3000,
+)
+
+
+def letter(**changes):
+    return OfferLetter(**{**KUMAR, **changes})
+
+
+def pdf_text(pdf):
+    return "\n".join(page.extract_text() for page in PdfReader(io.BytesIO(pdf)).pages)
+
+
+class AnnexureTests(TestCase):
+    def test_the_sample_letter_adds_up_as_it_did(self):
+        sums = annexure(letter())
+        self.assertEqual(sums, {"gross": 24208, "net": 24000, "benefits": 3207, "ctc": 27415})
+
+    def test_numbers_are_written_as_the_sample_writes_them(self):
+        texts = field_texts(letter())
+        self.assertEqual(texts["basic_m"], "12104")
+        self.assertEqual(texts["basic_y"], "145248")
+        self.assertEqual(texts["gross_m"], "24,208")
+        self.assertEqual(texts["gross_y"], "2,90,496")
+        self.assertEqual(texts["pt_m"], "208.0")
+        self.assertEqual(texts["pt_y"], "2496")
+        self.assertEqual(texts["net_y"], "2,88,000")
+        self.assertEqual(texts["package"], "27,415")
+        self.assertEqual(texts["joining_date"], "31.08.2026")
+        # Every line's year is twelve of its months, petrol included.
+        self.assertEqual(texts["petrol_y"], "36000")
+        self.assertEqual(texts["total_c_y"], "38484")
+        self.assertEqual(texts["ctc_y"], "3,28,980")
+
+    def test_lakhs(self):
+        self.assertEqual(indian(999), "999")
+        self.assertEqual(indian(1000), "1,000")
+        self.assertEqual(indian(290496), "2,90,496")
+        self.assertEqual(indian(10000000), "1,00,00,000")
+
+    def test_the_file_is_named_after_the_person(self):
+        self.assertEqual(offer_letter_filename(letter(name="Arun Kumar S.")), "Offer-Letter-Arun-Kumar-S.pdf")
+
+
+class OfferLetterPdfTests(TestCase):
+    def test_the_template_holds_no_text_at_all(self):
+        """Not the sample's name, not its salary: deleted, not covered."""
+        with open(TEMPLATE, "rb") as fh:
+            raw = fh.read()
+        self.assertEqual(pdf_text(raw).strip(), "")
+        for leak in (b"Kumar", b"27,415", b"24,208", b"RTPL/NJ/2026/140"):
+            self.assertNotIn(leak, raw)
+
+    def test_a_letter_carries_its_own_details_and_nobody_else_s(self):
+        pdf = render_offer_letter_pdf(letter(
+            ref_no="RTPL/NJ/2026/151", name="Priya Dharshini", designation="Senior Service Engineer",
+            joining_date=date(2026, 11, 3), basic=15000, hra=7500, personal_allowance=5000,
+        ))
+        self.assertTrue(pdf.startswith(b"%PDF"))
+        self.assertEqual(len(PdfReader(io.BytesIO(pdf)).pages), 6)
+        text = pdf_text(pdf)
+        # 15000 + 7500 + 1600 + 200 + 5000 = 29,300 gross; + 207 + 3000 = 32,507 a month.
+        for expected in ("RTPL/NJ/2026/151", "Priya Dharshini", "Senior Service Engineer", "03.11.2026",
+                         "32,507", "3,51,600", "Responsibilities", "ANNEXURE-I", "Medical"):
+            self.assertIn(expected, text)
+        for leak in ("Kumar", "27,415", "31.08.2026", "RTPL/NJ/2026/140", "12104"):
+            self.assertNotIn(leak, text)
+
+    def test_a_long_role_keeps_its_line_inside_the_margin(self):
+        pdf = render_offer_letter_pdf(letter(designation="Regional Service Operations Coordinator"))
+        page = PdfReader(io.BytesIO(pdf)).pages[0]
+        ends = []
+
+        def visit(text, cm, tm, font, size):
+            if "conditions:" in text:
+                ends.append(tm[4])
+
+        page.extract_text(visitor_text=visit)
+        self.assertTrue(ends)
+        self.assertLess(max(ends), 531.0)
+
+
+class OfferLetterApiTests(TestCase):
+    def setUp(self):
+        self.hr = User.objects.create_user(username="hr-offers", password="x", role="hr")
+        self.engineer = User.objects.create_user(username="eng-offers", password="x", role="employee")
+        self.client = APIClient()
+        self.client.force_authenticate(self.hr)
+
+    def _body(self, **changes):
+        body = {k: (v.isoformat() if isinstance(v, date) else v) for k, v in KUMAR.items()}
+        body["ref_no"] = "RTPL/NJ/2026/141"
+        body.update(changes)
+        return body
+
+    def test_hr_makes_a_letter_and_it_adds_up(self):
+        response = self.client.post("/api/offer-letters/", self._body(), format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["gross"], 24208)
+        self.assertEqual(response.data["net"], 24000)
+        self.assertEqual(response.data["ctc"], 27415)
+        self.assertEqual(OfferLetter.objects.get().created_by, self.hr)
+        self.assertEqual(len(self.client.get("/api/offer-letters/").data), 1)
+
+    def test_the_sums_cannot_be_typed(self):
+        response = self.client.post("/api/offer-letters/", self._body(ctc=1, gross=1), format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["ctc"], 27415)
+
+    def test_an_engineer_cannot_see_or_make_letters(self):
+        engineer = APIClient()
+        engineer.force_authenticate(self.engineer)
+        self.assertEqual(engineer.get("/api/offer-letters/").status_code, 403)
+        self.assertEqual(engineer.post("/api/offer-letters/", self._body(), format="json").status_code, 403)
+        self.assertEqual(APIClient().get("/api/offer-letters/").status_code, 401)
+
+    def test_what_would_go_wrong_on_paper_is_refused(self):
+        cases = {
+            "empty name": self._body(name="   "),
+            "name too long": self._body(name="A" * 61),
+            "role too long": self._body(designation="R" * 41),
+            "a zero too many": self._body(basic=12_10_400_0),
+            "no basic": self._body(basic=0),
+            "odd reference": self._body(ref_no="RTPL NJ 141"),
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self.client.post("/api/offer-letters/", body, format="json").status_code, 400)
+        self.client.post("/api/offer-letters/", self._body(), format="json")
+        self.assertEqual(self.client.post("/api/offer-letters/", self._body(), format="json").status_code, 400)
+
+    def test_names_are_tidied_not_printed_raw(self):
+        response = self.client.post("/api/offer-letters/", self._body(name="  Ravi\t   Kumar \n"), format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["name"], "Ravi Kumar")
+        # A NUL is refused outright (DRF's own rule), never printed.
+        response = self.client.post(
+            "/api/offer-letters/", self._body(ref_no="RTPL/NJ/2026/150", name="Ravi\x00"), format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_the_next_reference_follows_the_highest_this_year(self):
+        with mock.patch("onboarding.views.timezone.localdate", return_value=date(2026, 10, 19)):
+            self.assertEqual(self.client.get("/api/offer-letters/next_ref/").data["ref_no"], "RTPL/NJ/2026/141")
+            self.client.post("/api/offer-letters/", self._body(ref_no="RTPL/NJ/2026/157"), format="json")
+            self.assertEqual(self.client.get("/api/offer-letters/next_ref/").data["ref_no"], "RTPL/NJ/2026/158")
+        with mock.patch("onboarding.views.timezone.localdate", return_value=date(2027, 1, 2)):
+            self.assertEqual(self.client.get("/api/offer-letters/next_ref/").data["ref_no"], "RTPL/NJ/2027/1")
+
+    def test_the_pdf_opens_with_a_ticket_and_only_for_its_letter(self):
+        first = self.client.post("/api/offer-letters/", self._body(), format="json").data["id"]
+        second = self.client.post("/api/offer-letters/", self._body(ref_no="RTPL/NJ/2026/142"), format="json").data["id"]
+        ticket = self.client.get(f"/api/offer-letters/{first}/pdf_ticket/").data
+
+        browser = APIClient()  # no JWT, as a plain navigation has none
+        response = browser.get(ticket["path"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertIn('attachment; filename="Offer-Letter-Kumar-V.pdf"', response["Content-Disposition"])
+        self.assertTrue(response.content.startswith(b"%PDF"))
+
+        self.assertEqual(browser.get(f"/api/offer-letters/{second}/pdf/?t={ticket['ticket']}").status_code, 403)
+        self.assertEqual(browser.get(f"/api/offer-letters/{first}/pdf/?t=forged").status_code, 403)
+        with mock.patch("onboarding.views.OfferLetterViewSet.PDF_TICKET_MAX_AGE", -1):
+            self.assertEqual(browser.get(ticket["path"]).status_code, 403)
+
+    def test_an_engineer_gets_no_ticket(self):
+        letter_id = self.client.post("/api/offer-letters/", self._body(), format="json").data["id"]
+        engineer = APIClient()
+        engineer.force_authenticate(self.engineer)
+        self.assertEqual(engineer.get(f"/api/offer-letters/{letter_id}/pdf_ticket/").status_code, 403)
