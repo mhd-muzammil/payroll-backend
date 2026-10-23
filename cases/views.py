@@ -30,6 +30,7 @@ from .pings import (
 from .tracks import snapped_trail
 from . import places
 from . import olamaps, route_km
+from . import stored_km
 from . import day_cases
 from . import km_rule
 from employees.models import Employee
@@ -3410,6 +3411,31 @@ class TrackingViewSet(viewsets.ViewSet):
                 "pending": pending,
                 "rechecking": rechecking,
                 "measured_now": measured_now,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="route_km_stored")
+    def route_km_stored(self, request):
+        """ROUTE KM as stored, for readers that must not measure: the cells
+        route_km would answer with, read and nothing more -- no Ola, no writes
+        (cases/stored_km.py). A cell never measured is `not_measured`.
+
+        Query: ?engineers=1,2,3&from=YYYY-MM-DD&to=YYYY-MM-DD
+        Answer: {"configured": true, "days": [...], "engineers": [{"engineer_id",
+        "days": {"YYYY-MM-DD": {"km", "status", "points", "office", "final",
+        "measured_at"}}}]}
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Permission denied."}, status=403)
+        ids, days, problem = stored_km.parse_grid(request.query_params, timezone.localdate())
+        if problem:
+            return Response({"detail": problem}, status=400)
+        ids = stored_km.visible(request.user, ids)
+        return Response(
+            {
+                "configured": True,
+                "days": [day.isoformat() for day in days],
+                "engineers": stored_km.route_grid(ids, days),
             }
         )
 
