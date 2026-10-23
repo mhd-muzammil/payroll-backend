@@ -27,11 +27,12 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from authentication.models import get_allowed_branches
-from cases import olamaps, route_km
+from cases import olamaps, route_km, stored_km
 from cases.views import _is_staff_role
 from employees.models import Employee
 
 from . import km
+from .stored import fieldez_grid
 from .models import FieldezWorkOrder
 from .points import (
     MAX_RESOLUTIONS,
@@ -289,6 +290,29 @@ class FieldezKmViewSet(viewsets.ViewSet):
                 "rechecking": rechecking,
                 "waiting": waiting,
                 "measured_now": measured_now,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="stored")
+    def stored(self, request):
+        """FIELDEZ as stored, for readers that must not measure: no Ola, no
+        writes, nothing asked of the worker (fieldez_km/stored.py). Each cell
+        has ROUTE KM's stored fields plus checkins, placed, waiting,
+        missing_by_reason and beyond_lookback -- counts, never a WO or a place.
+
+        Query: ?engineers=1,2,3&from=YYYY-MM-DD&to=YYYY-MM-DD
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Permission denied."}, status=403)
+        ids, days, problem = stored_km.parse_grid(request.query_params, timezone.localdate())
+        if problem:
+            return Response({"detail": problem}, status=400)
+        ids = stored_km.visible(request.user, ids)
+        return Response(
+            {
+                "configured": True,
+                "days": [day.isoformat() for day in days],
+                "engineers": fieldez_grid(ids, days),
             }
         )
 
