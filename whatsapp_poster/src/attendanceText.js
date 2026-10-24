@@ -25,7 +25,7 @@ const MS_PER_HOUR = 60 * 60_000;
 const MAX_WORKDAY_HOURS = 24;
 
 // A day nobody came in has no punch; its midnight is only the date.
-const NO_PUNCH_STATUSES = new Set(["Absent", "Leave", "Off Day"]);
+const NO_PUNCH_STATUSES = new Set(["Absent", "Leave", "Half Day"]);
 const STATUS_DISPLAY = { overTime: "Overtime" };
 
 const CLOCK = new Intl.DateTimeFormat("en-US", {
@@ -189,21 +189,21 @@ export const buildMessage = ({ rows, branch, now = new Date() }) => {
   const totals = rows.reduce(
     (acc, record) => {
       if (record.status === "Absent") acc.absent += 1;
-      else if (record.status === "Off Day") acc.offDay += 1;
+      else if (record.status === "Half Day") acc.halfDay += 1;
       else if (record.status === "Leave") acc.leave += 1;
       else acc.present += 1;
       return acc;
     },
-    { present: 0, absent: 0, offDay: 0, leave: 0 },
+    { present: 0, absent: 0, halfDay: 0, leave: 0 },
   );
 
   const lines = [
     "*Renderways Technology*",
     `Daily Attendance · *${branch} branch*`,
     plainSpaces(DAY.format(now)),
-    // Off Day only on a day that has one, as the page's picture says it.
+    // Half Day only on a day that has one, as the page's picture says it.
     `Present ${totals.present} · Absent ${totals.absent} · ` +
-      (totals.offDay ? `Off Day ${totals.offDay} · ` : "") +
+      (totals.halfDay ? `Half Day ${totals.halfDay} · ` : "") +
       `On leave ${totals.leave} · ` +
       `${rows.length} ${rows.length === 1 ? "record" : "records"}`,
   ];
@@ -269,8 +269,8 @@ export const buildReminder = ({ branch, names, cutoff, now = new Date() }) =>
 /**
  * The final report -- at 10:30, right after the no-shows are marked Absent,
  * and again at 9pm: the
- * count, then who is Absent, on an Off Day, on leave and present, in that
- * order. The Off Day line and list appear only on a day that has one.
+ * count, then who is Absent, on a Half Day, on leave and present, in that
+ * order. The Half Day line and list appear only on a day that has one.
  *
  * `notMarked` is anybody the server still lists as not logged in. After 10:30
  * it should be nobody -- they were marked Absent -- so a name there means the
@@ -279,15 +279,15 @@ export const buildReminder = ({ branch, names, cutoff, now = new Date() }) =>
  */
 export const buildFinalReport = ({ rows, branch, notMarked = [], now = new Date() }) => {
   const absent = rows.filter((r) => r.status === "Absent");
-  // A day off the office marked: unpaid like Absent, but not a no-show.
-  const offDay = rows.filter((r) => r.status === "Off Day");
+  // Half Day, marked by the office: half a day unpaid, and not a no-show.
+  const halfDay = rows.filter((r) => r.status === "Half Day");
   const leave = rows.filter((r) => r.status === "Leave");
   const present = rows.filter((r) => !NO_PUNCH_STATUSES.has(r.status));
 
   const counts = [
     `Present ${present.length}`,
     `Absent ${absent.length}`,
-    ...(offDay.length ? [`Off Day ${offDay.length}`] : []),
+    ...(halfDay.length ? [`Half Day ${halfDay.length}`] : []),
     `On leave ${leave.length}`,
     ...(notMarked.length ? [`Not marked ${notMarked.length}`] : []),
     `Total ${rows.length + notMarked.length}`,
@@ -308,9 +308,9 @@ export const buildFinalReport = ({ rows, branch, notMarked = [], now = new Date(
   if (notMarked.length) {
     lines.push("", `*Not logged in, not marked Absent yet (${notMarked.length})*`, ...listed(notMarked));
   }
-  if (offDay.length) {
-    lines.push("", `*Off Day (${offDay.length})*`);
-    offDay.forEach((r) => lines.push(`• ${tidy(r.employee_name) || "—"}${lateLogin(r)}`));
+  if (halfDay.length) {
+    lines.push("", `*Half Day (${halfDay.length})*`);
+    halfDay.forEach((r) => lines.push(`• ${tidy(r.employee_name) || "—"}${lateLogin(r)}`));
   }
   if (leave.length) {
     lines.push("", `*On leave (${leave.length})*`, ...listed(leave.map((r) => r.employee_name)));

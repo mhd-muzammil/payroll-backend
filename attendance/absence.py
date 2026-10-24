@@ -17,7 +17,7 @@ The marking is asked for by the WhatsApp poster, at 10:30, just before its
 mark_absent endpoint. `manage.py mark_absent_no_login` does the same by hand.
 
 Absent is not a label here, it is pay: a payslip's loss-of-pay days are the
-count of Absent (and Off Day) rows in its cycle. So every rule below is about who must NOT
+count of Absent rows in its cycle (a Half Day row counts half). So every rule below is about who must NOT
 be marked:
 
   * Sunday. It is a day off, marked as one (Leave, shown as "Sunday") by
@@ -50,16 +50,16 @@ SUNDAY = 6  # datetime.weekday()
 # same as the Add Record form, the Excel import and the Sunday rule write it.
 DAY_MARK = time(0, 0)
 
-# The statuses a no-punch day is written with. Off Day is a day off the office
-# marks: nobody punches on it, and a row of it is not somebody having worked.
-NO_PUNCH_STATUSES = ("Absent", "Leave", "Off Day")
+# The statuses a no-punch day is written with. Half Day is marked by the office
+# as a date only: nobody punches on it, and a row of it is not somebody having worked.
+NO_PUNCH_STATUSES = ("Absent", "Leave", "Half Day")
 
 # App accounts that have a Login button. The admin accounts do not.
 CAN_LOG_IN = ("employee", "hr")
 
 
 def is_day_mark(row):
-    """Whether this row holds only a date -- an Absent, Leave or Off Day day
+    """Whether this row holds only a date -- an Absent, Leave or Half Day day
     nobody punched -- rather than a Login."""
     if row.status not in NO_PUNCH_STATUSES or row.intime is None:
         return False

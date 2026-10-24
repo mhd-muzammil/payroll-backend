@@ -56,7 +56,7 @@ def casual_leave_available(emp, year, month):
 from .models import Payslip, BranchFinancial
 from .serializer import PayslipSerializer, BranchFinancialSerializer
 from employees.models import Employee, Performance
-from attendance.models import Attendance, LOSS_OF_PAY_STATUSES
+from attendance.models import Attendance, loss_of_pay_days
 from authentication.models import get_allowed_branches
 from authentication.permissions import IsHRStaff
 
@@ -555,12 +555,11 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 skipped_paid += 1
                 continue
             # 2. Calculate LOP days based on Attendance Table within the range
-            # (Absent and Off Day rows: both unpaid).
-            lop_days = Decimal(Attendance.objects.filter(
+            # (a whole day for each Absent row, half a day for each Half Day).
+            lop_days = loss_of_pay_days(Attendance.objects.filter(
                 employee=emp,
                 intime__range=(start_datetime, end_datetime),
-                status__in=LOSS_OF_PAY_STATUSES,
-            ).count())
+            ))
 
             # 2b. Offset LOP with the employee's earned casual-leave balance
             # (6-month rule, from their real date_of_joining). CL days become
@@ -842,11 +841,10 @@ class PayslipViewSet(viewsets.ModelViewSet):
         start_datetime = make_aware(datetime.datetime.combine(start_date, datetime.time.min))
         end_datetime = make_aware(datetime.datetime.combine(end_date, datetime.time.max))
 
-        lop_days = Decimal(Attendance.objects.filter(
+        lop_days = loss_of_pay_days(Attendance.objects.filter(
             employee=payslip.employee,
             intime__range=(start_datetime, end_datetime),
-            status__in=LOSS_OF_PAY_STATUSES,
-        ).count())
+        ))
 
         # Same casual-leave offset bulk generation applies, so "revert to what
         # generation would produce" actually produces it. Without this, Undo

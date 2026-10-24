@@ -42,7 +42,7 @@ from attendance.models import Attendance
 
 # A day with no punch is stored as midnight with no logout -- see the docstring.
 # These are the statuses that means, and they are never closed.
-NO_PUNCH_STATUSES = ("Absent", "Leave", "Off Day")
+NO_PUNCH_STATUSES = ("Absent", "Leave", "Half Day")
 
 # The minute the day is closed at. Not midnight: midnight belongs to the next
 # day, and every list on the page groups by the date it reads off a punch.

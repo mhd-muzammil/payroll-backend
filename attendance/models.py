@@ -1,9 +1,19 @@
+from decimal import Decimal
+
 from django.db import models
+from django.db.models import Count
 from employees.models import Employee
 
-# The statuses a payslip counts as loss of pay, a day for each row. Off Day is
-# unpaid as Absent is -- the office's decision, 24 Oct 2026.
-LOSS_OF_PAY_STATUSES = ("Absent", "Off Day")
+# What a row of each unpaid status costs, in days of pay: a whole day for
+# Absent, half a day for a Half Day -- the office's decisions, 24 Oct 2026.
+LOSS_OF_PAY_DAYS = {"Absent": Decimal("1"), "Half Day": Decimal("0.5")}
+
+
+def loss_of_pay_days(rows):
+    """The loss-of-pay days in `rows`, an Attendance queryset: one for each
+    Absent row and a half for each Half Day row."""
+    counts = rows.filter(status__in=LOSS_OF_PAY_DAYS).values("status").annotate(n=Count("id"))
+    return sum((LOSS_OF_PAY_DAYS[c["status"]] * c["n"] for c in counts), Decimal(0))
 
 # Create your models here.
 class Attendance(models.Model):
@@ -11,10 +21,10 @@ class Attendance(models.Model):
         ('Present', 'Present'),
         ('Absent', 'Absent'),
         ('Leave', 'Leave'),
-        # A day off the office marks, unpaid: a payslip counts it as loss of pay
-        # exactly as it counts Absent, but the register names it apart so a day
-        # off asked for is not read as a day somebody failed to turn up.
-        ('Off Day', 'Off Day'),
+        # A half day the office marks. A payslip counts it as half a day's loss
+        # of pay (LOSS_OF_PAY_DAYS), and the register names it apart so it is
+        # not read as a day somebody failed to turn up.
+        ('Half Day', 'Half Day'),
         ('Late', 'Late'),
         ('Overtime', 'Overtime'),
     )

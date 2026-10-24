@@ -3,6 +3,7 @@ import math
 import openpyxl
 import re
 from datetime import datetime, time, date as dt_date, timedelta
+from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 from django.utils.timezone import make_aware
@@ -13,7 +14,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
 from . import absence
-from .models import Attendance, LeaveRequest, LOSS_OF_PAY_STATUSES
+from .models import Attendance, LeaveRequest, LOSS_OF_PAY_DAYS
 from .serializer import AttendanceSerializer, LeaveRequestSerializer
 from employees.models import Employee
 from authentication.models import User, get_allowed_branches
@@ -29,6 +30,11 @@ def haversine_distance(lat1, lon1, lat2, lon2):
         * math.cos(math.radians(lat2)) * math.sin(dlon / 2) * math.sin(dlon / 2)
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c * 1000  # returns distance in meters
+
+
+def _days(value):
+    """A count of days for JSON: 3 stays 3, and a half day reads 2.5."""
+    return int(value) if value == value.to_integral_value() else float(value)
 
 
 # How close to the registered work location an employee has to stand. It was
@@ -1020,13 +1026,13 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         email and charges each engineer what Payroll would actually pay them:
 
           present_days   distinct days with a worked status (Present/Late/Overtime)
-          absent_days    distinct days marked Absent or Off Day -- the only unpaid
-                         days, as on the payslip (a Leave row, and every Sunday,
-                         is paid)
+          absent_days    distinct days marked Absent -- unpaid, as on the payslip
+                         (a Leave row, and every Sunday, is paid)
+          half_days      distinct days marked Half Day -- half a day unpaid each
           casual_leave_days  of those absences, what casual leave covers: one a
                          salary cycle once six months' service are done, exactly
                          as payslip generation applies it
-          lop_days       absent_days - casual_leave_days
+          lop_days       absent_days + half_days / 2 - casual_leave_days
           unmarked_days  working days (not Sundays) with no row at all; the
                          payslip pays them, the office may want to mark them
           payslip        when the range is exactly one 25th-24th cycle and its
@@ -1047,7 +1053,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         all_days = [start + timedelta(days=i) for i in range(days)]
         working = {d for d in all_days if d.weekday() != 6}
 
-        present, absent, leave = {}, {}, {}
+        present, absent, half, leave = {}, {}, {}, {}
         rows = (
             self.get_queryset()
             .filter(employee__isnull=False, intime__isnull=False)
@@ -1057,8 +1063,10 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             day = timezone.localtime(intime).date()
             if status in self.WORKED_STATUSES:
                 bucket = present
-            elif status in LOSS_OF_PAY_STATUSES:
+            elif status == "Absent":
                 bucket = absent
+            elif status == "Half Day":
+                bucket = half
             else:
                 bucket = leave
             bucket.setdefault(employee_id, set()).add(day)
@@ -1086,7 +1094,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             branches = get_allowed_branches(user, "attendance")
             if "All" not in branches:
                 employees = employees.filter(branch__in=branches)
-        seen = set(present) | set(absent) | set(leave)
+        seen = set(present) | set(absent) | set(half) | set(leave)
         employees = [e for e in employees if e.id in seen or (e.email or "").strip()]
 
         slips = {}
@@ -1102,12 +1110,21 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             worked = present.get(emp.id, set())
             # A day with a worked row counts as worked, whatever else is on it.
             off = absent.get(emp.id, set()) - worked
-            lv = leave.get(emp.id, set()) - worked - off
-            cl = 0
+            halves = half.get(emp.id, set()) - worked - off
+            lv = leave.get(emp.id, set()) - worked - off - halves
+            # In days of pay, as the payslip counts them: a Half Day is half.
+            def unpaid(days, off=off, halves=halves):
+                return (
+                    len(off & days) * LOSS_OF_PAY_DAYS["Absent"]
+                    + len(halves & days) * LOSS_OF_PAY_DAYS["Half Day"]
+                )
+
+            cl = Decimal(0)
             for (m, y), cdays in cycles.items():
-                missed = len(off & cdays)
+                missed = unpaid(cdays)
                 if missed:
-                    cl += int(min(casual_leave_available(emp, y, m), missed))
+                    cl += min(casual_leave_available(emp, y, m), missed)
+            lop = unpaid(off | halves) - cl
             slip = slips.get(emp.id)
             results.append({
                 "employee_id": emp.id,
@@ -1117,10 +1134,12 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                 "date_of_joining": emp.date_of_joining.isoformat() if emp.date_of_joining else None,
                 "present_days": len(worked),
                 "absent_days": len(off),
+                "half_days": len(halves),
                 "leave_days": len(lv),
-                "casual_leave_days": cl,
-                "lop_days": len(off) - cl,
-                "unmarked_days": len(working - worked - off - lv),
+                # Whole numbers stay whole; a half day reads 0.5.
+                "casual_leave_days": _days(cl),
+                "lop_days": _days(lop),
+                "unmarked_days": len(working - worked - off - halves - lv),
                 "payslip": None if not slip else {
                     "month": slip.month,
                     "year": slip.year,
