@@ -1,12 +1,20 @@
 from django.db import models
 from employees.models import Employee
 
+# The statuses a payslip counts as loss of pay, a day for each row. Off Day is
+# unpaid as Absent is -- the office's decision, 24 Oct 2026.
+LOSS_OF_PAY_STATUSES = ("Absent", "Off Day")
+
 # Create your models here.
 class Attendance(models.Model):
     STATUS_CHOICES = (
         ('Present', 'Present'),
         ('Absent', 'Absent'),
         ('Leave', 'Leave'),
+        # A day off the office marks, unpaid: a payslip counts it as loss of pay
+        # exactly as it counts Absent, but the register names it apart so a day
+        # off asked for is not read as a day somebody failed to turn up.
+        ('Off Day', 'Off Day'),
         ('Late', 'Late'),
         ('Overtime', 'Overtime'),
     )

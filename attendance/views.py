@@ -13,7 +13,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
 from . import absence
-from .models import Attendance, LeaveRequest
+from .models import Attendance, LeaveRequest, LOSS_OF_PAY_STATUSES
 from .serializer import AttendanceSerializer, LeaveRequestSerializer
 from employees.models import Employee
 from authentication.models import User, get_allowed_branches
@@ -1020,8 +1020,9 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         email and charges each engineer what Payroll would actually pay them:
 
           present_days   distinct days with a worked status (Present/Late/Overtime)
-          absent_days    distinct days marked Absent -- the only unpaid days, as on
-                         the payslip (a Leave row, and every Sunday, is paid)
+          absent_days    distinct days marked Absent or Off Day -- the only unpaid
+                         days, as on the payslip (a Leave row, and every Sunday,
+                         is paid)
           casual_leave_days  of those absences, what casual leave covers: one a
                          salary cycle once six months' service are done, exactly
                          as payslip generation applies it
@@ -1056,7 +1057,7 @@ class AttendanceViewSet(viewsets.ModelViewSet):
             day = timezone.localtime(intime).date()
             if status in self.WORKED_STATUSES:
                 bucket = present
-            elif status == "Absent":
+            elif status in LOSS_OF_PAY_STATUSES:
                 bucket = absent
             else:
                 bucket = leave

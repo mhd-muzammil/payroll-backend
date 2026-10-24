@@ -156,6 +156,46 @@ test("the final report says so when the 10am job has not marked somebody", () =>
   assert.match(text, /\*Not logged in, not marked Absent yet \(1\)\*\n• Karthik S\n/);
 });
 
+test("an Off Day is counted apart, never as present", () => {
+  const rows = [
+    { employee_name: "Lava kumar V", department: "General", status: "Present", intime: at("08:34") },
+    { employee_name: "Karthik S", department: "Service", status: "Absent", intime: at("00:00") },
+    { employee_name: "Divya P", department: "Service", status: "Off Day", intime: at("00:00"), outtime: null },
+  ];
+  const now = new Date("2026-10-10T04:35:00Z"); // 10:05 am in India
+
+  const message = buildMessage({ rows, branch: "Chennai", now });
+  assert.match(message, /\nPresent 1 · Absent 1 · Off Day 1 · On leave 0 · 3 records\n/);
+  assert.match(message, /\*Divya P\* — Off Day\nService · In — · Out — · Hours —\n/);
+
+  assert.equal(
+    buildFinalReport({ rows, branch: "Chennai", now }),
+    [
+      "*Renderways Technology*",
+      "Final Attendance · *Chennai branch*",
+      "Saturday, 10 October 2026",
+      "Present 1 · Absent 1 · Off Day 1 · On leave 0 · Total 3",
+      "",
+      "*Absent (1)*",
+      "• Karthik S",
+      "",
+      "*Off Day (1)*",
+      "• Divya P",
+      "",
+      "*Present (1)*",
+      "*Lava kumar V* — In 08:34 AM",
+      "",
+      "_Generated 10 Oct 2026, 10:05 am_",
+    ].join("\n"),
+  );
+});
+
+test("an Off Day marked at midnight is a date, not a Login", () => {
+  const mark = { employee_name: "Divya P", status: "Off Day", intime: at("00:00"), outtime: null };
+  assert.equal(punchTime(mark, "intime"), "—");
+  assert.deepEqual(notLoggedOut([mark]), []);
+});
+
 test("no line starts the way WhatsApp turns into a list", () => {
   // "1. ", "- ", "* " and "> " at the start of a line are formatting in the
   // WhatsApp message box. Typed, they change what the box holds -- "1. A"
