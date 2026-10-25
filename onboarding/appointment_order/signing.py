@@ -1,10 +1,11 @@
 """Sending an appointment order to be signed, and the signing itself.
 
 The employee gets a link by email. It opens the order on their phone with no
-login; to sign they draw a signature, tick that they agree, and type a code
-emailed to the same address -- that code is what shows it was them. The link
-is a long random token, kept on the order and replaced every time it is sent,
-and any change to the order kills it.
+login; to sign they draw a signature, tick that they agree, take a photo of
+themselves with the page's camera, and type a code emailed to the same
+address -- the code shows it was their email, the photo shows HR their face.
+The link is a long random token, kept on the order and replaced every time it
+is sent, and any change to the order kills it.
 """
 import base64
 import binascii
@@ -40,6 +41,7 @@ CODE_GAP = timedelta(seconds=60)
 MAX_CODE_SENDS = 10
 MAX_CODE_TRIES = 5
 MAX_SIGNATURE_BYTES = 300_000
+MAX_PHOTO_BYTES = 1_500_000
 
 
 class SigningError(Exception):
@@ -272,14 +274,42 @@ def clean_signature(data_url):
     return out.getvalue()
 
 
-def sign(order_id, code, signature, agreed, ip, user_agent):
-    """Sign the order with the drawn signature, if the code is right. Returns
-    the order. A wrong code is counted even though the call fails."""
+def clean_photo(data_url):
+    """The photo from the signing page's camera, saved afresh as a JPEG, so
+    nothing but the picture is kept. Refuses anything that is not a JPEG the
+    size a camera takes, and a frame that came out black or blank."""
+    from PIL import Image, ImageStat, UnidentifiedImageError
+
+    # A page from before the camera step sends no photo at all.
+    missing = "Take your photo with the camera before signing. If this page has no camera step, reload it."
+    match = re.fullmatch(r"data:image/jpeg;base64,([A-Za-z0-9+/=\s]+)", data_url or "")
+    if not match or len(match.group(1)) > MAX_PHOTO_BYTES * 4 // 3 + 4:
+        raise SigningError(missing)
+    try:
+        raw = base64.b64decode(match.group(1), validate=False)
+        image = Image.open(io.BytesIO(raw))
+        if image.format != "JPEG" or min(image.size) < 120 or max(image.size) > 2000:
+            raise SigningError(missing)
+        image = image.convert("RGB")
+    except (binascii.Error, UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError):
+        raise SigningError(missing)
+    if ImageStat.Stat(image.convert("L")).stddev[0] < 6:
+        raise SigningError("The photo came out dark or blank. Take it again, facing the camera in good light.")
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=85)
+    return out.getvalue()
+
+
+def sign(order_id, code, signature, photo, agreed, ip, user_agent):
+    """Sign the order with the drawn signature and the photo, if the code is
+    right. Returns the order. A wrong code is counted even though the call
+    fails; a missing photo or signature is refused before the code is tried."""
     from ..models import AppointmentOrder
 
     if agreed is not True:
         raise SigningError("Tick that you agree to the conditions stated in the Appointment Order.")
     png = clean_signature(signature)
+    jpeg = clean_photo(photo)
     code = re.sub(r"\D", "", str(code or ""))
 
     problem = None
@@ -309,6 +339,7 @@ def sign(order_id, code, signature, agreed, ip, user_agent):
             order.signed_at = now
             order.signer_ip = ip
             order.signer_user_agent = (user_agent or "")[:255]
+            order.signer_photo_sha256 = sha256(jpeg)
             record = [
                 ("Document", f"Appointment Order for {order.salutation} {order.name}, {order.designation}"),
                 ("Reference", f"AO-{order.pk}"),
@@ -318,13 +349,16 @@ def sign(order_id, code, signature, agreed, ip, user_agent):
                          "and typed in correctly."),
                 ("Agreed", f"Ticked: “{AGREEMENT}”"),
                 ("Signed", f"{_when(now)} (India time)"),
+                ("Photo", "Taken with the camera on the signing page when signing. It is below."),
                 ("IP address", ip or "-"),
                 ("Device", order.signer_user_agent or "-"),
                 ("Document SHA-256", [order.sent_pdf_sha256[:32], order.sent_pdf_sha256[32:]]),
+                ("Photo SHA-256", [order.signer_photo_sha256[:32], order.signer_photo_sha256[32:]]),
             ]
-            signed = sign_pdf(sent, png, now, record)
+            signed = sign_pdf(sent, png, now, record, photo=jpeg)
             stamp = secrets.token_hex(6)
             order.signature.save(f"order-{order.pk}-signature-{stamp}.png", ContentFile(png), save=False)
+            order.signer_photo.save(f"order-{order.pk}-photo-{stamp}.jpg", ContentFile(jpeg), save=False)
             order.signed_pdf.save(f"order-{order.pk}-signed-{stamp}.pdf", ContentFile(signed), save=False)
             order.signed_pdf_sha256 = sha256(signed)
             order.otp_hash = ""

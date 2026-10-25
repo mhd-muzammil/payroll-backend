@@ -529,12 +529,18 @@ def _when(moment):
     return local.strftime("%d-%m-%Y, %I:%M %p").replace(", 0", ", ")
 
 
-def sign_pdf(sent_pdf, signature_png, signed_at, record):
+# The photo on the record page fits in a square this big: about passport size.
+PHOTO_SIZE = 130.0
+
+
+def sign_pdf(sent_pdf, signature_png, signed_at, record, photo=None):
     """The PDF the employee was shown, with their signature where the print
     has it, the date beside "Date:", and a last page saying how it was signed.
 
-    record is the audit trail: a list of (label, value) lines. Pages 1-3 are
-    the bytes that were sent, untouched underneath; only ink is laid on top.
+    record is the audit trail: a list of (label, value) lines; photo, the JPEG
+    the signing page's camera took, goes under the signature on that page.
+    Pages 1-3 are the bytes that were sent, untouched underneath; only ink is
+    laid on top.
     """
     from django.utils import timezone
     from pypdf import PdfReader, PdfWriter
@@ -585,6 +591,11 @@ def sign_pdf(sent_pdf, signature_png, signed_at, record):
     _draw(page, [("Signature drawn", True, False)], LEFT, y + 10, 10.5)
     page.drawImage(image, value_x, PAGE_H - (y + 52), 160, 50, mask="auto",
                    preserveAspectRatio=True, anchor="sw")
+    if photo:
+        top = y + 68
+        _draw(page, [("Photo taken", True, False)], LEFT, top + 8, 10.5)
+        page.drawImage(ImageReader(io.BytesIO(photo)), value_x, PAGE_H - (top + PHOTO_SIZE),
+                       PHOTO_SIZE, PHOTO_SIZE, preserveAspectRatio=True, anchor="nw")
     page.showPage()
     page.save()
     audit_page = PdfReader(io.BytesIO(_on_letterhead(audit.getvalue(), "Signature record"))).pages[0]

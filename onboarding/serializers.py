@@ -329,6 +329,7 @@ class AppointmentOrderSerializer(serializers.ModelSerializer):
     ctc = serializers.SerializerMethodField()
     offer_ref = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
+    has_photo = serializers.SerializerMethodField()
 
     class Meta:
         model = AppointmentOrder
@@ -336,7 +337,7 @@ class AppointmentOrderSerializer(serializers.ModelSerializer):
             "id", "offer_letter", "offer_ref", "salutation", "name", "address", "designation",
             "order_date", "joining_date",
             "basic", "hra", "conveyance", "cea", "personal_allowance", "professional_tax",
-            "email", "status", "sent_at", "viewed_at", "signed_at",
+            "email", "status", "sent_at", "viewed_at", "signed_at", "has_photo",
             "gross", "net", "ctc", "created_by_name", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "sent_at", "viewed_at", "signed_at", "created_at", "updated_at"]
@@ -361,6 +362,9 @@ class AppointmentOrderSerializer(serializers.ModelSerializer):
     def get_created_by_name(self, obj):
         user = obj.created_by
         return (user.get_full_name() or user.username) if user else ""
+
+    def get_has_photo(self, obj):
+        return bool(obj.signer_photo)
 
     def _text(self, value, field):
         value = _CONTROL.sub("", value or "").strip()

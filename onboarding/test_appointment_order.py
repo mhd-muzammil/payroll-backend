@@ -7,6 +7,7 @@ the person the link was emailed to can sign, only the words that were sent,
 and once signed the order cannot change.
 """
 import base64
+import hashlib
 import io
 import re
 import shutil
@@ -49,6 +50,20 @@ def signature(width=600, height=200, strokes=True):
     out = io.BytesIO()
     image.save(out, format="PNG")
     return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode()
+
+
+def photo(width=480, height=640, blank=False, kind="JPEG"):
+    """A camera frame as the signing page sends it: a face-ish oval on a
+    background, or one flat colour, as a black frame from a stuck camera is."""
+    image = Image.new("RGB", (width, height), (12, 12, 12) if blank else (190, 200, 210))
+    if not blank:
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((width // 4, height // 5, width * 3 // 4, height * 3 // 5), fill=(205, 160, 130))
+        draw.rectangle((width // 6, height * 2 // 3, width * 5 // 6, height), fill=(40, 60, 110))
+    out = io.BytesIO()
+    image.save(out, format=kind)
+    mime = "jpeg" if kind == "JPEG" else kind.lower()
+    return f"data:image/{mime};base64," + base64.b64encode(out.getvalue()).decode()
 
 
 class TheLetterTests(TestCase):
@@ -133,7 +148,7 @@ class _Office(TestCase):
         return re.search(r"code to sign your Appointment Order is: (\d{6})", mail.outbox[-1].body).group(1)
 
     def _sign(self, token, code, headers=None, **changes):
-        body = {"code": code, "signature": signature(), "agree": True, **changes}
+        body = {"code": code, "signature": signature(), "photo": photo(), "agree": True, **changes}
         return self.public.post(f"/api/appointment/{token}/sign/", body, format="json", **(headers or {}))
 
 
@@ -248,6 +263,27 @@ class SigningTests(_Office):
         self.assertEqual(self._sign(token, code, signature="data:image/png;base64,AAAA").status_code, 400)
         self.assertEqual(self._sign(token, code, signature="https://example.com/x.png").status_code, 400)
 
+    def test_a_photo_must_be_taken(self):
+        order_id, token = self._sent()
+        code = self._code(token)
+        missing = self._sign(token, code, photo=None)
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn("Take your photo", missing.data["detail"])
+        for wrong in (
+            "", "data:image/jpeg;base64,AAAA", "https://example.com/me.jpg",
+            photo(kind="PNG"),  # the page only ever sends a JPEG
+            photo(width=80, height=80),  # no camera takes a picture this small
+        ):
+            self.assertEqual(self._sign(token, code, photo=wrong).status_code, 400)
+        dark = self._sign(token, code, photo=photo(blank=True))
+        self.assertEqual(dark.status_code, 400)
+        self.assertIn("dark or blank", dark.data["detail"])
+        # None of that used up a try of the code: it still signs.
+        order = AppointmentOrder.objects.get(pk=order_id)
+        self.assertEqual(order.otp_attempts, 0)
+        self.assertIsNone(order.signed_at)
+        self.assertEqual(self._sign(token, code).status_code, 200)
+
     def test_signing(self):
         order_id, token = self._sent()
         self.public.get(f"/api/appointment/{token}/")
@@ -267,6 +303,15 @@ class SigningTests(_Office):
         self.assertIn(order.sent_pdf_sha256[:32], record)
         self.assertIn("tharun@example.com", record)
         self.assertIn("Android 14", record)
+        # The photo is kept as a JPEG of its own, named by its hash on the
+        # record page, and drawn there beside the signature.
+        with order.signer_photo.open("rb") as fh:
+            kept = fh.read()
+        self.assertEqual(Image.open(io.BytesIO(kept)).format, "JPEG")
+        self.assertEqual(order.signer_photo_sha256, hashlib.sha256(kept).hexdigest())
+        self.assertIn("Photo taken", record)
+        self.assertIn(order.signer_photo_sha256[:32], record)
+        self.assertIn((480, 640), [image.image.size for image in reader.pages[3].images])
         # The letter underneath is the one that was sent; page 2 gains the date.
         with order.sent_pdf.open("rb") as fh:
             sent = PdfReader(io.BytesIO(fh.read()))
@@ -297,6 +342,28 @@ class SigningTests(_Office):
         self.assertEqual(response.status_code, 200)
         self.assertIn("-signed.pdf", response["Content-Disposition"])
         self.assertEqual(len(PdfReader(io.BytesIO(response.content)).pages), 4)
+
+    def test_the_office_sees_the_photo(self):
+        order_id, token = self._sent()
+        url = f"/api/appointment-orders/{order_id}/photo/"
+        self.assertFalse(self.office.get(f"/api/appointment-orders/{order_id}/").data["has_photo"])
+        self.assertEqual(self.office.get(url).status_code, 404)
+        self._sign(token, self._code(token))
+        self.assertTrue(self.office.get(f"/api/appointment-orders/{order_id}/").data["has_photo"])
+        response = self.office.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "image/jpeg")
+        self.assertEqual(response["Cache-Control"], "no-store")
+        order = AppointmentOrder.objects.get(pk=order_id)
+        with order.signer_photo.open("rb") as fh:
+            self.assertEqual(response.content, fh.read())
+        # Nobody else: not without a login, not an employee, not the link.
+        self.assertEqual(APIClient().get(url).status_code, 401)
+        employee = User.objects.create_user(username="emp-photo", password="x", role="employee")
+        client = APIClient()
+        client.force_authenticate(employee)
+        self.assertEqual(client.get(url).status_code, 403)
+        self.assertNotIn("photo", self.public.get(f"/api/appointment/{token}/").data)
 
     def test_a_failed_email_does_not_undo_the_signing(self):
         order_id, token = self._sent()

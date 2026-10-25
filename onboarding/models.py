@@ -381,10 +381,11 @@ class AppointmentOrder(models.Model):
     onboarding/appointment_order), signed by the employee online.
 
     Send makes a link (sign_token) and keeps the exact PDF it points at
-    (sent_pdf). The employee reads it, draws a signature and types a code
-    emailed to them; the signed copy is that same PDF with the signature laid
-    on it and a last page saying how it was signed. Changing anything after
-    sending kills the link, so nobody signs words that have since changed.
+    (sent_pdf). The employee reads it, draws a signature, takes a photo of
+    themselves with the page's camera and types a code emailed to them; the
+    signed copy is that same PDF with the signature laid on it and a last page
+    saying how it was signed, photo included. Changing anything after sending
+    kills the link, so nobody signs words that have since changed.
     """
 
     SALUTATION_CHOICES = (("MR.", "MR."), ("MS.", "MS."))
@@ -430,6 +431,10 @@ class AppointmentOrder(models.Model):
     signer_ip = models.GenericIPAddressField(null=True, blank=True)
     signer_user_agent = models.CharField(max_length=255, blank=True, default="")
     signature = models.FileField(upload_to="hiring/appointment_orders/", blank=True)
+    # Taken by the signing page's camera as they signed, so HR can see who it
+    # was. Orders signed before the camera step have none.
+    signer_photo = models.FileField(upload_to="hiring/appointment_orders/", blank=True)
+    signer_photo_sha256 = models.CharField(max_length=64, blank=True, default="")
     signed_pdf = models.FileField(upload_to="hiring/appointment_orders/", blank=True)
     signed_pdf_sha256 = models.CharField(max_length=64, blank=True, default="")
 

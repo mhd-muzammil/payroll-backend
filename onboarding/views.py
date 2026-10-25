@@ -619,6 +619,21 @@ class AppointmentOrderViewSet(viewsets.ModelViewSet):
             return Response({"detail": f"Could not build the PDF: {exc}"}, status=500)
         return _pdf_response(pdf_bytes, appointment_order_filename(order))
 
+    @action(detail=True, methods=["get"], url_path="photo")
+    def photo(self, request, pk=None):
+        """The photo the employee took when signing, for HR to see who signed.
+        Fetched with the login like the list, so no ticket is needed."""
+        from django.http import HttpResponse
+
+        order = self.get_object()
+        if not order.signer_photo:
+            return Response({"detail": "This order has no photo."}, status=404)
+        with order.signer_photo.open("rb") as fh:
+            response = HttpResponse(fh.read(), content_type="image/jpeg")
+        response["Cache-Control"] = "no-store"
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+
 
 class _PublicAppointmentOrder(APIView):
     """The employee's end of an appointment order: no login, the token in the
@@ -678,6 +693,7 @@ class PublicAppointmentOrderSignView(_PublicAppointmentOrder):
                 order.pk,
                 request.data.get("code"),
                 request.data.get("signature"),
+                request.data.get("photo"),
                 request.data.get("agree"),
                 client_ip(request),
                 request.META.get("HTTP_USER_AGENT", ""),
