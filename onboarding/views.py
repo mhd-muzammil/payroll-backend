@@ -15,7 +15,15 @@ from rest_framework.response import Response
 
 from authentication.permissions import IsHRStaff
 from .candidate_import import build_candidates, UnreadableUpload
-from .models import AppointmentOrder, Onboarding, OnboardingInvite, Candidate, OfferLetter, new_invite_token
+from .models import (
+    AppointmentOrder,
+    Candidate,
+    OfferLetter,
+    OfferLetterMail,
+    Onboarding,
+    OnboardingInvite,
+    new_invite_token,
+)
 from .serializers import (
     DOCUMENT_FIELDS,
     AppointmentOrderSerializer,
@@ -305,7 +313,7 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
     """Offer letters made in the Hiring Portal. HR only, like the candidates they
     are written for: a letter states somebody's pay."""
 
-    queryset = OfferLetter.objects.select_related("created_by").all()
+    queryset = OfferLetter.objects.select_related("created_by", "response_user", "reply_mail").all()
     serializer_class = OfferLetterSerializer
     permission_classes = [IsAuthenticated, IsHRStaff]
 
@@ -398,7 +406,12 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
         from .offer_letter.email import offer_mail
 
         letter = self.get_object()
-        subject, html, _ = offer_mail(self._dear(request.query_params.get("dear")) or letter.name, letter.designation)
+        # The buttons are shown but lead nowhere here: HR must not be able to
+        # answer for the candidate by clicking the preview.
+        subject, html, _ = offer_mail(
+            self._dear(request.query_params.get("dear")) or letter.name, letter.designation,
+            accept_url="#accept", decline_url="#decline",
+        )
         return Response({"subject": subject, "html": html, "attachment": offer_letter_filename(letter)})
 
     @action(detail=True, methods=["post"], url_path="send_mail")
@@ -409,6 +422,7 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
         from hrmail import outbound
         from hrmail.mailparse import check_compose
 
+        from .appointment_order.signing import SigningError, link_base
         from .offer_letter import offer_letter_filename, render_offer_letter_pdf
         from .offer_letter.email import offer_mail
 
@@ -416,7 +430,19 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
         dear = self._dear(request.data.get("dear"))
         if not dear:
             return Response({"detail": "Type the name that goes after “Dear”."}, status=400)
-        subject, html, text = offer_mail(dear, letter.designation)
+        # The Accept / Decline buttons lead to the site HR is sending from, as
+        # an appointment order's signing link does.
+        try:
+            base = link_base(request.data.get("origin"))
+        except SigningError as exc:
+            return Response({"detail": exc.message}, status=exc.status)
+        if not letter.response_token:
+            letter.response_token = new_invite_token()
+            letter.save(update_fields=["response_token", "updated_at"])
+        answer = f"{base}/offer/{letter.response_token}"
+        subject, html, text = offer_mail(
+            dear, letter.designation, accept_url=f"{answer}?answer=accept", decline_url=f"{answer}?answer=decline",
+        )
         error, to, cc = check_compose(request.data.get("to"), request.data.get("cc"), subject, text)
         if error:
             return Response({"detail": error}, status=400)
@@ -440,7 +466,29 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
             record(str(exc))
             return Response({"detail": str(exc)}, status=502)
         record()
+        # Kept by its Message-ID, so the candidate's reply finds this letter.
+        OfferLetterMail.objects.create(offer_letter=letter, message_id=sent.message_id, sent_to=", ".join(to + cc))
+        letter.mailed_at, letter.mailed_to = timezone.now(), ", ".join(to)[:500]
+        letter.save(update_fields=["mailed_at", "mailed_to", "updated_at"])
         return Response({"sent_to": to, "cc": cc, "filed_in_sent": sent.filed_in_sent})
+
+    @action(detail=True, methods=["post"], url_path="response")
+    def set_response(self, request, pk=None):
+        """HR records the answer: after reading the candidate's reply, or to
+        change one. ACCEPTED, DECLINED, or "" to clear it."""
+        letter = self.get_object()
+        response = str(request.data.get("response") or "").upper()
+        if response not in ("ACCEPTED", "DECLINED", ""):
+            return Response({"detail": "The answer must be ACCEPTED, DECLINED or empty."}, status=400)
+        letter.response = response
+        letter.response_at = timezone.now() if response else None
+        letter.response_source = "HR" if response else ""
+        letter.response_user = request.user if response else None
+        letter.response_ip = None
+        letter.save(update_fields=[
+            "response", "response_at", "response_source", "response_user", "response_ip", "updated_at",
+        ])
+        return Response(self.get_serializer(letter).data)
 
 
 def _pdf_response(pdf_bytes, filename):
@@ -637,3 +685,58 @@ class PublicAppointmentOrderSignView(_PublicAppointmentOrder):
         except SigningError as exc:
             return _signing_error(exc)
         return Response({"signed": True, "signed_at": order.signed_at, "emailed": email_signed_copy(order)})
+
+
+class _PublicOffer(APIView):
+    """The candidate's end of an offer mail: the Accept / Decline buttons. No
+    login, the token in the link stands in for one; an unknown token is a 404.
+    Opening the page changes nothing -- mail scanners open every link in a
+    mail -- only the confirm on the page records an answer."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "offer_response"
+
+    def _letter(self, token):
+        letter = OfferLetter.objects.filter(response_token=token).first() if token else None
+        if letter is None:
+            raise Http404
+        return letter
+
+    @staticmethod
+    def _view(letter):
+        return {
+            "name": letter.name,
+            "designation": letter.designation,
+            "joining_date": letter.joining_date,
+            "response": letter.response,
+            "response_at": letter.response_at,
+        }
+
+
+class PublicOfferView(_PublicOffer):
+    def get(self, request, token):
+        return Response(self._view(self._letter(token)))
+
+
+class PublicOfferRespondView(_PublicOffer):
+    def post(self, request, token):
+        from .appointment_order.signing import client_ip
+
+        letter = self._letter(token)
+        answer = str(request.data.get("answer") or "").lower()
+        if answer not in ("accept", "decline"):
+            return Response({"detail": "Choose Accept or Decline."}, status=400)
+        # The first answer stands; changing it is for HR, who will have heard why.
+        updated = OfferLetter.objects.filter(pk=letter.pk, response="").update(
+            response="ACCEPTED" if answer == "accept" else "DECLINED",
+            response_at=timezone.now(),
+            response_source="LINK",
+            response_user=None,
+            response_ip=client_ip(request),
+        )
+        letter.refresh_from_db()
+        if not updated:
+            return Response({**self._view(letter), "detail": "Your answer has already been recorded."}, status=409)
+        return Response(self._view(letter))

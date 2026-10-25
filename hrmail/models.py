@@ -40,6 +40,7 @@ class InboundMail(models.Model):
     uid_validity = models.BigIntegerField()
     uid = models.BigIntegerField()
     message_id = models.CharField(max_length=255, blank=True, default="", db_index=True)
+    in_reply_to = models.CharField(max_length=255, blank=True, default="")
     references = models.TextField(blank=True, default="")
     from_email = models.CharField(max_length=254, blank=True, default="")
     from_name = models.CharField(max_length=200, blank=True, default="")

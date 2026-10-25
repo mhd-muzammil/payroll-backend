@@ -10,6 +10,8 @@ from .views import (
     PublicAppointmentOrderPdfView,
     PublicAppointmentOrderSignView,
     PublicAppointmentOrderView,
+    PublicOfferRespondView,
+    PublicOfferView,
     PublicOnboardingView,
 )
 
@@ -30,5 +32,8 @@ urlpatterns = [
     path('appointment/<str:token>/pdf/', PublicAppointmentOrderPdfView.as_view(), name='public-appointment-pdf'),
     path('appointment/<str:token>/code/', PublicAppointmentOrderCodeView.as_view(), name='public-appointment-code'),
     path('appointment/<str:token>/sign/', PublicAppointmentOrderSignView.as_view(), name='public-appointment-sign'),
+    # The candidate answering an offer mail (Accept / Decline).
+    path('offer/<str:token>/', PublicOfferView.as_view(), name='public-offer'),
+    path('offer/<str:token>/respond/', PublicOfferRespondView.as_view(), name='public-offer-respond'),
     path('', include(router.urls)),
 ]

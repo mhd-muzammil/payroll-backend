@@ -259,6 +259,7 @@ def parse_message(raw):
         "headers": headers,
         "message_id": _header(message, "Message-ID").strip()[:255],
         "references": _header(message, "References").strip(),
+        "in_reply_to": _header(message, "In-Reply-To").strip()[:255],
         "from_email": (from_email or "").strip().lower()[:254],
         "from_name": (from_name or "").strip()[:200],
         "to_text": _addresses(message, "To"),

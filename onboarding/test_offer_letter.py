@@ -10,6 +10,7 @@ from datetime import date
 from unittest import mock
 
 from django.core import mail
+from django.core.cache import cache
 from django.test import TestCase, override_settings
 from pypdf import PdfReader
 from rest_framework.test import APIClient
@@ -17,7 +18,7 @@ from rest_framework.test import APIClient
 from authentication.models import User
 from hrmail.models import OutboundMail, SystemMail
 
-from .models import OfferLetter
+from .models import OfferLetter, OfferLetterMail
 from .offer_letter import TEMPLATE, annexure, field_texts, indian, offer_letter_filename, render_offer_letter_pdf
 
 # The sample letter HR gave: Kumar V, Service engineer, joining 31.08.2026.
@@ -197,7 +198,10 @@ class OfferLetterApiTests(TestCase):
         self.assertEqual(engineer.get(f"/api/offer-letters/{letter_id}/pdf_ticket/").status_code, 403)
 
 
-@override_settings(EMAIL_HOST_USER="hr@renderways.in", EMAIL_HOST_PASSWORD="test-only-not-a-real-password")
+@override_settings(
+    EMAIL_HOST_USER="hr@renderways.in", EMAIL_HOST_PASSWORD="test-only-not-a-real-password",
+    CORS_ALLOWED_ORIGINS=["https://payroll.systimus.in"],
+)
 class OfferLetterMailTests(TestCase):
     """The letter goes out in HR's own offer mail (the one HR sent on 17 June
     2026), with the PDF attached, and is kept in the Sent folder and the Mail
@@ -215,7 +219,8 @@ class OfferLetterMailTests(TestCase):
     def _send(self, **body):
         return self.client.post(
             f"/api/offer-letters/{self.letter.id}/send_mail/",
-            {"to": "vaseem@example.com", "cc": "Dinesh <dinesh@renderways.in>", "dear": "Vaseem", **body},
+            {"to": "vaseem@example.com", "cc": "Dinesh <dinesh@renderways.in>", "dear": "Vaseem",
+             "origin": "https://payroll.systimus.in", **body},
             format="json",
         )
 
@@ -249,6 +254,22 @@ class OfferLetterMailTests(TestCase):
         self.assertEqual((logged.kind, logged.about, logged.cc_text), ("offer_letter", "Mohamed vaseem M A", "dinesh@renderways.in"))
         self.assertIn(">Vaseem</b>", logged.body_html)
         self.assertEqual(logged.attachments.get().filename, "Offer-Letter-Mohamed-vaseem-M-A.pdf")
+        # Accept / Decline lead to the candidate's page for this letter.
+        self.letter.refresh_from_db()
+        token = self.letter.response_token
+        self.assertTrue(token)
+        self.assertIn(f'href="https://payroll.systimus.in/offer/{token}?answer=accept"', html)
+        self.assertIn(f"Accept the offer: https://payroll.systimus.in/offer/{token}?answer=accept", sent.body)
+        self.assertEqual(self.letter.mailed_to, "vaseem@example.com")
+        self.assertIsNotNone(self.letter.mailed_at)
+        self.assertEqual(self.letter.mails.get().message_id, record.message_id)
+
+    def test_the_preview_buttons_lead_nowhere(self):
+        html = self.client.get(f"/api/offer-letters/{self.letter.id}/mail_preview/").data["html"]
+        self.assertIn('href="#accept"', html)
+        self.assertIn("Accept Offer", html)
+        self.letter.refresh_from_db()
+        self.assertIsNone(self.letter.response_token, "previewing makes no link")
 
     def test_a_name_is_never_read_as_markup(self):
         data = self.client.get(f"/api/offer-letters/{self.letter.id}/mail_preview/", {"dear": "<script>x</script>"}).data
@@ -272,3 +293,84 @@ class OfferLetterMailTests(TestCase):
         response = self._send()
         self.assertEqual(response.status_code, 502)
         self.assertIn("not set up", response.data["detail"])
+
+
+class OfferResponseTests(TestCase):
+    """The candidate's answer: from the buttons in the mail, from HR after a
+    reply, and the reply itself found against its letter."""
+
+    def setUp(self):
+        cache.clear()  # the candidate's page is rate limited in the cache
+        self.hr = User.objects.create_user(username="hr-offer-answer", password="x", role="hr", first_name="Hema")
+        self.client = APIClient()
+        self.client.force_authenticate(self.hr)
+        self.letter = OfferLetter.objects.create(**{**KUMAR, "response_token": "tok-kumar"})
+        self.public = APIClient()
+
+    def _row(self):
+        return next(r for r in self.client.get("/api/offer-letters/").data if r["id"] == self.letter.id)
+
+    def test_opening_the_link_records_nothing(self):
+        data = self.public.get("/api/offer/tok-kumar/").data
+        self.assertEqual((data["name"], data["designation"], data["response"]), ("Kumar V", "Service engineer", ""))
+        self.letter.refresh_from_db()
+        self.assertEqual(self.letter.response, "", "mail scanners open links; only the confirm counts")
+        self.assertEqual(self.public.get("/api/offer/not-a-token/").status_code, 404)
+
+    def test_the_candidate_accepts_once(self):
+        response = self.public.post("/api/offer/tok-kumar/respond/", {"answer": "accept"}, format="json",
+                                    REMOTE_ADDR="49.37.1.2")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["response"], "ACCEPTED")
+        again = self.public.post("/api/offer/tok-kumar/respond/", {"answer": "decline"}, format="json")
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual(again.data["response"], "ACCEPTED")
+        self.letter.refresh_from_db()
+        self.assertEqual((self.letter.response_source, self.letter.response_ip), ("LINK", "49.37.1.2"))
+        row = self._row()
+        self.assertEqual((row["response"], row["response_by"]), ("ACCEPTED", "Candidate"))
+        self.assertEqual(self.public.post("/api/offer/tok-kumar/respond/", {"answer": "maybe"}, format="json").status_code, 400)
+
+    def test_hr_marks_and_clears_the_answer(self):
+        data = self.client.post(f"/api/offer-letters/{self.letter.id}/response/", {"response": "DECLINED"}, format="json").data
+        self.assertEqual((data["response"], data["response_by"]), ("DECLINED", "Hema"))
+        data = self.client.post(f"/api/offer-letters/{self.letter.id}/response/", {"response": ""}, format="json").data
+        self.assertEqual((data["response"], data["response_at"]), ("", None))
+        engineer = APIClient()
+        engineer.force_authenticate(User.objects.create_user(username="eng-answer", password="x", role="employee"))
+        self.assertEqual(
+            engineer.post(f"/api/offer-letters/{self.letter.id}/response/", {"response": "ACCEPTED"}, format="json").status_code,
+            403,
+        )
+        # Editing the letter cannot set an answer.
+        body = {**KUMAR, "joining_date": "2026-08-31", "response": "ACCEPTED"}
+        self.assertEqual(self.client.put(f"/api/offer-letters/{self.letter.id}/", body, format="json").status_code, 200)
+        self.letter.refresh_from_db()
+        self.assertEqual(self.letter.response, "")
+
+    def _reply(self, **fields):
+        from django.utils import timezone
+
+        from hrmail.models import InboundMail
+
+        defaults = dict(
+            mailbox="hr@renderways.in", uid_validity=1, uid=InboundMail.objects.count() + 1,
+            from_email="kumar@example.com", subject="Re: Offer Letter", received_at=timezone.now(),
+            preview="I accept the offer. Thank you.",
+        )
+        return InboundMail.objects.create(**{**defaults, **fields})
+
+    def test_a_reply_is_found_by_its_thread(self):
+        OfferLetterMail.objects.create(offer_letter=self.letter, message_id="offer-1@renderways.in", sent_to="kumar@example.com")
+        reply = self._reply(from_email="someone-else@example.com", subject="Thanks",
+                            in_reply_to="<offer-1@renderways.in>")
+        row = self._row()
+        self.assertEqual(row["reply"]["id"], reply.id)
+        self.assertEqual(row["reply"]["preview"], "I accept the offer. Thank you.")
+
+    def test_a_reply_without_its_thread_is_found_by_sender_and_subject(self):
+        OfferLetterMail.objects.create(offer_letter=self.letter, message_id="offer-2@renderways.in", sent_to="kumar@example.com")
+        self._reply(subject="Unrelated", from_email="kumar@example.com")
+        self.assertIsNone(self._row()["reply"], "a mail that is not a reply to the offer is not one")
+        reply = self._reply()
+        self.assertEqual(self._row()["reply"]["id"], reply.id)

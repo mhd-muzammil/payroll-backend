@@ -176,6 +176,12 @@ class SanitizerTests(TestCase):
         self.assertIn("20 MB", check_compose("a@x.com", "", "Hi", "Body", 21 * 1024 * 1024)[0])
         self.assertIsNone(check_compose("a@x.com", "b@y.com", "Hi", "Body")[0])
 
+    def test_a_reply_names_the_mail_it_answers(self):
+        parsed = parse_message(raw_mail(headers={"In-Reply-To": "<offer-1@renderways.in>",
+                                                 "References": "<a@x> <offer-1@renderways.in>"}))
+        self.assertEqual(parsed["in_reply_to"], "<offer-1@renderways.in>")
+        self.assertIn("<offer-1@renderways.in>", parsed["references"])
+
     def test_a_mail_is_read_with_its_parts(self):
         parsed = parse_message(raw_mail(
             html='<p>Hello <img src="cid:logo1"></p><script>x()</script>', inline_logo=True,

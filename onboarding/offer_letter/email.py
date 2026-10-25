@@ -44,9 +44,24 @@ PHONES = "+91 9087019170 | +91 95430 95480"
 ADDRESS_LINES = ("#25, 1st Floor, Gandhi Street,", "Mettukuppam, Maduravoyal,", "Chennai 600 095.")
 
 
-def offer_mail(dear, designation):
-    """(subject, html, text) of the mail, for this name and role."""
+def _buttons(accept_url, decline_url):
+    """Accept / Decline, under HR's request to confirm -- a second way to
+    answer beside replying. Built from a table, which is how a button stays a
+    button in Gmail and Outlook."""
+    return f"""<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:4px 0 14px">
+<tr>
+<td style="background:#16A34A;border-radius:6px"><a href="{escape(accept_url)}" style="display:inline-block;padding:10px 24px;font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:bold;color:#FFFFFF;text-decoration:none">Accept Offer</a></td>
+<td style="width:12px">&nbsp;</td>
+<td style="border:1px solid #9CA3AF;border-radius:6px"><a href="{escape(decline_url)}" style="display:inline-block;padding:9px 22px;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#374151;text-decoration:none">Decline</a></td>
+</tr>
+</table>"""
+
+
+def offer_mail(dear, designation, accept_url=None, decline_url=None):
+    """(subject, html, text) of the mail, for this name and role. With the two
+    links, the mail carries Accept / Decline buttons as well."""
     dear_html, designation_html = escape(dear), escape(designation)
+    buttons = _buttons(accept_url, decline_url) if accept_url and decline_url else ""
     serif_line = f'<p style="margin:0 0 8px;font-family:{SERIF};font-size:15px;color:#000000">'
     products = " | ".join(
         f'<span style="color:{PINK}">{escape(name)}</span>' if pink else escape(name)
@@ -58,7 +73,7 @@ def offer_mail(dear, designation):
 <br><br>
 <p style="margin:0 0 12px">We feel confident that you will contribute your skill and experience to the growth of our organization.</p>
 <p style="margin:0 0 12px">Please confirm your acceptance of this offer letter by replying to this mail.</p>
-<p style="margin:0">We look forward to welcoming you on board</p>
+{buttons}<p style="margin:0">We look forward to welcoming you on board</p>
 <br><br>
 {"".join(f"{serif_line}{escape(line)}</p>" for line in SIGNATURE_LINES)}
 {serif_line}&#128242; {PHONES}</p>
@@ -80,6 +95,7 @@ def offer_mail(dear, designation):
         "We feel confident that you will contribute your skill and experience to the growth of our organization.",
         "",
         "Please confirm your acceptance of this offer letter by replying to this mail.",
+        *([f"Accept the offer: {accept_url}", f"Decline: {decline_url}"] if buttons else []),
         "",
         "We look forward to welcoming you on board",
         "",

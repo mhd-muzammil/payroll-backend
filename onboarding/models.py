@@ -333,11 +333,47 @@ class OfferLetter(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # The candidate's answer. It comes three ways: the Accept / Decline buttons
+    # in the offer mail (response_source LINK), HR marking it after reading the
+    # candidate's reply (HR), or HR changing either.
+    RESPONSE_CHOICES = (("ACCEPTED", "Accepted"), ("DECLINED", "Declined"))
+    response_token = models.CharField(max_length=64, unique=True, null=True, blank=True)
+    response = models.CharField(max_length=10, choices=RESPONSE_CHOICES, blank=True, default="")
+    response_at = models.DateTimeField(null=True, blank=True)
+    response_source = models.CharField(max_length=10, blank=True, default="")
+    response_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    response_ip = models.GenericIPAddressField(null=True, blank=True)
+    mailed_at = models.DateTimeField(null=True, blank=True)
+    mailed_to = models.CharField(max_length=500, blank=True, default="")
+    # The latest reply to the offer mail that arrived in the HR mailbox.
+    replied_at = models.DateTimeField(null=True, blank=True)
+    reply_mail = models.ForeignKey(
+        "hrmail.InboundMail", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
     class Meta:
         ordering = ["-created_at", "-id"]
 
     def __str__(self):
         return f"{self.ref_no} {self.name}"
+
+
+class OfferLetterMail(models.Model):
+    """One offer mail that went out, by its Message-ID: a reply names it in
+    In-Reply-To / References, which is how the reply finds its letter."""
+
+    offer_letter = models.ForeignKey(OfferLetter, on_delete=models.CASCADE, related_name="mails")
+    message_id = models.CharField(max_length=255, db_index=True)
+    sent_to = models.TextField(blank=True, default="")
+    sent_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-sent_at", "-id"]
+
+    def __str__(self):
+        return f"{self.offer_letter} -> {self.sent_to}"
 
 
 class AppointmentOrder(models.Model):
@@ -556,6 +592,39 @@ def _employee_status_for(employment_status):
     if employment_status == 'Relieved':
         return 'relieved'
     return 'inactive'
+
+
+def _message_ids(*headers):
+    """The Message-IDs named in In-Reply-To / References headers, bare."""
+    ids = []
+    for header in headers:
+        for token in str(header or "").replace(",", " ").split():
+            token = token.strip().strip("<>")
+            if token:
+                ids.append(token)
+    return ids
+
+
+@receiver(post_save, sender="hrmail.InboundMail")
+def match_offer_reply(sender, instance, created, **kwargs):
+    """A mail just arrived in the HR mailbox: if it answers an offer mail, the
+    letter shows it. Matched by the offer mail's Message-ID; failing that, a
+    "Re: Offer Letter" from an address an offer went to."""
+    if not created:
+        return
+    try:
+        ids = _message_ids(instance.in_reply_to, instance.references)
+        hit = OfferLetterMail.objects.filter(message_id__in=ids).first() if ids else None
+        subject = (instance.subject or "").strip().lower()
+        if hit is None and instance.from_email and subject.startswith("re:") and "offer letter" in subject:
+            hit = OfferLetterMail.objects.filter(sent_to__icontains=instance.from_email).first()
+        if hit is None:
+            return
+        OfferLetter.objects.filter(pk=hit.offer_letter_id).exclude(
+            replied_at__gt=instance.received_at
+        ).update(replied_at=instance.received_at, reply_mail=instance)
+    except Exception:  # noqa: BLE001 - a mail must never fail to arrive because of this
+        logger.exception("could not match mail %s to an offer letter", instance.pk)
 
 
 @receiver(post_save, sender=Onboarding)

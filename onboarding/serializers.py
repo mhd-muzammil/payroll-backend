@@ -229,6 +229,8 @@ class OfferLetterSerializer(serializers.ModelSerializer):
     net = serializers.SerializerMethodField()
     ctc = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
+    response_by = serializers.SerializerMethodField()
+    reply = serializers.SerializerMethodField()
 
     class Meta:
         model = OfferLetter
@@ -237,8 +239,27 @@ class OfferLetterSerializer(serializers.ModelSerializer):
             "basic", "hra", "conveyance", "cea", "personal_allowance",
             "professional_tax", "insurance", "petrol_allowance",
             "gross", "net", "ctc", "created_by_name", "created_at", "updated_at",
+            "mailed_at", "mailed_to", "response", "response_at", "response_source", "response_by",
+            "replied_at", "reply",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        # The answer and the mailing are the server's to record: HR changes the
+        # answer through the response action, never by editing the letter.
+        read_only_fields = [
+            "id", "created_at", "updated_at", "mailed_at", "mailed_to",
+            "response", "response_at", "response_source", "replied_at",
+        ]
+
+    def get_response_by(self, obj):
+        if obj.response_source == "LINK":
+            return "Candidate"
+        user = obj.response_user
+        return (user.get_full_name() or user.username) if user else ""
+
+    def get_reply(self, obj):
+        mail = obj.reply_mail
+        if mail is None:
+            return None
+        return {"id": mail.id, "from_email": mail.from_email, "received_at": mail.received_at, "preview": mail.preview}
 
     def _sums(self, obj):
         from .offer_letter import annexure

@@ -199,6 +199,7 @@ def _store(state, validity, uid, raw, arrived):
                 uid=uid,
                 message_id=parsed["message_id"],
                 references=parsed["references"],
+                in_reply_to=parsed["in_reply_to"],
                 from_email=parsed["from_email"],
                 from_name=parsed["from_name"],
                 to_text=parsed["to_text"],
