@@ -31,6 +31,7 @@ urlpatterns = [
     path('api/', include('cases.urls')),
     path('api/', include('fieldez_km.urls')),
     path('api/', include('staffrequests.urls')),
+    path('api/', include('hrmail.urls')),
     path("api/auth/", include("authentication.urls")),
 ]
 

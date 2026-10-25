@@ -95,8 +95,12 @@ def client_ip(request):
     return candidate
 
 
-def _mail(subject, body, to, attachment=None):
-    """One plain email from the account payslips go out from."""
+def _mail(subject, body, to, attachment=None, log=None):
+    """One plain email from the account payslips go out from. log is (kind,
+    who it is about, the subject to write down) for the Mail section's Payroll
+    mails tab -- the subject given there when the real one holds a secret."""
+    from hrmail.outbound import record_system_mail
+
     message = EmailMessage(
         subject=subject,
         body=body,
@@ -105,7 +109,14 @@ def _mail(subject, body, to, attachment=None):
     )
     if attachment:
         message.attach(*attachment)
-    message.send()
+    try:
+        message.send()
+    except Exception as exc:
+        if log:
+            record_system_mail(log[0], to, log[2] or subject, log[1], error=str(exc))
+        raise
+    if log:
+        record_system_mail(log[0], to, log[2] or subject, log[1])
 
 
 def _forget_code(order):
@@ -152,6 +163,7 @@ def send_for_signature(order, origin):
             "To sign, you will be asked for a one-time code. It will be sent to this email address.\n\n"
             "Renderways Technology Private Limited\n",
             [order.email],
+            log=("appointment_link", order.name, None),
         )
     except Exception as exc:  # noqa: BLE001 - said to HR as it is
         logger.exception("appointment order %s: link email failed", order.pk)
@@ -203,6 +215,8 @@ def send_code(order):
             "It works for 10 minutes. If you did not ask for it, ignore this email.\n\n"
             "Renderways Technology Private Limited\n",
             [order.email],
+            # The real subject carries the code; it is never written down.
+            log=("appointment_code", order.name, "Your code to sign the Appointment Order"),
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("appointment order %s: code email failed", order.pk)
@@ -323,6 +337,7 @@ def email_signed_copy(order):
             "Renderways Technology Private Limited\n",
             to,
             (appointment_order_filename(order, signed=True), pdf, "application/pdf"),
+            log=("appointment_signed", order.name, None),
         )
         return True
     except Exception:  # noqa: BLE001

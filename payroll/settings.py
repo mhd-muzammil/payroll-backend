@@ -80,6 +80,7 @@ INSTALLED_APPS = [
     'cases',
     'fieldez_km',
     'staffrequests',
+    'hrmail',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -327,6 +328,9 @@ EMAIL_USE_SSL = env_bool('EMAIL_USE_SSL', True)
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER)
+# The Mail section reads the same mailbox over IMAP, with the same password.
+HR_MAIL_IMAP_HOST = os.environ.get('HR_MAIL_IMAP_HOST', EMAIL_HOST)
+HR_MAIL_IMAP_PORT = int(os.environ.get('HR_MAIL_IMAP_PORT', '993'))
 
 
 # --- Ola Maps -----------------------------------------------------------------

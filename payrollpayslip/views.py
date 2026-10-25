@@ -1247,6 +1247,8 @@ class PayslipViewSet(viewsets.ModelViewSet):
         """Sends the payslip details as a formatted HTML email to the employee."""
         from django.core.mail import EmailMultiAlternatives
         from django.utils.html import strip_tags
+
+        from hrmail.outbound import record_system_mail
         
         payslip = self.get_object()
         emp = payslip.employee
@@ -1353,9 +1355,17 @@ class PayslipViewSet(viewsets.ModelViewSet):
             msg = f"Payslip successfully emailed to {emp.email}"
             if not settings.EMAIL_HOST_USER or not settings.EMAIL_HOST_PASSWORD:
                 msg += " (Printed to backend console - SMTP credentials not set in .env)"
+            # For the Mail section's Payroll mails tab. Printed to the console is
+            # not sent, and it says so there.
+            record_system_mail(
+                "payslip", [emp.email], subject, emp.employee_name,
+                error="" if settings.EMAIL_HOST_USER and settings.EMAIL_HOST_PASSWORD
+                else "Not sent: the mail account is not set up on the server",
+            )
                 
             return Response({"success": msg}, status=status.HTTP_200_OK)
         except Exception as err:
+            record_system_mail("payslip", [emp.email], subject, emp.employee_name, error=str(err))
             return Response({"error": f"Failed to send email: {str(err)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'])
