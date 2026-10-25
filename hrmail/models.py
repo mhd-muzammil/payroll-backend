@@ -89,7 +89,7 @@ class OutboundMail(models.Model):
     is the point -- a copy also goes into the mailbox's own Sent folder, but
     only this says which of the team sent it."""
 
-    KIND_CHOICES = (("REPLY", "Reply"), ("COMPOSE", "New mail"))
+    KIND_CHOICES = (("REPLY", "Reply"), ("COMPOSE", "New mail"), ("OFFER", "Offer letter"))
     STATUS_CHOICES = (("SENT", "Sent"), ("FAILED", "Failed"))
 
     kind = models.CharField(max_length=10, choices=KIND_CHOICES)

@@ -130,15 +130,32 @@ class SanitizerTests(TestCase):
         dirty = (
             '<div style="color:red" onclick="steal()">Hi<script>alert(1)</script>'
             '<a href="javascript:alert(1)">x</a><img src="data:image/png;base64,AA" onerror="x()">'
+            '<a href="data:text/html;base64,PHNjcmlwdD4=">y</a><img src="data:image/svg+xml;base64,PHN2Zz4=">'
             '<iframe src="https://evil"></iframe><form action="/x"><input name="p"></form>'
             '<table><tr><td style="width:expression(alert(1))">cell</td></tr></table><!-- </div> --></div>'
         )
         clean = sanitize_html(dirty)
-        for gone in ("<script", "onclick", "onerror", "javascript:", "data:image", "<iframe", "<form", "<input",
-                     "expression(", "<!--"):
+        for gone in ("<script", "onclick", "onerror", "javascript:", "data:text/html", "svg+xml", "<iframe",
+                     "<form", "<input", "expression(", "<!--"):
             self.assertNotIn(gone, clean)
-        for kept in ('style="color:red"', "<table>", "cell", ">x</a>"):
+        # A picture written into the mail stays, so the mail looks as it was sent.
+        for kept in ('style="color:red"', "<table>", "cell", ">x</a>", 'src="data:image/png;base64,AA"'):
             self.assertIn(kept, clean)
+
+    def test_a_preview_is_what_the_reader_sees(self):
+        raw = raw_mail(
+            text='<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0"><html><body>Dear Karthikeyan</body></html>',
+            html="<html><head><style>body{margin:0}</style></head><body><p>Dear Karthikeyan D,</p>"
+                 "<p>Here is a list of today's birthdays.</p></body></html>",
+        )
+        parsed = parse_message(raw)
+        self.assertTrue(parsed["preview"].startswith("Dear Karthikeyan D, Here is a list"), parsed["preview"])
+        self.assertNotIn("<", parsed["body_text"])
+        css_text = parse_message(raw_mail(
+            text="Candidate Chat @media only screen and (max-width:600px) { .a { width:100%; } } body { margin:0; }",
+            html="<p>Candidates are calling you</p>",
+        ))
+        self.assertEqual(css_text["preview"], "Candidates are calling you")
 
     def test_machine_mail_cannot_be_answered(self):
         self.assertTrue(is_auto_generated({"auto-submitted": "auto-replied"}))
@@ -193,10 +210,14 @@ class SyncTests(_Mailbox):
             self.sync()
         self.assertEqual(list(InboundMail.objects.values_list("subject", flat=True)), ["new"])
 
-    def test_a_backlog_is_taken_in_bites(self):
+    def test_a_backlog_is_taken_in_bites_newest_first(self):
         self.deliver(*[raw_mail(subject=f"mail {i}", text=f"text {i}") for i in range(imapbox.MAX_PER_SYNC + 5)])
         first = self.sync()
         self.assertEqual((first["stored"], first["pending"]), (imapbox.MAX_PER_SYNC, 5))
+        # Today's mail is what HR is waiting for: the newest came in the first bite.
+        stored = set(InboundMail.objects.values_list("subject", flat=True))
+        self.assertIn(f"mail {imapbox.MAX_PER_SYNC + 4}", stored)
+        self.assertNotIn("mail 0", stored)
         self.assertEqual(self.sync()["stored"], 5)
 
     def test_a_wrong_password_is_said_in_words(self):
@@ -250,6 +271,33 @@ class ReadingTests(_Mailbox):
         response = APIClient().get(ticket["path"])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(APIClient().get("/api/hr-mail/attachment/?t=forged").status_code, 403)
+
+    def test_the_newest_mail_is_on_top(self):
+        self.deliver(
+            raw_mail(subject="older", text="a", when=timezone.now() - timedelta(hours=5)),
+            raw_mail(subject="newest", text="b", when=timezone.now() - timedelta(minutes=5)),
+            raw_mail(subject="middle", text="c", when=timezone.now() - timedelta(hours=2)),
+        )
+        self.sync()
+        rows = self.client.get("/api/hr-mail/messages/", {"status": "ALL"}).data["rows"]
+        received = [r["received_at"] for r in rows]
+        self.assertEqual(received, sorted(received, reverse=True))
+        ours = [r["subject"] for r in rows if r["subject"] in ("older", "newest", "middle")]
+        self.assertEqual(ours, ["newest", "middle", "older"])
+
+    def test_old_previews_are_made_readable(self):
+        from importlib import import_module
+
+        from django.apps import apps
+
+        InboundMail.objects.filter(pk=self.mail.pk).update(
+            preview='<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0', body_text="<!DOCTYPE html><html>x</html>",
+            body_html="<html><head><title>t</title></head><body><p>Dear HR,</p><p>Resume attached.</p></body></html>",
+        )
+        import_module("hrmail.migrations.0002_readable_previews").readable_previews(apps, None)
+        self.mail.refresh_from_db()
+        self.assertEqual(self.mail.preview, "Dear HR, Resume attached.")
+        self.assertNotIn("<", self.mail.body_text)
 
     def test_marking(self):
         response = self.client.post(f"/api/hr-mail/messages/{self.mail.id}/status/", {"status": "IGNORED"}, format="json")
@@ -312,7 +360,7 @@ class SendingTests(_Mailbox):
         self.assertEqual(len(mail.outbox), 0)
 
     def test_a_refused_send_is_recorded_as_failed(self):
-        with mock.patch("hrmail.outbound.EmailMessage.send", side_effect=OSError("smtp down")):
+        with mock.patch("hrmail.outbound.EmailMultiAlternatives.send", side_effect=OSError("smtp down")):
             response = self.client.post("/api/hr-mail/compose/", {"to": "a@b.com", "subject": "x", "body": "y"},
                                         format="multipart")
         self.assertEqual(response.status_code, 502)

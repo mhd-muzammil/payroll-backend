@@ -22,6 +22,10 @@ FORBIDDEN_ELEMENTS = (
     "meta", "base", "form", "input", "button", "textarea", "select", "svg",
 )
 DANGEROUS_URL = re.compile(r"^\s*(?:javascript|vbscript|data|file)\s*:", re.I)
+# A picture written into the mail itself (Outlook does this for pasted images).
+# Kept in an <img>, so the mail looks as it was sent; anywhere else a data: URL
+# is still removed. SVG is left out: it is a document, not a picture.
+IMAGE_DATA_URL = re.compile(r"^\s*data:image/(?:png|jpe?g|gif|webp|bmp);base64,", re.I)
 _URL_ATTR = re.compile(
     r"""\s(href|src|xlink:href|action|formaction)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.I
 )
@@ -36,9 +40,12 @@ def _strip_element(html, tag):
 
 def _clean_tag(tag):
     tag = _HANDLER.sub("", tag)
+    is_img = tag[:4].lower() == "<img"
 
     def url(match):
         value = match.group(2) or match.group(3) or match.group(4) or ""
+        if is_img and match.group(1).lower() == "src" and IMAGE_DATA_URL.match(value):
+            return match.group(0)
         return "" if DANGEROUS_URL.match(value) else match.group(0)
 
     def css(match):
@@ -73,6 +80,16 @@ def html_to_text(html):
 
 def to_preview(text, limit=200):
     return re.sub(r"\s+", " ", str(text or "")).strip()[:limit]
+
+
+def looks_like_markup(text):
+    """A "plain text" part that is really HTML or CSS -- some senders' mailers
+    put the page source there -- and so is no use as the mail's text."""
+    head = str(text or "")[:400]
+    return bool(
+        re.match(r"\s*<(?:!doctype|html|head|body|table|div|meta|style)\b", head, re.I)
+        or re.search(r"[@.#a-z][^{}\n]{0,80}\{[^{}]*:[^{}]*;", head, re.I)
+    )
 
 
 # ------------------------------------------------------------------- who may be answered
@@ -214,8 +231,10 @@ def parse_message(raw):
     html_part = message.get_body(preferencelist=("html",))
     body_text = _content(text_part) if text_part is not None else ""
     body_html = _content(html_part) if html_part is not None else ""
-    if not body_text and body_html:
-        body_text = html_to_text(body_html)
+    # What the mail reads as, from what the reader actually sees: its HTML.
+    html_text = html_to_text(body_html) if body_html else ""
+    if html_text and (not body_text or looks_like_markup(body_text)):
+        body_text = html_text
 
     attachments = []
     for part in message.walk():
@@ -247,6 +266,7 @@ def parse_message(raw):
         "subject": _header(message, "Subject").strip()[:500],
         "sent_at": sent_at,
         "body_text": body_text,
+        "preview": to_preview(html_text or body_text),
         "body_html": sanitize_html(body_html),
         "attachments": attachments,
     }

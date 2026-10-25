@@ -387,6 +387,53 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
         response["Cache-Control"] = "no-store"
         return response
 
+    @staticmethod
+    def _dear(value):
+        return " ".join(str(value or "").split())[:60]
+
+    @action(detail=True, methods=["get"], url_path="mail_preview")
+    def mail_preview(self, request, pk=None):
+        """The mail exactly as it will go, for HR to look at before sending."""
+        from .offer_letter import offer_letter_filename
+        from .offer_letter.email import offer_mail
+
+        letter = self.get_object()
+        subject, html, _ = offer_mail(self._dear(request.query_params.get("dear")) or letter.name, letter.designation)
+        return Response({"subject": subject, "html": html, "attachment": offer_letter_filename(letter)})
+
+    @action(detail=True, methods=["post"], url_path="send_mail")
+    def send_mail(self, request, pk=None):
+        """Mail the letter from the HR mailbox, in HR's own offer mail, with the
+        PDF attached. It goes into the mailbox's Sent folder and the Mail
+        section's Sent list, with who sent it."""
+        from hrmail import outbound
+        from hrmail.mailparse import check_compose
+
+        from .offer_letter import offer_letter_filename, render_offer_letter_pdf
+        from .offer_letter.email import offer_mail
+
+        letter = self.get_object()
+        dear = self._dear(request.data.get("dear"))
+        if not dear:
+            return Response({"detail": "Type the name that goes after “Dear”."}, status=400)
+        subject, html, text = offer_mail(dear, letter.designation)
+        error, to, cc = check_compose(request.data.get("to"), request.data.get("cc"), subject, text)
+        if error:
+            return Response({"detail": error}, status=400)
+        try:
+            pdf_bytes = render_offer_letter_pdf(letter)
+        except Exception as exc:  # noqa: BLE001 - said to HR below
+            logger.exception("offer letter PDF render failed for %s", pk)
+            return Response({"detail": f"Could not build the PDF: {exc}"}, status=500)
+        try:
+            sent = outbound.send(
+                "OFFER", request.user, to, cc, subject, text,
+                [(offer_letter_filename(letter), pdf_bytes, "application/pdf")], html=html,
+            )
+        except outbound.SendError as exc:
+            return Response({"detail": str(exc)}, status=502)
+        return Response({"sent_to": to, "cc": cc, "filed_in_sent": sent.filed_in_sent})
+
 
 def _pdf_response(pdf_bytes, filename):
     from django.http import HttpResponse

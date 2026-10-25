@@ -9,11 +9,13 @@ import io
 from datetime import date
 from unittest import mock
 
-from django.test import TestCase
+from django.core import mail
+from django.test import TestCase, override_settings
 from pypdf import PdfReader
 from rest_framework.test import APIClient
 
 from authentication.models import User
+from hrmail.models import OutboundMail
 
 from .models import OfferLetter
 from .offer_letter import TEMPLATE, annexure, field_texts, indian, offer_letter_filename, render_offer_letter_pdf
@@ -193,3 +195,75 @@ class OfferLetterApiTests(TestCase):
         engineer = APIClient()
         engineer.force_authenticate(self.engineer)
         self.assertEqual(engineer.get(f"/api/offer-letters/{letter_id}/pdf_ticket/").status_code, 403)
+
+
+@override_settings(EMAIL_HOST_USER="hr@renderways.in", EMAIL_HOST_PASSWORD="test-only-not-a-real-password")
+class OfferLetterMailTests(TestCase):
+    """The letter goes out in HR's own offer mail (the one HR sent on 17 June
+    2026), with the PDF attached, and is kept in the Sent folder and the Mail
+    section's Sent list."""
+
+    def setUp(self):
+        self.hr = User.objects.create_user(username="hr-offer-mail", password="x", role="hr", first_name="Hema")
+        self.client = APIClient()
+        self.client.force_authenticate(self.hr)
+        self.letter = OfferLetter.objects.create(**{**KUMAR, "name": "Mohamed vaseem M A", "designation": "Software engineer"})
+        filed = mock.patch("hrmail.outbound.file_in_sent", return_value=True)
+        self.filed = filed.start()
+        self.addCleanup(filed.stop)
+
+    def _send(self, **body):
+        return self.client.post(
+            f"/api/offer-letters/{self.letter.id}/send_mail/",
+            {"to": "vaseem@example.com", "cc": "Dinesh <dinesh@renderways.in>", "dear": "Vaseem", **body},
+            format="json",
+        )
+
+    def test_the_preview_is_the_mail_that_will_go(self):
+        data = self.client.get(f"/api/offer-letters/{self.letter.id}/mail_preview/", {"dear": "Vaseem"}).data
+        self.assertEqual(data["subject"], "Offer Letter")
+        self.assertEqual(data["attachment"], "Offer-Letter-Mohamed-vaseem-M-A.pdf")
+        for words in ("Dear <b", ">Vaseem</b>", ">Software engineer</b>", "Renderways Technology Private Limited",
+                      "Please confirm your acceptance of this offer letter by replying to this mail.",
+                      "Karthikeyan D", "Human Resources(HR)", "+91 9087019170 | +91 95430 95480",
+                      "Chennai 600 095.", "Chip Level Services", "DISCLAIMER:", "may constitute unlawful act."):
+            self.assertIn(words, data["html"])
+
+    def test_it_goes_with_the_letter_attached(self):
+        response = self._send()
+        self.assertEqual(response.status_code, 200, response.data)
+        sent = mail.outbox[-1]
+        self.assertEqual((sent.subject, sent.from_email), ("Offer Letter", "hr@renderways.in"))
+        self.assertEqual((sent.to, sent.cc), (["vaseem@example.com"], ["dinesh@renderways.in"]))
+        self.assertIn("Dear Vaseem,", sent.body)
+        html = sent.alternatives[0][0]
+        self.assertIn(">Vaseem</b>", html)
+        name, content, kind = sent.attachments[0]
+        self.assertEqual((name, kind), ("Offer-Letter-Mohamed-vaseem-M-A.pdf", "application/pdf"))
+        self.assertTrue(content.startswith(b"%PDF"))
+        self.filed.assert_called_once()
+        record = OutboundMail.objects.get()
+        self.assertEqual((record.kind, record.sent_by, record.status), ("OFFER", self.hr, "SENT"))
+
+    def test_a_name_is_never_read_as_markup(self):
+        data = self.client.get(f"/api/offer-letters/{self.letter.id}/mail_preview/", {"dear": "<script>x</script>"}).data
+        self.assertNotIn("<script>", data["html"])
+        self.assertIn("&lt;script&gt;", data["html"])
+
+    def test_nothing_goes_without_a_proper_address_and_name(self):
+        self.assertEqual(self._send(to="vaseem").status_code, 400)
+        self.assertEqual(self._send(dear="  ").status_code, 400)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_only_hr_can_mail_a_letter(self):
+        engineer = APIClient()
+        engineer.force_authenticate(User.objects.create_user(username="eng-offer-mail", password="x", role="employee"))
+        response = engineer.post(f"/api/offer-letters/{self.letter.id}/send_mail/", {"to": "a@b.com", "dear": "A"}, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(len(mail.outbox), 0)
+
+    @override_settings(EMAIL_HOST_USER="", EMAIL_HOST_PASSWORD="")
+    def test_no_mailbox_set_up_is_said(self):
+        response = self._send()
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("not set up", response.data["detail"])

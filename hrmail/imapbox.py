@@ -1,9 +1,10 @@
 """The HR mailbox over IMAP: copy new mail in, and file what HR sends into Sent.
 
 Payroll has no background worker, so the inbox is read when somebody looks at
-it: the Mail page asks for a sync when it opens and every two minutes while it
-stays open. A sync is bounded -- a few mails and a few megabytes -- so it always
-finishes well inside a request, and a backlog simply takes a few syncs.
+it: the Mail page asks for a sync when it opens and every minute while it
+stays open, and keeps asking while a backlog remains. A sync is bounded -- a
+few mails and a few megabytes -- so it always finishes well inside a request,
+and it takes the newest mail first.
 
 READ ONLY on the server. The mailbox is selected read-only and bodies are
 fetched with BODY.PEEK, so nothing is marked read, moved or deleted; webmail
@@ -23,7 +24,7 @@ from django.core.files.base import ContentFile
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from .mailparse import is_auto_generated, is_no_reply_sender, parse_message, to_preview
+from .mailparse import is_auto_generated, is_no_reply_sender, parse_message
 from .models import InboundAttachment, InboundMail, MailboxState
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,9 @@ def sync_inbox(force=False):
             known = set(
                 InboundMail.objects.filter(mailbox=state.email, uid_validity=validity).values_list("uid", flat=True)
             )
-            pending = sorted({int(uid) for uid in offered if uid.isdigit() and int(uid) > 0} - known)
+            # Newest first: today's mail is what HR is waiting for, so it comes
+            # in the first sync and the older backlog fills in behind it.
+            pending = sorted({int(uid) for uid in offered if uid.isdigit() and int(uid) > 0} - known, reverse=True)
             budget = MAX_SYNC_BYTES
             for uid in pending[:MAX_PER_SYNC]:
                 status, data = client.uid("FETCH", str(uid), "(INTERNALDATE BODY.PEEK[])")
@@ -204,7 +207,7 @@ def _store(state, validity, uid, raw, arrived):
                 received_at=received_at,
                 body_text=parsed["body_text"],
                 body_html=parsed["body_html"],
-                preview=to_preview(parsed["body_text"]),
+                preview=parsed["preview"],
                 is_auto=is_auto_generated(parsed["headers"]) or is_no_reply_sender(parsed["from_email"]),
             )
         except IntegrityError:

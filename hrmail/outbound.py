@@ -8,7 +8,7 @@ employee's or candidate's answer comes back to it.
 import logging
 from email.utils import formatdate, make_msgid
 
-from django.core.mail import EmailMessage
+from django.core.mail import EmailMultiAlternatives
 from django.utils.html import strip_tags
 from django.utils.timezone import localtime
 
@@ -22,10 +22,11 @@ class SendError(Exception):
     pass
 
 
-def send(kind, user, to, cc, subject, body, attachments=(), in_reply_to=None):
+def send(kind, user, to, cc, subject, body, attachments=(), in_reply_to=None, html=None):
     """Send one mail from the HR mailbox and record it. attachments: (name,
-    bytes, content type). Raises SendError when the mail did not go; the
-    attempt is recorded either way."""
+    bytes, content type); html, when given, is the mail as it is meant to be
+    seen, with body as its plain-text copy. Raises SendError when the mail did
+    not go; the attempt is recorded either way."""
     if not is_set_up():
         raise SendError(NOT_SET_UP)
     sender = mailbox_address()
@@ -36,7 +37,9 @@ def send(kind, user, to, cc, subject, body, attachments=(), in_reply_to=None):
     if in_reply_to is not None and in_reply_to.message_id:
         headers["In-Reply-To"] = in_reply_to.message_id
         headers["References"] = f"{in_reply_to.references} {in_reply_to.message_id}".strip()
-    message = EmailMessage(subject=subject, body=body, from_email=sender, to=to, cc=cc, headers=headers)
+    message = EmailMultiAlternatives(subject=subject, body=body, from_email=sender, to=to, cc=cc, headers=headers)
+    if html:
+        message.attach_alternative(html, "text/html")
     for name, content, content_type in attachments:
         message.attach(name, content, content_type or None)
 

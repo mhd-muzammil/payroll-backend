@@ -117,7 +117,11 @@ class MessageListView(_HR):
             offset = max(int(request.query_params.get("offset") or 0), 0)
         except ValueError:
             offset = 0
-        mails = mails.annotate(file_count=Count("attachments", filter=Q(attachments__is_inline=False)))
+        # Newest first, said here: Django drops the model's own ordering from a
+        # query with a COUNT in it, and the inbox came out oldest first.
+        mails = mails.annotate(
+            file_count=Count("attachments", filter=Q(attachments__is_inline=False))
+        ).order_by("-received_at", "-id")
         page = list(mails[offset:offset + PAGE_SIZE + 1])
         return Response({
             "rows": [_row(mail) for mail in page[:PAGE_SIZE]],
