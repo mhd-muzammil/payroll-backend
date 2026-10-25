@@ -52,6 +52,15 @@ services:
       MIGRATE_ON_START: ${MIGRATE_ON_START:-True}
       MEDIA_ROOT: /app/media
       MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-10}
+      # The HR mailbox: payslips, appointment orders and the Mail section send
+      # from it, and the Mail section reads it. Only what is listed here reaches
+      # the container, so these must be named, not just set in Dokploy.
+      EMAIL_HOST: ${EMAIL_HOST:-mail.renderways.in}
+      EMAIL_PORT: ${EMAIL_PORT:-465}
+      EMAIL_USE_SSL: ${EMAIL_USE_SSL:-True}
+      EMAIL_USE_TLS: ${EMAIL_USE_TLS:-False}
+      EMAIL_HOST_USER: ${EMAIL_HOST_USER:-}
+      EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD:-}
     volumes:
       - media_data:/app/media
     expose:
