@@ -259,6 +259,9 @@ class OfferLetterMailTests(TestCase):
         token = self.letter.response_token
         self.assertTrue(token)
         self.assertIn(f'href="https://payroll.systimus.in/offer/{token}?answer=accept"', html)
+        # HR's mail stays whole; the buttons come after it, below the disclaimer.
+        self.assertGreater(html.index("Accept Offer"), html.index("may constitute unlawful act."))
+        self.assertGreater(sent.body.index("Accept the offer:"), sent.body.index("may constitute unlawful act."))
         self.assertIn(f"Accept the offer: https://payroll.systimus.in/offer/{token}?answer=accept", sent.body)
         self.assertEqual(self.letter.mailed_to, "vaseem@example.com")
         self.assertIsNotNone(self.letter.mailed_at)
@@ -267,7 +270,7 @@ class OfferLetterMailTests(TestCase):
     def test_the_preview_buttons_lead_nowhere(self):
         html = self.client.get(f"/api/offer-letters/{self.letter.id}/mail_preview/").data["html"]
         self.assertIn('href="#accept"', html)
-        self.assertIn("Accept Offer", html)
+        self.assertGreater(html.index("Accept Offer"), html.index("DISCLAIMER:"))
         self.letter.refresh_from_db()
         self.assertIsNone(self.letter.response_token, "previewing makes no link")
 
