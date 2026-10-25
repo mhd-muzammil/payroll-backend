@@ -225,6 +225,9 @@ REST_FRAMEWORK = {
     # far less than anything worth doing with an open door.
     "DEFAULT_THROTTLE_RATES": {
         "onboarding_link": "20/day",
+        # An employee opening and signing their appointment order: a handful of
+        # calls each, and several may sign from the office's one address.
+        "appointment_sign": "120/hour",
     },
 }
 

@@ -340,6 +340,88 @@ class OfferLetter(models.Model):
         return f"{self.ref_no} {self.name}"
 
 
+class AppointmentOrder(models.Model):
+    """The appointment order that follows an offer letter (see
+    onboarding/appointment_order), signed by the employee online.
+
+    Send makes a link (sign_token) and keeps the exact PDF it points at
+    (sent_pdf). The employee reads it, draws a signature and types a code
+    emailed to them; the signed copy is that same PDF with the signature laid
+    on it and a last page saying how it was signed. Changing anything after
+    sending kills the link, so nobody signs words that have since changed.
+    """
+
+    SALUTATION_CHOICES = (("MR.", "MR."), ("MS.", "MS."))
+
+    offer_letter = models.ForeignKey(
+        OfferLetter,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="appointment_orders",
+    )
+    salutation = models.CharField(max_length=4, choices=SALUTATION_CHOICES, default="MR.")
+    name = models.CharField(max_length=60)
+    address = models.CharField(max_length=140)
+    designation = models.CharField(max_length=40, default="Service Engineer")
+    order_date = models.DateField()
+    joining_date = models.DateField()
+
+    # Per month, in rupees -- except professional tax, which is for the year
+    # (2,500 on the print; the Annexure shows a twelfth of it, 208.3, a month).
+    basic = models.PositiveIntegerField()
+    hra = models.PositiveIntegerField()
+    conveyance = models.PositiveIntegerField(default=1600)
+    cea = models.PositiveIntegerField(default=200)
+    personal_allowance = models.PositiveIntegerField()
+    professional_tax = models.PositiveIntegerField(default=2500)
+
+    # Where the link and the signing code go.
+    email = models.EmailField(blank=True, default="")
+
+    sign_token = models.CharField(max_length=64, unique=True, null=True, blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    viewed_at = models.DateTimeField(null=True, blank=True)
+    sent_pdf = models.FileField(upload_to="hiring/appointment_orders/", blank=True)
+    sent_pdf_sha256 = models.CharField(max_length=64, blank=True, default="")
+
+    otp_hash = models.CharField(max_length=128, blank=True, default="")
+    otp_sent_at = models.DateTimeField(null=True, blank=True)
+    otp_sends = models.PositiveSmallIntegerField(default=0)
+    otp_attempts = models.PositiveSmallIntegerField(default=0)
+
+    signed_at = models.DateTimeField(null=True, blank=True)
+    signer_ip = models.GenericIPAddressField(null=True, blank=True)
+    signer_user_agent = models.CharField(max_length=255, blank=True, default="")
+    signature = models.FileField(upload_to="hiring/appointment_orders/", blank=True)
+    signed_pdf = models.FileField(upload_to="hiring/appointment_orders/", blank=True)
+    signed_pdf_sha256 = models.CharField(max_length=64, blank=True, default="")
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="appointment_orders_made",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    @property
+    def status(self):
+        if self.signed_at:
+            return "signed"
+        if self.sign_token:
+            return "opened" if self.viewed_at else "sent"
+        return "draft"
+
+    def __str__(self):
+        return f"Appointment order {self.name}"
+
+
 import logging
 
 from django.db.models.signals import post_save

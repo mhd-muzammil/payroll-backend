@@ -15,8 +15,14 @@ from rest_framework.response import Response
 
 from authentication.permissions import IsHRStaff
 from .candidate_import import build_candidates, UnreadableUpload
-from .models import Onboarding, OnboardingInvite, Candidate, OfferLetter, new_invite_token
-from .serializers import DOCUMENT_FIELDS, OnboardingSerializer, CandidateSerializer, OfferLetterSerializer
+from .models import AppointmentOrder, Onboarding, OnboardingInvite, Candidate, OfferLetter, new_invite_token
+from .serializers import (
+    DOCUMENT_FIELDS,
+    AppointmentOrderSerializer,
+    CandidateSerializer,
+    OfferLetterSerializer,
+    OnboardingSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -380,3 +386,199 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
         response["Content-Disposition"] = f'attachment; filename="{offer_letter_filename(letter)}"'
         response["Cache-Control"] = "no-store"
         return response
+
+
+def _pdf_response(pdf_bytes, filename):
+    from django.http import HttpResponse
+
+    response = HttpResponse(pdf_bytes, content_type="application/pdf")
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response["Cache-Control"] = "private, no-store"
+    response["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+def _signing_error(exc):
+    return Response({"detail": exc.message}, status=exc.status)
+
+
+class AppointmentOrderViewSet(viewsets.ModelViewSet):
+    """Appointment orders, made in the Hiring Portal after the offer letter and
+    signed by the employee online (onboarding/appointment_order). HR only: an
+    order states somebody's pay and address.
+
+    A signed order is a record of what somebody agreed to, so it can be
+    neither changed nor deleted. Changing an order that has been sent kills
+    its link; it has to be sent again."""
+
+    queryset = AppointmentOrder.objects.select_related("created_by", "offer_letter").all()
+    serializer_class = AppointmentOrderSerializer
+    permission_classes = [IsAuthenticated, IsHRStaff]
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def update(self, request, *args, **kwargs):
+        if self.get_object().signed_at:
+            return Response({"detail": "A signed appointment order cannot be changed."}, status=409)
+        return super().update(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        from .appointment_order.signing import reset_signing
+
+        order = serializer.save()
+        if order.sign_token:
+            reset_signing(order)
+
+    def destroy(self, request, *args, **kwargs):
+        order = self.get_object()
+        if order.signed_at:
+            return Response({"detail": "A signed appointment order cannot be deleted."}, status=409)
+        if order.sent_pdf:
+            order.sent_pdf.delete(save=False)
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"], url_path="send")
+    def send(self, request, pk=None):
+        """Email the employee a link to sign. The site to link to is the one HR
+        is sending from (checked against the sites this backend serves)."""
+        from .appointment_order.signing import SigningError, send_for_signature
+
+        order = self.get_object()
+        try:
+            link = send_for_signature(order, request.data.get("origin"))
+        except SigningError as exc:
+            return _signing_error(exc)
+        order.refresh_from_db()
+        data = self.get_serializer(order).data
+        data["link"] = link
+        return Response(data)
+
+    @action(detail=True, methods=["get"], url_path="link")
+    def link(self, request, pk=None):
+        """The link that was sent, for HR to pass on another way (WhatsApp)."""
+        from .appointment_order.signing import SigningError, link_base, sign_link
+
+        order = self.get_object()
+        if not order.sign_token or order.signed_at:
+            return Response({"detail": "This order has no open link."}, status=404)
+        try:
+            base = link_base(request.query_params.get("origin"))
+        except SigningError as exc:
+            return _signing_error(exc)
+        return Response({"link": sign_link(base, order.sign_token)})
+
+    PDF_TICKET_SALT = "appointment-order.pdf.download"
+    PDF_TICKET_MAX_AGE = 300  # seconds
+
+    @action(detail=True, methods=["get"], url_path="pdf_ticket")
+    def pdf_ticket(self, request, pk=None):
+        """As for offer letters: the PDF opens by navigation, which carries no
+        JWT, so a five-minute ticket for this one order stands in for it."""
+        from django.core import signing
+
+        order = self.get_object()
+        ticket = signing.dumps({"appointment_order": order.id, "user": request.user.id}, salt=self.PDF_TICKET_SALT)
+        return Response({
+            "ticket": ticket,
+            "path": f"/api/appointment-orders/{order.id}/pdf/?t={ticket}",
+            "expires_in": self.PDF_TICKET_MAX_AGE,
+        })
+
+    @action(detail=True, methods=["get"], url_path="pdf", permission_classes=[AllowAny], authentication_classes=[])
+    def pdf(self, request, pk=None):
+        """The signed copy once there is one; until then the order as it stands."""
+        from django.core import signing
+
+        from .appointment_order import appointment_order_filename, render_appointment_order_pdf
+
+        try:
+            payload = signing.loads(
+                request.query_params.get("t") or "", salt=self.PDF_TICKET_SALT, max_age=self.PDF_TICKET_MAX_AGE
+            )
+        except signing.SignatureExpired:
+            return Response({"detail": "This download link has expired. Please try again."}, status=403)
+        except signing.BadSignature:
+            return Response({"detail": "Invalid download link."}, status=403)
+        if str(payload.get("appointment_order")) != str(pk):
+            return Response({"detail": "Invalid download link."}, status=403)
+
+        order = AppointmentOrder.objects.filter(pk=pk).first()
+        if order is None:
+            return Response({"detail": "Appointment order not found."}, status=404)
+        if order.signed_at:
+            with order.signed_pdf.open("rb") as fh:
+                return _pdf_response(fh.read(), appointment_order_filename(order, signed=True))
+        try:
+            pdf_bytes = render_appointment_order_pdf(order)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller below
+            logger.exception("appointment order PDF render failed for %s", pk)
+            return Response({"detail": f"Could not build the PDF: {exc}"}, status=500)
+        return _pdf_response(pdf_bytes, appointment_order_filename(order))
+
+
+class _PublicAppointmentOrder(APIView):
+    """The employee's end of an appointment order: no login, the token in the
+    link stands in for one. An unknown token and a replaced one get the same
+    404, so there is nothing to learn from trying."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "appointment_sign"
+
+    def _order(self, token):
+        order = AppointmentOrder.objects.filter(sign_token=token).first() if token else None
+        if order is None:
+            raise Http404
+        return order
+
+
+class PublicAppointmentOrderView(_PublicAppointmentOrder):
+    def get(self, request, token):
+        from .appointment_order.signing import public_view
+
+        order = self._order(token)
+        if not order.viewed_at and not order.signed_at:
+            order.viewed_at = timezone.now()
+            order.save(update_fields=["viewed_at", "updated_at"])
+        return Response(public_view(order))
+
+
+class PublicAppointmentOrderPdfView(_PublicAppointmentOrder):
+    def get(self, request, token):
+        from .appointment_order import appointment_order_filename
+
+        order = self._order(token)
+        document = order.signed_pdf if order.signed_at else order.sent_pdf
+        with document.open("rb") as fh:
+            return _pdf_response(fh.read(), appointment_order_filename(order, signed=bool(order.signed_at)))
+
+
+class PublicAppointmentOrderCodeView(_PublicAppointmentOrder):
+    def post(self, request, token):
+        from .appointment_order.signing import SigningError, send_code
+
+        try:
+            return Response(send_code(self._order(token)))
+        except SigningError as exc:
+            return _signing_error(exc)
+
+
+class PublicAppointmentOrderSignView(_PublicAppointmentOrder):
+    def post(self, request, token):
+        from .appointment_order.signing import SigningError, client_ip, email_signed_copy, sign
+
+        order = self._order(token)
+        try:
+            order = sign(
+                order.pk,
+                request.data.get("code"),
+                request.data.get("signature"),
+                request.data.get("agree"),
+                client_ip(request),
+                request.META.get("HTTP_USER_AGENT", ""),
+            )
+        except SigningError as exc:
+            return _signing_error(exc)
+        return Response({"signed": True, "signed_at": order.signed_at, "emailed": email_signed_copy(order)})

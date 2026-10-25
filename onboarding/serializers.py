@@ -6,7 +6,7 @@ from django.conf import settings
 from django.urls import reverse
 from rest_framework import serializers
 
-from .models import Onboarding, Candidate, OfferLetter, employee_already_holding
+from .models import AppointmentOrder, Onboarding, Candidate, OfferLetter, employee_already_holding
 
 
 DOCUMENT_FIELDS = (
@@ -291,4 +291,96 @@ class OfferLetterSerializer(serializers.ModelSerializer):
         basic = attrs.get("basic", getattr(self.instance, "basic", None))
         if basic is not None and basic <= 0:
             raise serializers.ValidationError({"basic": "Basic must be more than zero."})
+        return attrs
+
+
+APPOINTMENT_ORDER_MAX = {"name": 60, "address": 140, "designation": 40}
+APPOINTMENT_ORDER_AMOUNTS = ("basic", "hra", "conveyance", "cea", "personal_allowance")
+
+
+class AppointmentOrderSerializer(serializers.ModelSerializer):
+    """An appointment order. The signing state is the server's alone: nothing
+    here can mark an order sent or signed."""
+
+    status = serializers.ReadOnlyField()
+    gross = serializers.SerializerMethodField()
+    net = serializers.SerializerMethodField()
+    ctc = serializers.SerializerMethodField()
+    offer_ref = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AppointmentOrder
+        fields = [
+            "id", "offer_letter", "offer_ref", "salutation", "name", "address", "designation",
+            "order_date", "joining_date",
+            "basic", "hra", "conveyance", "cea", "personal_allowance", "professional_tax",
+            "email", "status", "sent_at", "viewed_at", "signed_at",
+            "gross", "net", "ctc", "created_by_name", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "sent_at", "viewed_at", "signed_at", "created_at", "updated_at"]
+
+    def _sums(self, obj):
+        from .appointment_order import annexure
+
+        return annexure(obj)
+
+    def get_gross(self, obj):
+        return self._sums(obj)["gross"]
+
+    def get_net(self, obj):
+        return self._sums(obj)["net"]
+
+    def get_ctc(self, obj):
+        return self._sums(obj)["ctc"]
+
+    def get_offer_ref(self, obj):
+        return obj.offer_letter.ref_no if obj.offer_letter_id else ""
+
+    def get_created_by_name(self, obj):
+        user = obj.created_by
+        return (user.get_full_name() or user.username) if user else ""
+
+    def _text(self, value, field):
+        value = _CONTROL.sub("", value or "").strip()
+        value = re.sub(r"\s+", " ", value)
+        if not value:
+            raise serializers.ValidationError("This cannot be empty.")
+        if len(value) > APPOINTMENT_ORDER_MAX[field]:
+            raise serializers.ValidationError(
+                f"At most {APPOINTMENT_ORDER_MAX[field]} characters fit on the letter."
+            )
+        # The letter is set in Times, which has the Western letters and no others.
+        try:
+            value.encode("cp1252")
+        except UnicodeEncodeError:
+            raise serializers.ValidationError("Type this in English letters.")
+        return value
+
+    def validate_name(self, value):
+        return self._text(value, "name")
+
+    def validate_address(self, value):
+        return self._text(value, "address")
+
+    def validate_designation(self, value):
+        return self._text(value, "designation")
+
+    def validate(self, attrs):
+        for field in APPOINTMENT_ORDER_AMOUNTS:
+            if field in attrs and attrs[field] > OFFER_LETTER_MAX_AMOUNT:
+                raise serializers.ValidationError({field: "That is more than any monthly line should be."})
+        if attrs.get("professional_tax", 0) > OFFER_LETTER_MAX_AMOUNT:
+            raise serializers.ValidationError({"professional_tax": "That is more than a year's professional tax."})
+
+        def current(field):
+            return attrs.get(field, getattr(self.instance, field, None))
+
+        if (current("basic") or 0) <= 0:
+            raise serializers.ValidationError({"basic": "Basic must be more than zero."})
+        gross = sum(current(field) or 0 for field in APPOINTMENT_ORDER_AMOUNTS)
+        if (current("professional_tax") or 0) >= gross * 12:
+            raise serializers.ValidationError(
+                {"professional_tax": "Professional tax is for the year, and must be less than a year's pay."}
+            )
         return attrs
