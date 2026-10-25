@@ -15,7 +15,7 @@ from pypdf import PdfReader
 from rest_framework.test import APIClient
 
 from authentication.models import User
-from hrmail.models import OutboundMail
+from hrmail.models import OutboundMail, SystemMail
 
 from .models import OfferLetter
 from .offer_letter import TEMPLATE, annexure, field_texts, indian, offer_letter_filename, render_offer_letter_pdf
@@ -244,6 +244,11 @@ class OfferLetterMailTests(TestCase):
         self.filed.assert_called_once()
         record = OutboundMail.objects.get()
         self.assertEqual((record.kind, record.sent_by, record.status), ("OFFER", self.hr, "SENT"))
+        # And in the Mail section's Payroll mails, to be opened again with the letter.
+        logged = SystemMail.objects.get()
+        self.assertEqual((logged.kind, logged.about, logged.cc_text), ("offer_letter", "Mohamed vaseem M A", "dinesh@renderways.in"))
+        self.assertIn(">Vaseem</b>", logged.body_html)
+        self.assertEqual(logged.attachments.get().filename, "Offer-Letter-Mohamed-vaseem-M-A.pdf")
 
     def test_a_name_is_never_read_as_markup(self):
         data = self.client.get(f"/api/offer-letters/{self.letter.id}/mail_preview/", {"dear": "<script>x</script>"}).data

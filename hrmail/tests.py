@@ -388,9 +388,34 @@ class PayrollMailTests(_Mailbox):
         )
         send_code(order)
         logged = SystemMail.objects.get()
+        code = mail.outbox[-1].subject.split(" ")[0]
         self.assertEqual(logged.kind, "appointment_code")
-        self.assertNotRegex(logged.subject, r"\d{6}", "the code itself is never written down")
-        self.assertRegex(mail.outbox[-1].subject, r"^\d{6} ")
+        self.assertRegex(code, r"^\d{6}$")
+        # The mail can be opened again, but the code itself is never written down.
+        self.assertNotIn(code, logged.subject)
+        self.assertNotIn(code, logged.body_text)
+        self.assertIn("•" * 6, logged.body_text)
+        self.assertIn("Dear Tharun R", logged.body_text)
+
+    def test_a_payroll_mail_opens_again_with_its_file(self):
+        record_system_mail(
+            "offer_letter", ["vaseem@example.com"], "Offer Letter", "Mohamed vaseem M A",
+            body="Dear Vaseem,", html="<p>Dear <b>Vaseem</b>,</p>", cc=["dinesh@renderways.in"],
+            attachments=[("Offer-Letter-Vaseem.pdf", b"%PDF offer", "application/pdf")],
+        )
+        row = self.client.get("/api/hr-mail/system/").data[0]
+        self.assertEqual((row["kind_label"], row["cc_text"]), ("Offer letter", "dinesh@renderways.in"))
+        detail = self.client.get(f"/api/hr-mail/system/{row['id']}/").data
+        self.assertEqual((detail["from"], detail["body_html"]), (BOX, "<p>Dear <b>Vaseem</b>,</p>"))
+        attachment = detail["attachments"][0]
+        self.assertEqual(attachment["filename"], "Offer-Letter-Vaseem.pdf")
+        ticket = self.client.get(f"/api/hr-mail/system/{row['id']}/attachments/{attachment['id']}/ticket/").data
+        response = APIClient().get(ticket["path"])
+        self.assertEqual(b"".join(response.streaming_content), b"%PDF offer")
+        self.assertEqual(APIClient().get("/api/hr-mail/system-attachment/?t=forged").status_code, 403)
+        employee = APIClient()
+        employee.force_authenticate(User.objects.create_user(username="emp-sys", password="x", role="employee"))
+        self.assertEqual(employee.get(f"/api/hr-mail/system/{row['id']}/").status_code, 403)
 
     def test_a_payslip_email_is_logged(self):
         from decimal import Decimal

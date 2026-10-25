@@ -119,21 +119,27 @@ class OutboundMail(models.Model):
 
 
 class SystemMail(models.Model):
-    """A mail Payroll sent by itself. The subject is stored as something safe to
-    show: a signing code is never written down here."""
+    """A mail Payroll sent, kept as it went so it can be opened again: who it
+    went to, what it said, what was attached. What is stored is safe to show:
+    a signing code is never written down here, in the subject or the text."""
 
     KIND_CHOICES = (
         ("appointment_link", "Appointment order link"),
         ("appointment_code", "Appointment order signing code"),
         ("appointment_signed", "Signed appointment order"),
         ("payslip", "Payslip"),
+        ("offer_letter", "Offer letter"),
     )
     STATUS_CHOICES = (("SENT", "Sent"), ("FAILED", "Failed"))
 
     kind = models.CharField(max_length=30, choices=KIND_CHOICES)
     to_text = models.TextField()
+    cc_text = models.TextField(blank=True, default="")
     subject = models.CharField(max_length=500)
     about = models.CharField(max_length=200, blank=True, default="")
+    # The mail itself. Empty for mails recorded before it was kept.
+    body_text = models.TextField(blank=True, default="")
+    body_html = models.TextField(blank=True, default="")
     status = models.CharField(max_length=10, choices=STATUS_CHOICES)
     error = models.CharField(max_length=500, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -143,3 +149,17 @@ class SystemMail(models.Model):
 
     def __str__(self):
         return f"{self.kind} to {self.to_text}"
+
+
+class SystemMailAttachment(models.Model):
+    """A file a Payroll mail carried (an offer letter, a signed order), kept
+    so the mail can be opened again with it."""
+
+    mail = models.ForeignKey(SystemMail, on_delete=models.CASCADE, related_name="attachments")
+    filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=120, blank=True, default="application/octet-stream")
+    size = models.PositiveIntegerField(default=0)
+    file = models.FileField(upload_to="hrmail/system/")
+
+    def __str__(self):
+        return self.filename

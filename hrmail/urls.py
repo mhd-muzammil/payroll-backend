@@ -24,4 +24,15 @@ urlpatterns = [
     path("hr-mail/compose/", views.ComposeView.as_view(), name="hr-mail-compose"),
     path("hr-mail/sent/", views.SentView.as_view(), name="hr-mail-sent"),
     path("hr-mail/system/", views.SystemMailView.as_view(), name="hr-mail-system"),
+    path("hr-mail/system/<int:pk>/", views.SystemMailDetailView.as_view(), name="hr-mail-system-mail"),
+    path(
+        "hr-mail/system/<int:pk>/attachments/<int:attachment_id>/ticket/",
+        views.SystemAttachmentTicketView.as_view(),
+        name="hr-mail-system-attachment-ticket",
+    ),
+    path(
+        "hr-mail/system-attachment/",
+        views.SystemAttachmentByTicketView.as_view(),
+        name="hr-mail-system-attachment-file",
+    ),
 ]

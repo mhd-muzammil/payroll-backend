@@ -19,7 +19,7 @@ from authentication.permissions import IsHRStaff
 
 from . import imapbox, outbound
 from .mailparse import MAX_BODY_LENGTH, check_compose
-from .models import InboundAttachment, InboundMail, OutboundMail, SystemMail
+from .models import InboundAttachment, InboundMail, OutboundMail, SystemMail, SystemMailAttachment
 
 PAGE_SIZE = 100
 TICKET_SALT = "hrmail.attachment.download"
@@ -285,14 +285,65 @@ class SentView(_HR):
         ])
 
 
+def _system_row(r):
+    return {
+        "id": r.id, "kind": r.kind, "kind_label": r.get_kind_display(), "to_text": r.to_text,
+        "cc_text": r.cc_text, "subject": r.subject, "about": r.about, "status": r.status, "error": r.error,
+        "created_at": r.created_at,
+    }
+
+
 class SystemMailView(_HR):
     def get(self, request):
-        rows = SystemMail.objects.all()[:300]
-        return Response([
-            {
-                "id": r.id, "kind": r.kind, "kind_label": r.get_kind_display(), "to_text": r.to_text,
-                "subject": r.subject, "about": r.about, "status": r.status, "error": r.error,
-                "created_at": r.created_at,
-            }
-            for r in rows
-        ])
+        rows = SystemMail.objects.order_by("-created_at", "-id")[:300]
+        return Response([_system_row(r) for r in rows])
+
+
+class SystemMailDetailView(_HR):
+    """One Payroll mail, opened: what it said and what it carried."""
+
+    def get(self, request, pk):
+        mail = SystemMail.objects.filter(pk=pk).first()
+        if mail is None:
+            raise Http404
+        return Response({
+            **_system_row(mail),
+            "from": imapbox.mailbox_address(),
+            "body_text": mail.body_text,
+            "body_html": mail.body_html,
+            "attachments": [
+                {"id": a.id, "filename": a.filename, "size": a.size, "content_type": a.content_type}
+                for a in mail.attachments.all()
+            ],
+        })
+
+
+SYSTEM_TICKET_SALT = "hrmail.system-attachment.download"
+
+
+class SystemAttachmentTicketView(_HR):
+    """As for the inbox's files: a five-minute ticket, since in the phone app a
+    file only arrives by navigation, which carries no login."""
+
+    def get(self, request, pk, attachment_id):
+        if not SystemMailAttachment.objects.filter(pk=attachment_id, mail_id=pk).exists():
+            raise Http404
+        ticket = signing.dumps({"attachment": int(attachment_id), "user": request.user.id}, salt=SYSTEM_TICKET_SALT)
+        return Response({"path": f"/api/hr-mail/system-attachment/?t={ticket}", "expires_in": TICKET_MAX_AGE})
+
+
+class SystemAttachmentByTicketView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        try:
+            payload = signing.loads(request.query_params.get("t") or "", salt=SYSTEM_TICKET_SALT, max_age=TICKET_MAX_AGE)
+        except signing.SignatureExpired:
+            return Response({"detail": "This download link has expired. Please try again."}, status=403)
+        except signing.BadSignature:
+            return Response({"detail": "Invalid download link."}, status=403)
+        attachment = SystemMailAttachment.objects.filter(pk=payload.get("attachment")).first()
+        if attachment is None:
+            raise Http404
+        return _file_response(attachment)

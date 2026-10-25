@@ -6,14 +6,17 @@ Everything goes out over the same SMTP account Payroll already uses
 employee's or candidate's answer comes back to it.
 """
 import logging
+import secrets
 from email.utils import formatdate, make_msgid
 
+from django.core.files.base import ContentFile
 from django.core.mail import EmailMultiAlternatives
+from django.db import transaction
 from django.utils.html import strip_tags
 from django.utils.timezone import localtime
 
 from .imapbox import NOT_SET_UP, file_in_sent, is_set_up, mailbox_address
-from .models import OutboundMail, SystemMail
+from .models import OutboundMail, SystemMail, SystemMailAttachment
 
 logger = logging.getLogger(__name__)
 
@@ -82,18 +85,34 @@ def quoted(mail):
     return f"\n\nOn {when}, {sender} wrote:\n{lines}"
 
 
-def record_system_mail(kind, to, subject, about="", error=""):
-    """Write down one mail Payroll sent by itself, for the Payroll mails tab.
-    Never raises: a mail that went must not be reported as failed because its
-    note could not be written."""
+def _addresses(value):
+    return ", ".join(value) if isinstance(value, (list, tuple)) else str(value or "")
+
+
+def record_system_mail(kind, to, subject, about="", error="", body="", html="", cc=(), attachments=()):
+    """Write down one mail Payroll sent, as it went, for the Payroll mails tab:
+    body and html are its text (with any secret already taken out by the
+    caller), attachments are (name, bytes, content type). Never raises: a mail
+    that went must not be reported as failed because its note could not be
+    written."""
     try:
-        SystemMail.objects.create(
-            kind=kind,
-            to_text=", ".join(to) if isinstance(to, (list, tuple)) else str(to),
-            subject=str(subject)[:500],
-            about=str(about)[:200],
-            status="FAILED" if error else "SENT",
-            error=str(error)[:500],
-        )
+        with transaction.atomic():
+            mail = SystemMail.objects.create(
+                kind=kind,
+                to_text=_addresses(to),
+                cc_text=_addresses(cc),
+                subject=str(subject)[:500],
+                about=str(about)[:200],
+                body_text=str(body or ""),
+                body_html=str(html or ""),
+                status="FAILED" if error else "SENT",
+                error=str(error)[:500],
+            )
+            for name, content, content_type in attachments:
+                attachment = SystemMailAttachment(
+                    mail=mail, filename=str(name)[:255], content_type=(content_type or "")[:120], size=len(content),
+                )
+                attachment.file.save(f"{mail.pk}-{secrets.token_hex(6)}", ContentFile(content), save=False)
+                attachment.save()
     except Exception:  # noqa: BLE001
         logger.exception("could not record a system mail")

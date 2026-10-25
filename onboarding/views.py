@@ -425,13 +425,21 @@ class OfferLetterViewSet(viewsets.ModelViewSet):
         except Exception as exc:  # noqa: BLE001 - said to HR below
             logger.exception("offer letter PDF render failed for %s", pk)
             return Response({"detail": f"Could not build the PDF: {exc}"}, status=500)
-        try:
-            sent = outbound.send(
-                "OFFER", request.user, to, cc, subject, text,
-                [(offer_letter_filename(letter), pdf_bytes, "application/pdf")], html=html,
+        attachment = (offer_letter_filename(letter), pdf_bytes, "application/pdf")
+
+        def record(error=""):
+            # Also in the Mail section's Payroll mails, to be opened again.
+            outbound.record_system_mail(
+                "offer_letter", to, subject, letter.name, error=error,
+                body=text, html=html, cc=cc, attachments=[attachment],
             )
+
+        try:
+            sent = outbound.send("OFFER", request.user, to, cc, subject, text, [attachment], html=html)
         except outbound.SendError as exc:
+            record(str(exc))
             return Response({"detail": str(exc)}, status=502)
+        record()
         return Response({"sent_to": to, "cc": cc, "filed_in_sent": sent.filed_in_sent})
 
 

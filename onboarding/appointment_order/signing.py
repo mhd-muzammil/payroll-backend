@@ -97,8 +97,9 @@ def client_ip(request):
 
 def _mail(subject, body, to, attachment=None, log=None):
     """One plain email from the account payslips go out from. log is (kind,
-    who it is about, the subject to write down) for the Mail section's Payroll
-    mails tab -- the subject given there when the real one holds a secret."""
+    who it is about, the subject to write down, the text to write down) for
+    the Mail section's Payroll mails tab, where the mail can be opened again --
+    the subject and text given there when the real ones hold a secret."""
     from hrmail.outbound import record_system_mail
 
     message = EmailMessage(
@@ -109,14 +110,22 @@ def _mail(subject, body, to, attachment=None, log=None):
     )
     if attachment:
         message.attach(*attachment)
+
+    def record(error=""):
+        if log:
+            kind, about, shown_subject, shown_body = (tuple(log) + (None, None))[:4]
+            record_system_mail(
+                kind, to, shown_subject or subject, about, error=error,
+                body=body if shown_body is None else shown_body,
+                attachments=[attachment] if attachment else (),
+            )
+
     try:
         message.send()
     except Exception as exc:
-        if log:
-            record_system_mail(log[0], to, log[2] or subject, log[1], error=str(exc))
+        record(str(exc))
         raise
-    if log:
-        record_system_mail(log[0], to, log[2] or subject, log[1])
+    record()
 
 
 def _forget_code(order):
@@ -207,16 +216,22 @@ def send_code(order):
     if order.otp_sends >= MAX_CODE_SENDS:
         raise SigningError("Too many codes for this link. Ask the office to send the order again.", 429)
     code = f"{secrets.randbelow(10 ** 6):06d}"
+    body = (
+        f"Dear {order.name},\n\n"
+        f"Your one-time code to sign your Appointment Order is: {code}\n\n"
+        "It works for 10 minutes. If you did not ask for it, ignore this email.\n\n"
+        "Renderways Technology Private Limited\n"
+    )
     try:
         _mail(
             f"{code} is your code to sign the Appointment Order",
-            f"Dear {order.name},\n\n"
-            f"Your one-time code to sign your Appointment Order is: {code}\n\n"
-            "It works for 10 minutes. If you did not ask for it, ignore this email.\n\n"
-            "Renderways Technology Private Limited\n",
+            body,
             [order.email],
-            # The real subject carries the code; it is never written down.
-            log=("appointment_code", order.name, "Your code to sign the Appointment Order"),
+            # The real subject and text carry the code; it is never written down.
+            log=(
+                "appointment_code", order.name, "Your code to sign the Appointment Order",
+                body.replace(code, "•" * 6),
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("appointment order %s: code email failed", order.pk)

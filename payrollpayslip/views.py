@@ -1361,11 +1361,15 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 "payslip", [emp.email], subject, emp.employee_name,
                 error="" if settings.EMAIL_HOST_USER and settings.EMAIL_HOST_PASSWORD
                 else "Not sent: the mail account is not set up on the server",
+                body=text_content, html=html_content,
             )
                 
             return Response({"success": msg}, status=status.HTTP_200_OK)
         except Exception as err:
-            record_system_mail("payslip", [emp.email], subject, emp.employee_name, error=str(err))
+            record_system_mail(
+                "payslip", [emp.email], subject, emp.employee_name, error=str(err),
+                body=text_content, html=html_content,
+            )
             return Response({"error": f"Failed to send email: {str(err)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'])
