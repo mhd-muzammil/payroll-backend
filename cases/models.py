@@ -709,6 +709,43 @@ class RouteKmDay(models.Model):
         return f"{self.engineer.employee_name} {self.day} ({self.status})"
 
 
+class ImportedKmDay(models.Model):
+    """An engineer's km for a day the app did not record, taken from a report.
+
+    Before this app tracked them, the engineers were tracked by another one,
+    and its Monthly Report is the only record of how far they went on those
+    days. A row here IS that day's km: _DayKm reads it in place of the GPS
+    trail, so the KM report, Engineer Productivity, the board and the
+    engineer's own history all show the same figure for it. Never for today:
+    a day still going on is the app's.
+
+    Written by `manage.py import_old_app_km`, which checks who each figure is
+    for before it writes one.
+    """
+
+    engineer = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="imported_km_days",
+    )
+    # The IST calendar day, the way the KM report asks for it.
+    day = models.DateField()
+    km = models.FloatField()
+    # Where the figure came from, so it is never mistaken for the app's own.
+    source = models.CharField(max_length=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["engineer", "day"], name="one_imported_km_per_engineer_day"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.engineer.employee_name} {self.day}: {self.km} km ({self.source})"
+
+
 class PhoneStatus(models.Model):
     """How an employee's phone is set up to record, one row per change.
 

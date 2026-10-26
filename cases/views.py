@@ -17,6 +17,7 @@ from rest_framework.response import Response
 from .models import Case, CaseVisit, DutySession, EngineerAlias, EngineerScorecard, LocationPing
 from .models import EngineerScorecardDay
 from .models import PhoneStatus
+from .models import ImportedKmDay
 from .serializer import CaseSerializer, LocationPingSerializer, LiveEngineerSerializer
 from .pings import (
     MAX_BATCH,
@@ -192,6 +193,10 @@ class _DayKm:
     Three queries whatever the number of engineers. `kinds` widens the events
     for a caller that reads them for something else as well; the km come out
     the same, since the rule reads only what RULE_EVENT_KINDS holds.
+
+    A past day the app did not record can have its km imported from the old
+    app's report (ImportedKmDay); that figure is then the day's km for all of
+    them. A fourth query, on past days only.
     """
 
     def __init__(self, engineer_ids, day, kinds=km_rule.RULE_EVENT_KINDS):
@@ -203,8 +208,22 @@ class _DayKm:
             engineer_id__in=ids, timestamp__gte=start, timestamp__lt=end
         ).order_by("timestamp", "id"):
             self.trails.setdefault(ping.engineer_id, []).append(ping)
+        # Never today: a day still going on is the app's own.
+        self.imported = {}
+        if day < timezone.localdate():
+            self.imported = dict(
+                ImportedKmDay.objects.filter(engineer_id__in=ids, day=day).values_list(
+                    "engineer_id", "km"
+                )
+            )
 
     def km(self, engineer_id):
+        if engineer_id in self.imported:
+            return self.imported[engineer_id]
+        return self.trail_km(engineer_id)
+
+    def trail_km(self, engineer_id):
+        """The km of the day's own fixes, whatever was imported for it."""
         return _trail_km(self.trails.get(engineer_id, []), self.contexts[engineer_id])
 
 
