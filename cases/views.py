@@ -32,6 +32,7 @@ from .tracks import snapped_trail
 from . import places
 from . import olamaps, route_km
 from . import day_cases
+from . import day_report
 from . import km_rule
 from employees.models import Employee
 from authentication.models import get_allowed_branches
@@ -3508,6 +3509,85 @@ class TrackingViewSet(viewsets.ViewSet):
                         "days": {day.isoformat(): counts[(engineer_id, day)] for day in days},
                     }
                     for engineer_id in ids
+                ],
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="day_report")
+    def day_report(self, request):
+        """The Day Report (cases/day_report.py): for every engineer and day,
+        what the day panel says -- Login and Logout, the check-ins and outs,
+        OpenCall's Assigned / Attended / Closed, the waiting, GPS and Net off
+        and on, and the km -- with where each happened.
+
+        Body: {"engineers": [<employee id>, ...], "from": "YYYY-MM-DD", "to": "YYYY-MM-DD"}
+        Answer: {"days": [...], "engineers": [{"engineer_id",
+        "days": {"YYYY-MM-DD": {...}}}]}
+
+        Read only; it never looks an address up from Ola.
+        """
+        if not _is_staff_role(request.user):
+            return Response({"detail": "Permission denied."}, status=403)
+
+        data = request.data if isinstance(request.data, dict) else {}
+
+        # The engineers and the days, checked as cases_by_day checks them --
+        # copied rather than shared, so that code is left as it is.
+        raw_ids = data.get("engineers")
+        if not isinstance(raw_ids, list) or len(raw_ids) > route_km.MAX_ENGINEERS:
+            return Response(
+                {"detail": f"engineers must be a list of at most {route_km.MAX_ENGINEERS} ids."},
+                status=400,
+            )
+        ids = []
+        for raw in raw_ids:
+            text = "" if isinstance(raw, bool) or not isinstance(raw, (int, str)) else str(raw)
+            if not (text.isascii() and text.isdigit()) or len(text) > 19 or int(text) >= 2**63:
+                return Response({"detail": "engineers must be a list of numeric ids."}, status=400)
+            if int(text) not in ids:
+                ids.append(int(text))
+
+        bounds = []
+        for name in ("from", "to"):
+            value = data.get(name)
+            try:
+                parsed = parse_date(value) if isinstance(value, str) else None
+            except ValueError:
+                parsed = None
+            if not parsed:
+                return Response({"detail": f"{name} must be YYYY-MM-DD."}, status=400)
+            bounds.append(parsed)
+        start, end = bounds
+        if start > end:
+            return Response({"detail": "from must not be after to."}, status=400)
+        if (end - start).days + 1 > day_report.MAX_DAYS:
+            return Response(
+                {"detail": f"from and to may cover at most {day_report.MAX_DAYS} days."},
+                status=400,
+            )
+
+        # Nothing after today: a day that has not happened has nothing in it.
+        end = min(end, timezone.localdate())
+        days = [start + timedelta(days=n) for n in range((end - start).days + 1)]
+
+        # Only the engineers this user may see, as on the day view.
+        branches = get_allowed_branches(request.user, "attendance")
+        visible = Employee.objects.filter(pk__in=ids)
+        if "All" not in branches:
+            visible = visible.filter(branch__in=branches)
+        by_id = {engineer.pk: engineer for engineer in visible}
+        engineers = [by_id[engineer_id] for engineer_id in ids if engineer_id in by_id]
+
+        cells = day_report.build(engineers, days)
+        return Response(
+            {
+                "days": [day.isoformat() for day in days],
+                "engineers": [
+                    {
+                        "engineer_id": engineer.id,
+                        "days": {day.isoformat(): cells[(engineer.id, day)] for day in days},
+                    }
+                    for engineer in engineers
                 ],
             }
         )
