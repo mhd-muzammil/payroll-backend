@@ -43,6 +43,20 @@ arrived before it is read the old way, byte for byte, so a closed day keeps the
 number it closed on -- from the flags that had arrived before it too: a flag
 an old phone delivers after the cutover would take back a line counted
 before it.
+
+THE DUTY RULE came on top of it ("Login -> Logout kulla mattum km"): a line
+counts only when its later fix was taken on duty -- after a Login, before the
+Logout that ended that duty, and before the 12:00 AM after the day of the
+Login, when a duty nobody ended is ended for them. The road after a Logout, the
+night after a forgotten one and a day with no Login at all are not work. Read
+the same way whenever it is read, so nothing it counted is ever taken back:
+the Logout reaches every fix that had arrived by it -- a phone whose clock runs
+a little fast stamps its last fixes after the Logout it sent them before -- and
+a duty the midnight sweep ended keeps its window to that midnight, so a fix the
+phone held and delivered after the sweep still counts. Its cutover is
+KM_DUTY_FROM when the environment says, otherwise the moment migration 0024 was
+applied; a line that had arrived before it, or whose later fix was taken
+before it, is read as above, so no day closed before the deploy changes.
 """
 
 import datetime
@@ -63,6 +77,15 @@ logger = logging.getLogger(__name__)
 # cutover, unless KM_RULE_FROM says otherwise.
 RULE_MIGRATION = ("cases", "0019_phoneevent_dutysession_last_contact_at")
 
+# The migration that brought the duty rule in, read the same way through
+# KM_DUTY_FROM. It changes nothing in the database; never revert it, or a
+# re-apply moves the cutover and reads closed days again.
+DUTY_MIGRATION = ("cases", "0024_km_on_duty_only")
+
+# A duty ends by the 12:00 AM after the day it began, so none is longer than
+# this: how far back a fix's duty can have started.
+LONGEST_DUTY = datetime.timedelta(hours=25)
+
 # How far a phone's clock may run either way of ours before a Login stops
 # recognising its first fix. pings.py refuses a fix more than this far ahead.
 CLOCK_SKEW = datetime.timedelta(minutes=5)
@@ -81,9 +104,10 @@ LOAD_MARGIN = datetime.timedelta(minutes=10)
 RULE_EVENT_KINDS = ("gps_off", "tracker_stopped")
 STATE_EVENT_KINDS = ("gps_off", "gps_on", "tracker_stopped")
 
-# The migration's applied time, once found. A value that was not there yet is
+# The migrations' applied times, once found. A value that was not there yet is
 # not kept, so a process started before migrate ran still finds it later.
 _applied = None
+_duty_applied = None
 
 
 def trail_order(ping):
@@ -145,6 +169,33 @@ def rule_cutover():
     return _migration_applied()
 
 
+def _duty_migration_applied():
+    global _duty_applied
+    if _duty_applied is None:
+        from django.db.migrations.recorder import MigrationRecorder
+
+        app, name = DUTY_MIGRATION
+        _duty_applied = (
+            MigrationRecorder.Migration.objects.filter(app=app, name=name)
+            .values_list("applied", flat=True)
+            .first()
+        )
+    return _duty_applied
+
+
+def duty_cutover():
+    """The moment the duty rule began, or None while it has not: unlike the
+    rule above, a process that reads before migrate has run must not read old
+    lines the new way."""
+    raw = (os.environ.get("KM_DUTY_FROM") or "").strip()
+    if raw:
+        when = _parse_moment(raw)
+        if when is not None:
+            return when
+        logger.warning("KM_DUTY_FROM=%r is not an ISO date or time; using migration 0024's", raw)
+    return _duty_migration_applied()
+
+
 def day_bounds(day):
     """The first and the first-after instants of a local calendar day."""
     tz = timezone.get_current_timezone()
@@ -153,6 +204,11 @@ def day_bounds(day):
         datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time.min), tz
     )
     return start, end
+
+
+def duty_ends(started_at):
+    """The 12:00 AM after the local day a duty began: no duty runs past it."""
+    return day_bounds(timezone.localtime(started_at).date())[1]
 
 
 class TrailContext:
@@ -165,10 +221,11 @@ class TrailContext:
     one itself when nobody hands it one.
     """
 
-    def __init__(self, sessions=(), events=(), cutover=None):
+    def __init__(self, sessions=(), events=(), cutover=None, duty_from=None):
         self.sessions = list(sessions)
         self.events = list(events)
         self.cutover = cutover
+        self.duty_from = duty_from
 
 
 def _load(engineer_ids, since, until, kinds):
@@ -179,10 +236,17 @@ def _load(engineer_ids, since, until, kinds):
         return sessions, events
     early, late = since - LOAD_MARGIN, until + LOAD_MARGIN
     # Every session that overlaps the span, and every one that began in it
-    # however it ended: a Login is what the rule looks for.
+    # however it ended: a Login is what the rule looks for. And every one the
+    # midnight sweep ended that could still reach into it, since its duty runs
+    # to that midnight whatever its Logout says.
     for session in (
         DutySession.objects.filter(engineer_id__in=ids, started_at__lte=late)
-        .filter(Q(ended_at__isnull=True) | Q(ended_at__gte=early) | Q(started_at__gte=early))
+        .filter(
+            Q(ended_at__isnull=True)
+            | Q(ended_at__gte=early)
+            | Q(started_at__gte=early)
+            | Q(auto_closed=True, started_at__gte=early - LONGEST_DUTY)
+        )
         .order_by("started_at", "id")
     ):
         sessions[session.engineer_id].append(session)
@@ -202,10 +266,11 @@ def load_contexts(engineer_ids, since, until, kinds=RULE_EVENT_KINDS):
     kind.
     """
     cutover = rule_cutover()
+    duty_from = duty_cutover()
     ids = list(engineer_ids)
     sessions, events = _load(ids, since, until, kinds)
     return {
-        engineer_id: TrailContext(sessions[engineer_id], events[engineer_id], cutover)
+        engineer_id: TrailContext(sessions[engineer_id], events[engineer_id], cutover, duty_from)
         for engineer_id in ids
     }
 
@@ -214,7 +279,7 @@ def context_for(pings):
     """The context for fixes nobody loaded one for, read off their own span."""
     pings = list(pings)
     if not pings:
-        return TrailContext(cutover=rule_cutover())
+        return TrailContext(cutover=rule_cutover(), duty_from=duty_cutover())
     moments = [p.timestamp for p in pings] + [p.received_at for p in pings if p.received_at]
     sessions, events = _load(
         {p.engineer_id for p in pings}, min(moments), max(moments), RULE_EVENT_KINDS
@@ -223,6 +288,7 @@ def context_for(pings):
         [s for found in sessions.values() for s in found],
         [e for found in events.values() for e in found],
         rule_cutover(),
+        duty_cutover(),
     )
 
 
@@ -238,6 +304,11 @@ class SegmentRule:
     def __init__(self, pings, context):
         pings = sorted(pings, key=trail_order)
         self.cutover = context.cutover
+        self.duty_from = getattr(context, "duty_from", None)
+
+        by_engineer = defaultdict(list)
+        for ping in pings:
+            by_engineer[ping.engineer_id].append(ping)
 
         # The old rule's evidence, read exactly as it always was: the flags of
         # ALL the fixes, since the first fix after the GPS wakes is the noisiest
@@ -261,17 +332,25 @@ class SegmentRule:
         for session in context.sessions:
             sessions[session.engineer_id].append(session)
         self._logins = defaultdict(list)
+        # And each duty's window, in Login order: the Login, where the window
+        # closes (None while it runs), and the midnight it cannot pass.
+        self._duties = defaultdict(list)
+        self._duty_starts = defaultdict(list)
         for engineer_id, found in sessions.items():
             found.sort(key=lambda s: (s.started_at, s.id or 0))
+            fixes = by_engineer.get(engineer_id, [])
             for index, session in enumerate(found):
                 ended = [
                     earlier.ended_at
                     for earlier in found[:index]
                     if earlier.ended_at is not None and earlier.ended_at <= session.started_at
                 ]
-                self._logins[engineer_id].append(
-                    (session.started_at, max(ended) if ended else None)
+                login = (session.started_at, max(ended) if ended else None)
+                self._logins[engineer_id].append(login)
+                self._duties[engineer_id].append(
+                    (login, self._duty_closes(session, fixes), duty_ends(session.started_at))
                 )
+                self._duty_starts[engineer_id].append(session.started_at)
 
         self._stopped = defaultdict(list)
         switched = defaultdict(list)
@@ -282,10 +361,6 @@ class SegmentRule:
                 switched[event.engineer_id].append(event)
         for moments in self._stopped.values():
             moments.sort()
-
-        by_engineer = defaultdict(list)
-        for ping in pings:
-            by_engineer[ping.engineer_id].append(ping)
 
         # The switch-offs the phone reported in time, per engineer, by when.
         self._switched_off = defaultdict(list)
@@ -315,11 +390,68 @@ class SegmentRule:
     def _reads_the_old_way(self, prev, cur):
         return self.cutover is not None and max(arrival(prev), arrival(cur)) < self.cutover
 
+    def _reads_duty(self, prev, cur):
+        """Whether the duty rule reads this line: it reached us after the rule
+        began, and its later fix was taken after it too -- a fix held from
+        before the deploy stays on the rule it was taken under."""
+        return (
+            self.duty_from is not None
+            and max(arrival(prev), arrival(cur)) >= self.duty_from
+            and cur.timestamp >= self.duty_from
+        )
+
+    @staticmethod
+    def _duty_closes(session, fixes):
+        """Where a duty's window closes, or None for one still running or one
+        the midnight sweep ended, whose window runs to that midnight: a fix
+        the phone held and delivered after the sweep is still that duty's.
+
+        For a duty the engineer ended, the Logout -- reaching every fix that
+        had arrived by it, which a phone whose clock runs a little fast stamps
+        after it. Fixed once the duty is over, so it is the same on every read.
+        """
+        if session.ended_at is None or session.auto_closed:
+            return None
+        closes = session.ended_at
+        for fix in fixes:
+            if (
+                arrival(fix) <= session.ended_at
+                and closes < fix.timestamp <= session.ended_at + CLOCK_SKEW
+            ):
+                closes = fix.timestamp
+        return closes
+
+    def _on_duty(self, fix):
+        """Whether the fix was taken on duty: after a Login (as _after reads
+        it), no later than the end of that duty, and before its midnight."""
+        starts = self._duty_starts.get(fix.engineer_id)
+        if not starts:
+            return False
+        first = bisect_left(starts, fix.timestamp - LONGEST_DUTY)
+        last = bisect_right(starts, fix.timestamp + CLOCK_SKEW)
+        for login, closes, midnight in self._duties[fix.engineer_id][first:last]:
+            if fix.timestamp >= midnight:
+                continue
+            if closes is not None and fix.timestamp > closes:
+                continue
+            if self._after(fix, login):
+                return True
+        return False
+
+    def _off_duty(self, prev, cur):
+        """Whether the duty rule takes this line: it reads it, and the later
+        fix was not taken on duty. The earlier one need not be asked: if it
+        was before that duty's Login the line crosses the Login, which
+        counted_from already reads."""
+        return self._reads_duty(prev, cur) and not self._on_duty(cur)
+
     def skips(self, prev, cur):
         """Whether the straight line from prev to cur does not count as it
         stands. Across a Login part of it may: counted_from says which."""
         if self._reads_the_old_way(prev, cur):
             return self._flagged_between(prev, cur)
+        if self._off_duty(prev, cur):
+            return True
         return self.crosses_login(prev, cur) or self._location_switched_off(prev, cur)
 
     def counted_from(self, prev, cur, usable):
@@ -337,6 +469,8 @@ class SegmentRule:
         """
         if self._reads_the_old_way(prev, cur):
             return None if self._flagged_between(prev, cur) else prev
+        if self._off_duty(prev, cur):
+            return None
         login = self._crossed_login(prev, cur)
         if login is None:
             return None if self._location_switched_off(prev, cur) else prev

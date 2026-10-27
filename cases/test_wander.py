@@ -14,7 +14,7 @@ from django.utils import timezone
 
 from employees.models import Employee
 
-from .models import LocationPing
+from .models import DutySession, LocationPing
 from .views import MIN_STEP_METERS, _moving_trail, _trail_km, _usable_pings, haversine_km
 
 # Degrees of latitude per metre, near enough at Chennai's latitude.
@@ -38,6 +38,10 @@ class WanderTests(TestCase):
         self.day = timezone.localdate()
         self.base = timezone.make_aware(
             datetime.datetime(self.day.year, self.day.month, self.day.day, 9, 0)
+        )
+        # On duty from just before the first fix: km count only on duty.
+        DutySession.objects.create(
+            engineer=self.engineer, started_at=self.base - datetime.timedelta(minutes=1)
         )
 
     def _ping(self, index, north_metres, accuracy=7):

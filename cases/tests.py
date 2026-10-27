@@ -6,6 +6,7 @@ is closed, so the same ticket is re-sent day after day. The engineer must keep
 seeing it every one of those days, and their own field progress must survive
 the next sync tick.
 """
+import datetime
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
@@ -840,16 +841,18 @@ class DutyAndLiveTrackingTests(TestCase):
         self.assertIsNotNone(res.data["started_at"])
 
     def test_a_forgotten_session_is_auto_closed(self):
-        """One missed Stop Duty must not show someone on duty for days."""
-        session = DutySession.objects.create(engineer=self.engineer)
-        session.started_at = timezone.now() - timedelta(
-            hours=DutySession.MAX_DURATION_HOURS + 1
+        """One missed Logout must not show someone on duty for days: a duty
+        from an earlier day is over at the 12:00 AM after it began."""
+        yesterday = timezone.localdate() - timedelta(days=1)
+        started = timezone.make_aware(
+            datetime.datetime.combine(yesterday, datetime.time(20, 0))
         )
-        session.save(update_fields=["started_at"])
+        session = DutySession.objects.create(engineer=self.engineer)
+        DutySession.objects.filter(pk=session.pk).update(started_at=started)
 
         self.assertEqual(self._live(), [])
         session.refresh_from_db()
-        self.assertIsNotNone(session.ended_at)
+        self.assertEqual(session.ended_at, started, "no fix at all: it ends where it began")
         self.assertTrue(session.auto_closed)
 
     def test_branch_scoped_staff_only_see_their_own_branch(self):
@@ -982,9 +985,12 @@ class EngineerRosterTests(TestCase):
         session.started_at = timezone.now() - timedelta(hours=2)
         session.ended_at = timezone.now()
         session.save(update_fields=["started_at", "ended_at"])
-        for lat in (13.00, 13.09):
+        # Taken on that duty: km count only between the Login and the Logout.
+        for minutes, lat in ((90, 13.00), (60, 13.09)):
+            taken = timezone.now() - timedelta(minutes=minutes)
             LocationPing.objects.create(
-                engineer=self.checked_out, latitude=lat, longitude=80.0, accuracy=10
+                engineer=self.checked_out, latitude=lat, longitude=80.0, accuracy=10,
+                timestamp=taken, received_at=taken,
             )
 
         row = self._roster()["Checked Out Kumar"]

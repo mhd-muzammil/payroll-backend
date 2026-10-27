@@ -121,12 +121,15 @@ class Command(BaseCommand):
             # finished session rather than leaving one open behind them.
             ended_at = attendance.outtime if attendance and attendance.outtime else None
 
+            # Their own punch-out is their Logout, not one made for them: an
+            # auto_closed duty's km run on to midnight (km_rule), and the road
+            # home after a punch-out is not duty.
             if apply_changes:
                 DutySession.objects.create(
                     engineer=employee,
                     started_at=started_at,
                     ended_at=ended_at,
-                    auto_closed=bool(ended_at),
+                    auto_closed=False,
                 )
 
             finish = (

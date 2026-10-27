@@ -44,6 +44,9 @@ CHENNAI_LON = 80.2707
 # after all of them (the old rule) or before all of them (the new one).
 OLD_RULE = {"KM_RULE_FROM": "2100-01-01T00:00:00+00:00"}
 NEW_RULE = {"KM_RULE_FROM": "2000-01-01T00:00:00+00:00"}
+# These trails are about the flags, the switch-off and the Login, so the duty
+# rule (test_km_rule.DutyTests) is kept out of them.
+DUTY_OFF = {"KM_DUTY_FROM": "2100-01-01T00:00:00+00:00"}
 
 
 @mock.patch.dict(os.environ, OLD_RULE)
@@ -261,7 +264,7 @@ class UntrackedGapTests(APITestCase):
         self.assertEqual(_trail_km(self._trail()), 0.0)
 
 
-@mock.patch.dict(os.environ, NEW_RULE)
+@mock.patch.dict(os.environ, {**NEW_RULE, **DUTY_OFF})
 class NewRuleFlagTests(APITestCase):
     """The same trails, read by the rule since the cutover.
 

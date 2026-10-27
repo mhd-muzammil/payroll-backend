@@ -80,6 +80,10 @@ class AppOnlyPingTests(TestCase):
         joining in. The distance must be the morning's, not the laptop's.
         """
         base = timezone.now() - datetime.timedelta(hours=2)
+        # The morning's duty began before its first fix.
+        DutySession.objects.filter(engineer=self.engineer).update(
+            started_at=base - datetime.timedelta(minutes=1)
+        )
         for i in range(6):
             LocationPing.objects.create(
                 engineer=self.engineer,

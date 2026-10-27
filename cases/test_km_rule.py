@@ -28,6 +28,7 @@ from employees.models import Employee
 DAY = datetime.date(2026, 10, 16)
 NEW_RULE = {"KM_RULE_FROM": "2000-01-01T00:00:00+00:00"}
 OLD_RULE = {"KM_RULE_FROM": "2100-01-01T00:00:00+00:00"}
+DUTY_ON = {"KM_DUTY_FROM": "2000-01-01T00:00:00+00:00"}
 KM = 0.009  # about a kilometre of latitude
 
 
@@ -416,6 +417,170 @@ class CutoverTests(RuleTestCase):
         )
 
 
+class DutyTests(RuleTestCase):
+    """Km only on duty: Login to Logout, and no further than the 12:00 AM after
+    the day of the Login ("2 a", "3 b")."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(os.environ, DUTY_ON)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_road_after_a_logout_is_not_counted(self):
+        """The road home after the Logout, which a phone still tracking used
+        to add to the day (Prashanth K, 10 Oct: 90.6 km after a Logout)."""
+        self.login(at(9), until=at(13))
+        self.fix(at(10), 11.0)
+        self.fix(at(12), 11.0 + 5 * KM)
+        self.fix(at(12, 59), 11.0 + 6 * KM)
+        self.fix(at(14), 11.0 + 16 * KM)
+        self.fix(at(15), 11.0 + 26 * KM)
+        self.assertAlmostEqual(self.km(), 6.0, delta=0.05)
+
+    def test_a_day_with_no_login_counts_nothing(self):
+        self.fix(at(10), 11.0)
+        self.fix(at(11), 11.0 + 5 * KM)
+        self.assertEqual(self.km(), 0.0)
+
+    def test_the_drive_to_a_login_is_still_left_out(self):
+        self.fix(at(8), 11.0)
+        self.fix(at(8, 30), 11.0 + 10 * KM)
+        self.login(at(9))
+        self.fix(at(9, 5), 11.0 + 11 * KM)
+        self.fix(at(9, 30), 11.0 + 12 * KM)
+        self.assertAlmostEqual(self.km(), 1.0, delta=0.05)
+
+    def test_a_logout_and_a_login_again_count_both_duties_and_not_between(self):
+        self.login(at(9), until=at(12))
+        self.fix(at(10), 11.0)
+        self.fix(at(11), 11.0 + KM)
+        self.fix(at(12, 30), 11.0 + 10 * KM)
+        self.login(at(13))
+        self.fix(at(13, 5), 11.0 + 11 * KM)
+        self.fix(at(14), 11.0 + 12 * KM)
+        self.assertAlmostEqual(self.km(), 2.0, delta=0.05)
+
+    def test_a_duty_left_open_stops_counting_at_midnight(self):
+        """Prashanth K, Saturday 7:49 PM: the duty ran on into Sunday, and
+        Sunday read 53 km. It ends at 12:00 AM now, swept or not."""
+        self.login(at(20))
+        sunday = DAY + datetime.timedelta(days=1)
+        self.fix(at(21), 11.0)
+        self.fix(at(22), 11.0 + 5 * KM)
+        self.fix(at(1, day=sunday), 11.0 + 10 * KM)
+        self.fix(at(2, day=sunday), 11.0 + 15 * KM)
+        self.assertAlmostEqual(self.km(), 5.0, delta=0.05)
+
+    def test_a_phone_running_fast_keeps_its_last_line_at_the_logout(self):
+        """Stamped two minutes after the Logout, sent before it: it is the
+        duty's. A fix taken after the Logout is not."""
+        self.login(at(9), until=at(13))
+        self.fix(at(12), 11.0)
+        self.fix(at(13, 2), 11.0 + 2 * KM, received=at(12, 59, 30))
+        self.fix(at(13, 3), 11.0 + 3 * KM, received=at(13, 3))
+        self.assertAlmostEqual(self.km(), 2.0, delta=0.05)
+
+    def test_a_fix_held_on_the_phone_counts_on_a_duty_the_sweep_ended(self):
+        """The sweep ended it at its last fix it had then, 12:00; the
+        afternoon, held on the phone and sent the next morning, is still that
+        duty's. After midnight is not."""
+        session = self.login(at(9))
+        self.fix(at(9, 30), 11.0)
+        self.fix(at(12), 11.0 + 5 * KM)
+        DutySession.objects.filter(pk=session.pk).update(ended_at=at(12), auto_closed=True)
+        morning = at(9, day=DAY + datetime.timedelta(days=1))
+        self.fix(at(15), 11.0 + 8 * KM, received=morning)
+        self.fix(at(0, 30, day=DAY + datetime.timedelta(days=1)), 11.0 + 9 * KM, received=morning)
+        self.assertAlmostEqual(self.km(), 8.0, delta=0.05)
+
+    def test_a_duty_the_sweep_ended_reaches_a_trail_read_on_its_own(self):
+        """A trail that begins after that Logout -- /path for an afternoon --
+        still finds the duty, since its window runs to midnight."""
+        session = self.login(at(9))
+        DutySession.objects.filter(pk=session.pk).update(ended_at=at(9, 30), auto_closed=True)
+        morning = at(9, day=DAY + datetime.timedelta(days=1))
+        afternoon = [
+            self.fix(at(15), 11.0, received=morning),
+            self.fix(at(16), 11.0 + 3 * KM, received=morning),
+        ]
+        self.assertAlmostEqual(_trail_km(afternoon), 3.0, delta=0.05)
+
+    def test_the_midnight_sweep_takes_back_nothing_counted_while_the_duty_ran(self):
+        from cases.views import TrackingViewSet
+
+        self.login(at(18))
+        self.fix(at(18, 30), 11.0)
+        self.fix(at(20), 11.0 + 4 * KM)
+        self.fix(at(21, 30), 11.0 + 7 * KM)
+        while_running = self.km()
+        with mock.patch(
+            "django.utils.timezone.now",
+            return_value=at(8, day=DAY + datetime.timedelta(days=1)),
+        ):
+            TrackingViewSet._close_forgotten_sessions()
+        session = DutySession.objects.get(engineer=self.engineer)
+        self.assertEqual(session.ended_at, at(21, 30), "at its last fix before midnight")
+        self.assertTrue(session.auto_closed)
+        self.assertAlmostEqual(while_running, 7.0, delta=0.05)
+        self.assertEqual(self.km(), while_running)
+
+    def test_a_line_that_arrived_before_the_cutover_is_read_as_before(self):
+        """The deploy at noon: the morning's lines, here before it, count as
+        they did; the afternoon's, with no duty, do not."""
+        self.fix(at(9), 11.0)
+        self.fix(at(10), 11.0 + 3 * KM)
+        self.fix(at(13), 11.0 + 5 * KM)
+        with mock.patch.dict(os.environ, {"KM_DUTY_FROM": at(12).isoformat()}):
+            self.assertAlmostEqual(self.km(), 3.0, delta=0.05)
+
+    def test_a_fix_taken_before_the_cutover_but_sent_after_is_read_as_before(self):
+        self.fix(at(10), 11.0)
+        self.fix(at(11), 11.0 + 2 * KM, received=at(13))
+        with mock.patch.dict(os.environ, {"KM_DUTY_FROM": at(12).isoformat()}):
+            self.assertAlmostEqual(self.km(), 2.0, delta=0.05)
+
+    def test_without_the_setting_the_duty_cutover_is_when_migration_0024_ran(self):
+        applied = MigrationRecorder.Migration.objects.get(
+            app="cases", name=km_rule.DUTY_MIGRATION[1]
+        ).applied
+        with mock.patch.dict(os.environ):
+            os.environ.pop("KM_DUTY_FROM", None)
+            self.assertEqual(km_rule.duty_cutover(), applied)
+            # A day whose fixes all arrived before the deploy reads as it did,
+            # duty or none.
+            self.fix(at(10), 11.0)
+            self.fix(at(11), 11.0 + 2 * KM)
+            self.assertAlmostEqual(self.km(), 2.0, delta=0.05)
+
+    def test_a_duty_setting_that_is_not_a_date_falls_back_to_the_migration(self):
+        with mock.patch.dict(os.environ, {"KM_DUTY_FROM": "next tuesday"}):
+            with self.assertLogs("cases.km_rule", level="WARNING"):
+                cutover = km_rule.duty_cutover()
+        self.assertEqual(
+            cutover,
+            MigrationRecorder.Migration.objects.get(
+                app="cases", name=km_rule.DUTY_MIGRATION[1]
+            ).applied,
+        )
+
+    def test_the_board_reads_only_the_duty(self):
+        """Through the roster, the number the office reads."""
+        self.login(at(9), until=at(13))
+        self.fix(at(10), 11.0)
+        self.fix(at(12), 11.0 + 5 * KM)
+        self.fix(at(15), 11.0 + 25 * KM)
+        office = User.objects.create_user(username="duty-office", password="x", role="admin")
+        client = APIClient()
+        client.force_authenticate(office)
+        row = next(
+            r
+            for r in client.get("/api/tracking/roster/", {"date": DAY.isoformat()}).data
+            if r["engineer_id"] == self.engineer.id
+        )
+        self.assertAlmostEqual(row["distance_km"], 5.0, delta=0.05)
+
+
 class QueryCountTests(TestCase):
     """The board's km costs the same queries for three engineers as for
     thirty: the Logins and events are read once for all of them."""
@@ -425,7 +590,9 @@ class QueryCountTests(TestCase):
         cls.office = User.objects.create_user(username="count-office", password="x", role="admin")
 
     def setUp(self):
-        patcher = mock.patch.dict(os.environ, NEW_RULE)
+        # Both cutovers from the environment: neither costs a lookup of its
+        # migration on the first read in the process.
+        patcher = mock.patch.dict(os.environ, {**NEW_RULE, **DUTY_ON})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.client = APIClient()

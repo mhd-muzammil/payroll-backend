@@ -28,9 +28,10 @@ Scheduled nightly at 11.59pm IST. Note for whoever sets that up: the server
 runs on UTC, so 11.59pm IST is 18:29 UTC -- `29 18 * * *`. The command reads
 the day in IST itself, so it files the rows on the right date either way.
 
-Duty is NOT touched here. An engineer's duty session already closes itself
-(DutySession.MAX_DURATION_HOURS), at their last known position rather than at
-a clock time, which is the honest answer for a trail.
+Duty is NOT touched here. An engineer's duty session already closes itself by
+the 12:00 AM after the day it began (TrackingViewSet._close_forgotten_sessions),
+at their last known position rather than at a clock time, which is the honest
+answer for a trail.
 """
 
 from datetime import datetime, time

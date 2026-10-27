@@ -2019,43 +2019,50 @@ class TrackingViewSet(viewsets.ViewSet):
     # -- duty state ---------------------------------------------------------
 
     @staticmethod
-    def _close_forgotten_sessions():
-        """Auto-close sessions nobody ever stopped, so a missed Stop Duty does
-        not leave someone 'on duty' for days. Cheap and idempotent; run before
-        any read or write of duty state.
+    def _end_forgotten(session):
+        """End a duty nobody ended, at its own last fix before the 12:00 AM
+        after the day it began -- not at the clock time this happens to run.
+        Stamping it now() recorded every hour between the engineer's last
+        position and whenever somebody next opened the board as duty they had
+        worked: a night of it, most mornings. With no fix at all the duty never
+        reported anything, so it has no honest length and ends where it began.
 
-        Closed at the session's own last fix, not at the clock time the sweep
-        happens to run. Stamping it now() recorded every hour between the
-        engineer's last position and whenever somebody next opened the board as
-        duty they had worked -- a night of it, most mornings. Capped at the
-        maximum duration, because a session cannot honestly be longer than the
-        rule that closed it.
-
-        The per-session query costs nothing in the ordinary case: this filter
-        matches no rows at all unless somebody actually forgot.
+        The kilometres read such a duty to its midnight all the same (km_rule),
+        so this takes back nothing already counted. Guarded, so a Logout that
+        lands in between is kept.
         """
-        cutoff = timezone.now() - timedelta(hours=DutySession.MAX_DURATION_HOURS)
-        forgotten = list(
-            DutySession.objects.filter(ended_at__isnull=True, started_at__lt=cutoff)
-        )
-        if not forgotten:
-            return
-        for session in forgotten:
-            window_end = session.started_at + timedelta(hours=DutySession.MAX_DURATION_HOURS)
-            last = (
-                LocationPing.objects.filter(
-                    engineer_id=session.engineer_id,
-                    timestamp__gte=session.started_at,
-                    timestamp__lte=window_end,
-                )
-                .order_by("-timestamp")
-                .first()
+        midnight = km_rule.duty_ends(session.started_at)
+        last = (
+            LocationPing.objects.filter(
+                engineer_id=session.engineer_id,
+                timestamp__gte=session.started_at,
+                timestamp__lt=midnight,
             )
-            # No fix at all means the duty never reported anything, so it has no
-            # honest length: it starts and ends where it started.
-            session.ended_at = last.timestamp if last else session.started_at
-            session.auto_closed = True
-        DutySession.objects.bulk_update(forgotten, ["ended_at", "auto_closed"])
+            .order_by("-timestamp")
+            .first()
+        )
+        ended_at = last.timestamp if last else session.started_at
+        DutySession.objects.filter(pk=session.pk, ended_at__isnull=True).update(
+            ended_at=ended_at, auto_closed=True
+        )
+        session.ended_at = ended_at
+        session.auto_closed = True
+
+    @classmethod
+    def _close_forgotten_sessions(cls):
+        """End every duty nobody ended by the 12:00 AM after the day it began
+        ("3 b": raathiri 12:00 AM-ku taanaa Logout), so a missed Logout does
+        not leave someone on duty through the night and into the next day.
+        Cheap and idempotent; run before any read or write of duty state.
+
+        The filter matches no rows at all unless somebody actually forgot, so
+        in the ordinary case this is one query.
+        """
+        today_start, _ = km_rule.day_bounds(timezone.localdate())
+        for session in DutySession.objects.filter(
+            ended_at__isnull=True, started_at__lt=today_start
+        ):
+            cls._end_forgotten(session)
 
     @classmethod
     def _open_session(cls, employee):
@@ -2091,11 +2098,36 @@ class TrackingViewSet(viewsets.ViewSet):
             raise NoEmployeeProfile()
         return Response(self._duty_payload(employee))
 
+    @staticmethod
+    def _logged_in_today(employee):
+        """Whether the register holds today's Login: a punch, not the midnight
+        date mark the 10:30 rule writes for somebody not in yet."""
+        from attendance import absence
+        from attendance.models import Attendance
+
+        return any(
+            not absence.is_day_mark(row)
+            for row in Attendance.objects.filter(employee=employee, intime__date=timezone.localdate())
+        )
+
     @action(detail=False, methods=["post"], url_path="start_duty")
     def start_duty(self, request):
         employee = _get_employee(request.user)
         if not employee:
             raise NoEmployeeProfile()
+        # A Check In with no Login today starts no duty ("1 a"): the day's
+        # duty, and its km, begin with the Login. After the 12:00 AM auto
+        # Logout this is what keeps a late call from opening the next day's
+        # duty, which the morning Login would then have carried on.
+        data = request.data if hasattr(request.data, "get") else {}
+        if data.get("from") == "check_in" and not self._logged_in_today(employee):
+            return Response(
+                {
+                    "detail": "Login first: tap Login on Attendance. Your duty and km start with it.",
+                    "login_first": True,
+                },
+                status=409,
+            )
         session = self._open_session(employee)
         # A session that began on an earlier day was never stopped -- the app was
         # closed, or the phone closed it for them. Today's Login is the signal
@@ -2107,20 +2139,12 @@ class TrackingViewSet(viewsets.ViewSet):
         # night logged in this morning, was quietly told "already on duty", no row
         # was written for today, and the board read "Not on duty" all day beside
         # his live position and a distance that kept climbing.
+        #
+        # The midnight sweep in _open_session ends such a duty first; this is
+        # for the Login that lands as the clock crosses 12:00 AM, ended the
+        # same way.
         if session and timezone.localtime(session.started_at).date() < timezone.localdate():
-            # Closed at its own last fix rather than now: the engineer stopped
-            # reporting when the phone did, and stamping it with this morning's
-            # clock would invent a night's duty that nobody worked.
-            last = (
-                LocationPing.objects.filter(
-                    engineer=employee, timestamp__gte=session.started_at
-                )
-                .order_by("-timestamp")
-                .first()
-            )
-            session.ended_at = last.timestamp if last else session.started_at
-            session.auto_closed = True
-            session.save(update_fields=["ended_at", "auto_closed"])
+            self._end_forgotten(session)
             session = None
         # Idempotent within the day: tapping Login twice (or a reconnect) must not
         # open a second overlapping session and double-count the day.
@@ -2754,6 +2778,10 @@ class TrackingViewSet(viewsets.ViewSet):
                 return Response({"detail": "date must be YYYY-MM-DD."}, status=400)
         else:
             target_date = timezone.localdate()
+
+        # A duty nobody ended is over at 12:00 AM; say so here too, not only
+        # once the board or a phone has asked.
+        self._close_forgotten_sessions()
 
         pings = list(
             LocationPing.objects.select_related("case")
@@ -3578,6 +3606,8 @@ class TrackingViewSet(viewsets.ViewSet):
         by_id = {engineer.pk: engineer for engineer in visible}
         engineers = [by_id[engineer_id] for engineer_id in ids if engineer_id in by_id]
 
+        # As on the day view: a duty nobody ended is over at 12:00 AM.
+        self._close_forgotten_sessions()
         cells = day_report.build(engineers, days)
         return Response(
             {

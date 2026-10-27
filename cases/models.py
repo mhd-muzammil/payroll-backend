@@ -195,8 +195,9 @@ class DutySession(models.Model):
     duty, for how long, and how far they travelled in that stretch.
     """
 
-    # A session left open this long is treated as forgotten and auto-closed, so
-    # one missed Stop Duty doesn't show an engineer on duty for days.
+    # The longest the phone's own tracker runs (TrackerRules in the APK). The
+    # server ends a forgotten duty sooner: at the 12:00 AM after the day it
+    # began (TrackingViewSet._close_forgotten_sessions).
     MAX_DURATION_HOURS = 16
 
     engineer = models.ForeignKey(
@@ -207,7 +208,7 @@ class DutySession(models.Model):
     started_at = models.DateTimeField(default=timezone.now, db_index=True)
     # NULL means the engineer is still on duty right now.
     ended_at = models.DateTimeField(null=True, blank=True)
-    # Set when MAX_DURATION_HOURS closed it instead of the engineer.
+    # Set when the midnight sweep ended it instead of the engineer.
     auto_closed = models.BooleanField(default=False)
     # The last time the phone was heard from on this duty: a fix it had not
     # sent before, or a post to events/ (an empty one is the heartbeat).
