@@ -3,6 +3,8 @@
 The dropdown's options are written in two places, the model's ACTION_CHOICES
 and the portal's list, and the server refuses anything not in the model's. A
 status added to the portal alone would show in the dropdown and fail on save.
+Nothing here reads the portal's list, so these tests cannot see the two drift
+apart; that stays a check by hand whenever a status is added.
 """
 
 from rest_framework.test import APITestCase
@@ -31,7 +33,7 @@ class CandidateStatusTests(APITestCase):
         self.candidate.refresh_from_db()
         self.assertEqual(self.candidate.action, "Interview Scheduled")
 
-    def test_every_status_in_the_dropdown_is_saved(self):
+    def test_every_status_the_server_lists_is_saved(self):
         for action, _ in Candidate.ACTION_CHOICES:
             with self.subTest(action=action):
                 self.assertEqual(self._set(action).status_code, 200)
