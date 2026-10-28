@@ -264,6 +264,7 @@ class Candidate(models.Model):
         ('Waiting For Joining Date', 'Waiting For Joining Date'),
         ('Salary Discussion', 'Salary Discussion'),
         ('Rejected', 'Rejected'),
+        ('Interview Scheduled', 'Interview Scheduled'),
         ('Decline', 'Decline'),
     )
 
