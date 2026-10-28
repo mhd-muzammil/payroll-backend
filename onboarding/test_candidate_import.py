@@ -7,8 +7,10 @@ of them it is given.
 """
 
 import csv
+import importlib
 import io
 
+from django.apps import apps as django_apps
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.urls import reverse
@@ -104,6 +106,16 @@ class ActionTests(TestCase):
         action, note = map_action("NEW")
         self.assertEqual(action, "In Progress")
         self.assertEqual(note, "NEW")
+
+    def test_an_interview_fixed_or_scheduled_is_the_interview_stage(self):
+        for raw in ("interview_fixed", "Interview Fixed", "INTERVIEW SCHEDULED"):
+            with self.subTest(raw=raw):
+                self.assertEqual(map_action(raw), ("Interview Scheduled", ""))
+
+    def test_a_later_outcome_still_wins_over_the_interview(self):
+        # The interview hints come last, so "fixed, then not interested" is a
+        # Decline, not an interview still to happen.
+        self.assertEqual(map_action("interview fixed, not interested")[0], "Decline")
 
 
 class HeaderDetectionTests(TestCase):
@@ -479,12 +491,12 @@ class ApnaSheetTests(TestCase):
         self.assertIsNone(candidate["previous_company"])
         self.assertNotIn("Not Available", candidate["remarks"])
 
-    def test_the_stage_the_board_reports_is_kept_even_though_we_have_no_such_stage(self):
-        # The portal has no "interview fixed"; inventing one would move 71
-        # people to a stage nobody worked them to. The wording is kept instead.
+    def test_the_boards_interview_fixed_is_the_interview_stage(self):
+        # Apna's "interview_fixed" is the portal's Interview Scheduled. Mapped,
+        # the wording is not repeated in remarks, as with every other stage.
         candidate = self._one()
-        self.assertEqual(candidate["action"], "In Progress")
-        self.assertIn("Status in sheet: interview_fixed", candidate["remarks"])
+        self.assertEqual(candidate["action"], "Interview Scheduled")
+        self.assertNotIn("Status in sheet:", candidate["remarks"])
 
     def test_the_boards_bookkeeping_is_not_carried_into_remarks(self):
         remarks = self._one()["remarks"]
@@ -493,6 +505,56 @@ class ApnaSheetTests(TestCase):
 
     def test_the_resume_link_survives(self):
         self.assertIn("employer.apna.co", self._one()["remarks"])
+
+
+class InterviewFixedMoveTests(TestCase):
+    """Migration 0013: candidates already imported as In Progress with Apna's
+    "interview_fixed" move to Interview Scheduled, and nobody else does."""
+
+    migration = importlib.import_module(
+        "onboarding.migrations.0013_interview_fixed_to_interview_scheduled"
+    )
+
+    def _candidate(self, action, remarks):
+        return Candidate.objects.create(
+            name="Rajan", phone_number="9840323779", action=action, remarks=remarks
+        )
+
+    def _forward(self):
+        self.migration.interview_fixed_to_interview_scheduled(django_apps, None)
+
+    def _actions(self, *candidates):
+        return [Candidate.objects.get(pk=c.pk).action for c in candidates]
+
+    def test_only_the_imported_interview_fixed_still_in_progress_moves(self):
+        remarks = "Status in sheet: interview_fixed\nJob city: Hosur"
+        imported = self._candidate("In Progress", remarks)
+        moved_on_by_hr = self._candidate("Rejected", "Status in sheet: interview_fixed")
+        new_lead = self._candidate("In Progress", "Status in sheet: new_candidate")
+        own_note = self._candidate(
+            "In Progress", "Interview fixed for Monday\nStatus in sheet: shortlisted"
+        )
+        blank = self._candidate("In Progress", "")
+        no_remarks = self._candidate("In Progress", None)
+
+        self._forward()
+        self._forward()  # a second run moves nobody else
+
+        self.assertEqual(
+            self._actions(imported, moved_on_by_hr, new_lead, own_note, blank, no_remarks),
+            ["Interview Scheduled", "Rejected", "In Progress", "In Progress",
+             "In Progress", "In Progress"],
+        )
+        self.assertEqual(Candidate.objects.get(pk=imported.pk).remarks, remarks)
+
+    def test_going_back_returns_only_the_ones_it_moved(self):
+        imported = self._candidate("In Progress", "Status in sheet: interview_fixed")
+        chosen_by_hr = self._candidate("Interview Scheduled", "Status in sheet: new_candidate")
+
+        self._forward()
+        self.migration.interview_scheduled_back_to_in_progress(django_apps, None)
+
+        self.assertEqual(self._actions(imported, chosen_by_hr), ["In Progress", "Interview Scheduled"])
 
 
 class WorkIndiaSheetTests(TestCase):

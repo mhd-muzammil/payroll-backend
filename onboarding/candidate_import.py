@@ -84,6 +84,10 @@ ACTION_HINTS: tuple[tuple[str, str], ...] = (
     ("salary discussion", "Salary Discussion"),
     ("waiting for acceptance", "Waiting For Acceptance"),
     ("waiting for joining", "Waiting For Joining Date"),
+    # Apna's own word for it is "interview_fixed".
+    ("interview_fixed", "Interview Scheduled"),
+    ("interview fixed", "Interview Scheduled"),
+    ("interview scheduled", "Interview Scheduled"),
 )
 
 # Columns about the vacancy, not the person sitting in front of it. "Job city"
