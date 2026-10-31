@@ -424,7 +424,19 @@ class PayslipViewSet(viewsets.ModelViewSet):
         # the table, and setting them back to Active in onboarding shows the
         # lot again. Payslip generation already skips them: it only ever picks
         # up status='active'.
-        queryset = queryset.exclude(employee__status="relieved")
+        #
+        # The Employee Pay Report asks for them back (with_relieved=1) and
+        # marks them Relieved: a month they worked is a month paid, and the
+        # Payroll page's totals count it, so without them the two disagreed.
+        # Only the office, and only a list that asks; by its id a slip of
+        # theirs opens, edits and downloads like any other, so a row on the
+        # report works. Every list-level route -- including any added later --
+        # keeps leaving them out unless it asks.
+        wants_relieved = role != "employee" and (
+            bool(self.detail) or self.request.query_params.get("with_relieved") == "1"
+        )
+        if not wants_relieved:
+            queryset = queryset.exclude(employee__status="relieved")
 
         month = self.request.query_params.get('month')
         year = self.request.query_params.get('year')

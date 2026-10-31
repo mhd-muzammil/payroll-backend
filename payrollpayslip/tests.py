@@ -727,3 +727,70 @@ class PayslipIsPrivateUntilSentTests(APITestCase):
         self._as_employee()
         response = self.client.get(f"/api/payslips/{self.slip.id}/pdf_ticket/")
         self.assertEqual(response.status_code, 200, response.content)
+
+
+class RelievedSlipsOnThePayReportTests(APITestCase):
+    """A month somebody worked is a month paid, relieved since or not.
+
+    The Payroll page's month totals count every slip of the month. The
+    Employee Pay Report left out whoever had been relieved, so the two
+    disagreed: August read 6,42,400 on one and 4,99,366.86 on the other. The
+    report now asks for them (with_relieved=1) and marks them Relieved; every
+    other list of the working staff still leaves them out.
+    """
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username="admin-stats", password="x", role="admin")
+        self.client.force_authenticate(self.admin)
+        self.slips = {}
+        for name, status, paid in (
+            ("Still Here", "active", True),
+            ("On A Break", "inactive", False),
+            ("Has Left", "relieved", False),
+        ):
+            employee = make_employee(name, datetime.date(2025, 1, 1), status=status)
+            fields = compute_payslip_fields(employee, PERIOD, 0)
+            self.slips[status] = Payslip.objects.create(
+                employee=employee, month=8, year=2026, status="Paid" if paid else "Generated", **fields
+            )
+
+    def _rows(self, query):
+        response = self.client.get(f"/api/payslips/?{query}")
+        self.assertEqual(response.status_code, 200, response.content)
+        rows = response.json()
+        return rows if isinstance(rows, list) else rows.get("results", [])
+
+    def test_the_report_lists_them_and_agrees_with_the_totals(self):
+        rows = self._rows("month=8&year=2026&with_relieved=1")
+        stats = self.client.get("/api/payslips/company_stats/?month=8&year=2026").json()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(stats["slipsCount"], len(rows))
+        self.assertEqual(
+            Decimal(str(stats["generatedNetRaw"])), sum(Decimal(str(row["net_salary"])) for row in rows)
+        )
+        # What the report needs to mark them.
+        marked = {row["employee_details"]["employee_name"]: row["employee_details"]["status"] for row in rows}
+        self.assertEqual(marked["Has Left"], "relieved")
+
+    def test_every_other_list_still_leaves_them_out(self):
+        """The Payroll page's roster, the Generate tab and the rest list the
+        working staff, and are untouched."""
+        names = [row["employee_details"]["employee_name"] for row in self._rows("month=8&year=2026")]
+        self.assertEqual(sorted(names), ["On A Break", "Still Here"])
+
+    def test_a_listed_slip_of_theirs_opens_by_its_id(self):
+        relieved = self.slips["relieved"]
+        self.assertEqual(self.client.get(f"/api/payslips/{relieved.id}/").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/payslips/{relieved.id}/pdf_ticket/").status_code, 200)
+
+    def test_an_employee_never_gets_them_back(self):
+        """The flag is the office's: on an employee's own list it changes nothing."""
+        relieved = self.slips["relieved"]
+        user = User.objects.create_user(username="left-one", password="x", role="employee")
+        relieved.employee.user = user
+        relieved.employee.save()
+        relieved.sent_at = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
+        relieved.save()
+        self.client.force_authenticate(user)
+        self.assertEqual(self._rows("with_relieved=1"), [])
+        self.assertEqual(self.client.get(f"/api/payslips/{relieved.id}/").status_code, 404)
