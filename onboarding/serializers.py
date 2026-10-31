@@ -330,6 +330,9 @@ class AppointmentOrderSerializer(serializers.ModelSerializer):
     offer_ref = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     has_photo = serializers.SerializerMethodField()
+    has_signature_photo = serializers.SerializerMethodField()
+    # Where the employee was when signing, as their phone said: never written here.
+    location = serializers.SerializerMethodField()
 
     class Meta:
         model = AppointmentOrder
@@ -338,6 +341,7 @@ class AppointmentOrderSerializer(serializers.ModelSerializer):
             "order_date", "joining_date",
             "basic", "hra", "conveyance", "cea", "personal_allowance", "professional_tax",
             "email", "status", "sent_at", "viewed_at", "signed_at", "has_photo",
+            "has_signature_photo", "location",
             "gross", "net", "ctc", "created_by_name", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "sent_at", "viewed_at", "signed_at", "created_at", "updated_at"]
@@ -365,6 +369,25 @@ class AppointmentOrderSerializer(serializers.ModelSerializer):
 
     def get_has_photo(self, obj):
         return bool(obj.signer_photo)
+
+    def get_has_signature_photo(self, obj):
+        return bool(obj.signature_photo)
+
+    def get_location(self, obj):
+        """{latitude, longitude, accuracy, text, map}, or None before signing
+        and on orders signed before the location step."""
+        from .appointment_order.signing import map_url, where
+
+        if obj.signer_lat is None or obj.signer_lon is None:
+            return None
+        accuracy = obj.signer_accuracy if obj.signer_accuracy is not None else 0.0
+        return {
+            "latitude": obj.signer_lat,
+            "longitude": obj.signer_lon,
+            "accuracy": accuracy,
+            "text": where(obj.signer_lat, obj.signer_lon, accuracy),
+            "map": map_url(obj.signer_lat, obj.signer_lon),
+        }
 
     def _text(self, value, field):
         value = _CONTROL.sub("", value or "").strip()

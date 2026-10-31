@@ -1,11 +1,13 @@
 """Sending an appointment order to be signed, and the signing itself.
 
 The employee gets a link by email. It opens the order on their phone with no
-login; to sign they draw a signature, tick that they agree, take a photo of
-themselves with the page's camera, and type a code emailed to the same
-address -- the code shows it was their email, the photo shows HR their face.
-The link is a long random token, kept on the order and replaced every time it
-is sent, and any change to the order kills it.
+login; to sign they tick that they agree, sign on paper and take a photo of it
+with the page's camera, take a photo of themselves, share their location, and
+type a code emailed to the same address -- the code shows it was their email,
+the photos show HR their hand and their face, the location where they were.
+The ink on the letter is taken from the photo of the paper. The link is a long
+random token, kept on the order and replaced every time it is sent, and any
+change to the order kills it.
 """
 import base64
 import binascii
@@ -13,6 +15,7 @@ import hashlib
 import io
 import ipaddress
 import logging
+import math
 import re
 import secrets
 from datetime import timedelta
@@ -40,8 +43,8 @@ CODE_LIFETIME = timedelta(minutes=10)
 CODE_GAP = timedelta(seconds=60)
 MAX_CODE_SENDS = 10
 MAX_CODE_TRIES = 5
-MAX_SIGNATURE_BYTES = 300_000
 MAX_PHOTO_BYTES = 1_500_000
+MAX_SIGNATURE_PHOTO_BYTES = 2_000_000
 
 
 class SigningError(Exception):
@@ -246,53 +249,65 @@ def send_code(order):
     return {"sent_to": mask_email(order.email), "expires_in": int(CODE_LIFETIME.total_seconds())}
 
 
-def clean_signature(data_url):
-    """The drawn signature as a PNG cropped to its ink. Refuses anything that
-    is not a PNG, is too big, or has next to nothing drawn on it."""
+def _camera_jpeg(data_url, missing, max_bytes):
+    """A JPEG data URL as the signing page's camera sends it, opened. Refuses
+    anything that is not a JPEG the size a camera takes."""
     from PIL import Image, UnidentifiedImageError
 
-    match = re.fullmatch(r"data:image/png;base64,([A-Za-z0-9+/=\s]+)", data_url or "")
-    if not match or len(match.group(1)) > MAX_SIGNATURE_BYTES * 4 // 3 + 4:
-        raise SigningError("Draw your signature in the box.")
-    try:
-        raw = base64.b64decode(match.group(1), validate=False)
-        image = Image.open(io.BytesIO(raw))
-        if image.format != "PNG" or image.width > 3000 or image.height > 1500:
-            raise SigningError("Draw your signature in the box.")
-        image = image.convert("RGBA")
-    except (binascii.Error, UnidentifiedImageError, OSError, ValueError):
-        raise SigningError("Draw your signature in the box.")
-    alpha = image.getchannel("A").point(lambda a: 255 if a > 40 else 0)
-    box = alpha.getbbox()
-    inked = sum(1 for a in alpha.getdata() if a)
-    if not box or inked < 150 or (box[2] - box[0]) < 40:
-        raise SigningError("That signature is too small. Draw your full signature in the box.")
-    pad = 8
-    box = (max(box[0] - pad, 0), max(box[1] - pad, 0), min(box[2] + pad, image.width), min(box[3] + pad, image.height))
-    out = io.BytesIO()
-    image.crop(box).save(out, format="PNG")
-    return out.getvalue()
-
-
-def clean_photo(data_url):
-    """The photo from the signing page's camera, saved afresh as a JPEG, so
-    nothing but the picture is kept. Refuses anything that is not a JPEG the
-    size a camera takes, and a frame that came out black or blank."""
-    from PIL import Image, ImageStat, UnidentifiedImageError
-
-    # A page from before the camera step sends no photo at all.
-    missing = "Take your photo with the camera before signing. If this page has no camera step, reload it."
-    match = re.fullmatch(r"data:image/jpeg;base64,([A-Za-z0-9+/=\s]+)", data_url or "")
-    if not match or len(match.group(1)) > MAX_PHOTO_BYTES * 4 // 3 + 4:
+    if not isinstance(data_url, str):
+        raise SigningError(missing)
+    match = re.fullmatch(r"data:image/jpeg;base64,([A-Za-z0-9+/=\s]+)", data_url)
+    if not match or len(match.group(1)) > max_bytes * 4 // 3 + 4:
         raise SigningError(missing)
     try:
         raw = base64.b64decode(match.group(1), validate=False)
         image = Image.open(io.BytesIO(raw))
         if image.format != "JPEG" or min(image.size) < 120 or max(image.size) > 2000:
             raise SigningError(missing)
-        image = image.convert("RGB")
+        return image.convert("RGB")
     except (binascii.Error, UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError):
         raise SigningError(missing)
+
+
+def clean_signature_photo(data_url):
+    """The photo of the signature on paper, saved afresh as a JPEG, and the ink
+    taken from it as a PNG -- the ink is what goes on the letter. Refuses a
+    photo with no usable signature in it, saying what to change."""
+    from .ink import NoSignature, extract_ink
+
+    # A page from before the paper signature sends a drawn one, or nothing.
+    missing = (
+        "Take a photo of your signature on paper with the camera. "
+        "If this page asks you to draw it instead, reload it."
+    )
+    image = _camera_jpeg(data_url, missing, MAX_SIGNATURE_PHOTO_BYTES)
+    try:
+        png = extract_ink(image)
+    except NoSignature as exc:
+        raise SigningError(str(exc))
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=90)
+    return out.getvalue(), png
+
+
+def preview_signature(order, data_url):
+    """The ink the signing would take from this photo, for the page to show
+    before anyone signs: what you see is what goes on the letter."""
+    if order.signed_at:
+        raise SigningError("This appointment order is already signed.", 409)
+    _, png = clean_signature_photo(data_url)
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def clean_photo(data_url):
+    """The photo from the signing page's camera, saved afresh as a JPEG, so
+    nothing but the picture is kept. Refuses anything that is not a JPEG the
+    size a camera takes, and a frame that came out black or blank."""
+    from PIL import ImageStat
+
+    # A page from before the camera step sends no photo at all.
+    missing = "Take your photo with the camera before signing. If this page has no camera step, reload it."
+    image = _camera_jpeg(data_url, missing, MAX_PHOTO_BYTES)
     if ImageStat.Stat(image.convert("L")).stddev[0] < 6:
         raise SigningError("The photo came out dark or blank. Take it again, facing the camera in good light.")
     out = io.BytesIO()
@@ -300,16 +315,52 @@ def clean_photo(data_url):
     return out.getvalue()
 
 
-def sign(order_id, code, signature, photo, agreed, ip, user_agent):
-    """Sign the order with the drawn signature and the photo, if the code is
-    right. Returns the order. A wrong code is counted even though the call
-    fails; a missing photo or signature is refused before the code is tried."""
+def clean_location(location):
+    """Where the phone said it was when signing: latitude, longitude, and how
+    sure it was in metres. Compulsory; only real coordinates are taken, as
+    they came, rounded to what a phone can tell (about 10 cm)."""
+    missing = "Share your location before signing. If this page does not ask for it, reload it."
+    if not isinstance(location, dict):
+        raise SigningError(missing)
+    try:
+        latitude = float(location.get("latitude"))
+        longitude = float(location.get("longitude"))
+        accuracy = float(location.get("accuracy"))
+    except (TypeError, ValueError, OverflowError):  # OverflowError: a whole number too big for a float
+        raise SigningError(missing)
+    if not all(math.isfinite(value) for value in (latitude, longitude, accuracy)):
+        raise SigningError(missing)
+    if (
+        not (-90 <= latitude <= 90 and -180 <= longitude <= 180)
+        or (latitude == 0 and longitude == 0)
+        or not (0 <= accuracy <= 1_000_000)
+    ):
+        raise SigningError("That location could not be used. Share your location again.")
+    return round(latitude, 6), round(longitude, 6), round(accuracy, 1)
+
+
+def map_url(latitude, longitude):
+    """The place on Google Maps, for HR and the signed copy."""
+    return f"https://www.google.com/maps?q={latitude:.6f},{longitude:.6f}"
+
+
+def where(latitude, longitude, accuracy):
+    """13.082700, 80.270700 (within 20 m) -- as the record and HR show it."""
+    return f"{latitude:.6f}, {longitude:.6f} (within {accuracy:,.0f} m)"
+
+
+def sign(order_id, code, signature_photo, photo, location, agreed, ip, user_agent):
+    """Sign the order with the ink from the photo of the paper signature, the
+    photo of the employee and their location, if the code is right. Returns
+    the order. A wrong code is counted even though the call fails; a missing
+    photo, signature or location is refused before the code is tried."""
     from ..models import AppointmentOrder
 
     if agreed is not True:
         raise SigningError("Tick that you agree to the conditions stated in the Appointment Order.")
-    png = clean_signature(signature)
+    signature_jpeg, png = clean_signature_photo(signature_photo)
     jpeg = clean_photo(photo)
+    latitude, longitude, accuracy = clean_location(location)
     code = re.sub(r"\D", "", str(code or ""))
 
     problem = None
@@ -340,6 +391,8 @@ def sign(order_id, code, signature, photo, agreed, ip, user_agent):
             order.signer_ip = ip
             order.signer_user_agent = (user_agent or "")[:255]
             order.signer_photo_sha256 = sha256(jpeg)
+            order.signature_photo_sha256 = sha256(signature_jpeg)
+            order.signer_lat, order.signer_lon, order.signer_accuracy = latitude, longitude, accuracy
             record = [
                 ("Document", f"Appointment Order for {order.salutation} {order.name}, {order.designation}"),
                 ("Reference", f"AO-{order.pk}"),
@@ -349,15 +402,23 @@ def sign(order_id, code, signature, photo, agreed, ip, user_agent):
                          "and typed in correctly."),
                 ("Agreed", f"Ticked: “{AGREEMENT}”"),
                 ("Signed", f"{_when(now)} (India time)"),
+                ("Signature", "Signed on paper and photographed with the camera on the signing page; "
+                              "the signature on pages 1 to 3 is the ink from that photo. Both are below."),
                 ("Photo", "Taken with the camera on the signing page when signing. It is below."),
+                ("Location", f"{where(latitude, longitude, accuracy)}, as the phone reported it on the signing page."),
+                ("Map", map_url(latitude, longitude)),
                 ("IP address", ip or "-"),
                 ("Device", order.signer_user_agent or "-"),
                 ("Document SHA-256", [order.sent_pdf_sha256[:32], order.sent_pdf_sha256[32:]]),
+                ("Signature photo SHA-256", [order.signature_photo_sha256[:32], order.signature_photo_sha256[32:]]),
                 ("Photo SHA-256", [order.signer_photo_sha256[:32], order.signer_photo_sha256[32:]]),
             ]
-            signed = sign_pdf(sent, png, now, record, photo=jpeg)
+            signed = sign_pdf(sent, png, now, record, photo=jpeg, signature_photo=signature_jpeg)
             stamp = secrets.token_hex(6)
             order.signature.save(f"order-{order.pk}-signature-{stamp}.png", ContentFile(png), save=False)
+            order.signature_photo.save(
+                f"order-{order.pk}-signature-photo-{stamp}.jpg", ContentFile(signature_jpeg), save=False
+            )
             order.signer_photo.save(f"order-{order.pk}-photo-{stamp}.jpg", ContentFile(jpeg), save=False)
             order.signed_pdf.save(f"order-{order.pk}-signed-{stamp}.pdf", ContentFile(signed), save=False)
             order.signed_pdf_sha256 = sha256(signed)

@@ -8,6 +8,7 @@ from .views import (
     OnboardingViewSet,
     PublicAppointmentOrderCodeView,
     PublicAppointmentOrderPdfView,
+    PublicAppointmentOrderSignaturePreviewView,
     PublicAppointmentOrderSignView,
     PublicAppointmentOrderView,
     PublicOfferRespondView,
@@ -32,6 +33,11 @@ urlpatterns = [
     path('appointment/<str:token>/pdf/', PublicAppointmentOrderPdfView.as_view(), name='public-appointment-pdf'),
     path('appointment/<str:token>/code/', PublicAppointmentOrderCodeView.as_view(), name='public-appointment-code'),
     path('appointment/<str:token>/sign/', PublicAppointmentOrderSignView.as_view(), name='public-appointment-sign'),
+    path(
+        'appointment/<str:token>/signature-preview/',
+        PublicAppointmentOrderSignaturePreviewView.as_view(),
+        name='public-appointment-signature-preview',
+    ),
     # The candidate answering an offer mail (Accept / Decline).
     path('offer/<str:token>/', PublicOfferView.as_view(), name='public-offer'),
     path('offer/<str:token>/respond/', PublicOfferRespondView.as_view(), name='public-offer-respond'),

@@ -10,7 +10,8 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.exceptions import ParseError
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from authentication.permissions import IsHRStaff
@@ -634,6 +635,21 @@ class AppointmentOrderViewSet(viewsets.ModelViewSet):
         response["X-Content-Type-Options"] = "nosniff"
         return response
 
+    @action(detail=True, methods=["get"], url_path="signature-photo")
+    def signature_photo(self, request, pk=None):
+        """The photo of the signature on paper the employee took when signing:
+        the ink on the letter was taken from it."""
+        from django.http import HttpResponse
+
+        order = self.get_object()
+        if not order.signature_photo:
+            return Response({"detail": "This order has no signature photo."}, status=404)
+        with order.signature_photo.open("rb") as fh:
+            response = HttpResponse(fh.read(), content_type="image/jpeg")
+        response["Cache-Control"] = "no-store"
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+
 
 class _PublicAppointmentOrder(APIView):
     """The employee's end of an appointment order: no login, the token in the
@@ -644,12 +660,32 @@ class _PublicAppointmentOrder(APIView):
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "appointment_sign"
+    # The page sends JSON and nothing else: no upload is ever spooled to /tmp.
+    parser_classes = [JSONParser]
+    # Two camera photos as data URLs come to well under this. Django's own
+    # upload limit never sees a JSON body read by DRF, so it is checked here,
+    # before anything is read.
+    MAX_BODY = 6_000_000
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        try:
+            length = int(request.META.get("CONTENT_LENGTH") or 0)
+        except ValueError:
+            length = 0
+        if length > self.MAX_BODY:
+            raise ParseError("That is too big to send. Take the photos again.")
 
     def _order(self, token):
         order = AppointmentOrder.objects.filter(sign_token=token).first() if token else None
         if order is None:
             raise Http404
         return order
+
+    @staticmethod
+    def _sent(request):
+        """What the page sent, or nothing if it was not a JSON object."""
+        return request.data if isinstance(request.data, dict) else {}
 
 
 class PublicAppointmentOrderView(_PublicAppointmentOrder):
@@ -688,19 +724,39 @@ class PublicAppointmentOrderSignView(_PublicAppointmentOrder):
         from .appointment_order.signing import SigningError, client_ip, email_signed_copy, sign
 
         order = self._order(token)
+        sent = self._sent(request)
         try:
             order = sign(
                 order.pk,
-                request.data.get("code"),
-                request.data.get("signature"),
-                request.data.get("photo"),
-                request.data.get("agree"),
+                sent.get("code"),
+                sent.get("signature_photo"),
+                sent.get("photo"),
+                sent.get("location"),
+                sent.get("agree"),
                 client_ip(request),
                 request.META.get("HTTP_USER_AGENT", ""),
             )
         except SigningError as exc:
             return _signing_error(exc)
         return Response({"signed": True, "signed_at": order.signed_at, "emailed": email_signed_copy(order)})
+
+
+class PublicAppointmentOrderSignaturePreviewView(_PublicAppointmentOrder):
+    """The ink the signing would take from a photo of the paper signature, so
+    the employee sees what goes on the letter -- and can take it again --
+    before they sign. Nothing is kept. Counted apart from the signing itself,
+    so retakes never use up the tries the signing needs."""
+
+    throttle_scope = "appointment_preview"
+
+    def post(self, request, token):
+        from .appointment_order.signing import SigningError, preview_signature
+
+        order = self._order(token)
+        try:
+            return Response({"signature": preview_signature(order, self._sent(request).get("signature_photo"))})
+        except SigningError as exc:
+            return _signing_error(exc)
 
 
 class _PublicOffer(APIView):

@@ -531,16 +531,23 @@ def _when(moment):
 
 # The photo on the record page fits in a square this big: about passport size.
 PHOTO_SIZE = 130.0
+# The photo of the paper signature goes under the ink taken from it, in a box
+# as wide as the ink's.
+SIGNATURE_PHOTO_BOX = (160.0, 80.0)
+# Nothing on the record page goes lower than this: the letterhead's footer
+# starts 767pt down the page.
+RECORD_BOTTOM = 755.0
 
 
-def sign_pdf(sent_pdf, signature_png, signed_at, record, photo=None):
+def sign_pdf(sent_pdf, signature_png, signed_at, record, photo=None, signature_photo=None):
     """The PDF the employee was shown, with their signature where the print
     has it, the date beside "Date:", and a last page saying how it was signed.
 
-    record is the audit trail: a list of (label, value) lines; photo, the JPEG
-    the signing page's camera took, goes under the signature on that page.
-    Pages 1-3 are the bytes that were sent, untouched underneath; only ink is
-    laid on top.
+    record is the audit trail: a list of (label, value) lines, the Map row's
+    address made a link; signature_photo, the JPEG the signing page's
+    camera took of the paper they signed, goes under the signature on that
+    page, and photo, the one it took of the employee, beside them. Pages 1-3
+    are the bytes that were sent, untouched underneath; only ink is laid on top.
     """
     from django.utils import timezone
     from pypdf import PdfReader, PdfWriter
@@ -586,16 +593,41 @@ def sign_pdf(sent_pdf, signature_png, signed_at, record, photo=None):
                 continue
             for wrapped in wrap([(str(line), False, False)], RIGHT - value_x, 10.5):
                 _draw(page, wrapped, value_x, y, 10.5)
+                if label == "Map":
+                    # The map's address is a link, over the text as drawn. Only
+                    # that row: the Device row is whatever the browser sent.
+                    page.linkURL(str(line), (value_x, PAGE_H - y - 3, value_x + _width(wrapped, 10.5),
+                                             PAGE_H - y + 10), relative=0)
                 y += 14
         y += 6
-    _draw(page, [("Signature drawn", True, False)], LEFT, y + 10, 10.5)
-    page.drawImage(image, value_x, PAGE_H - (y + 52), 160, 50, mask="auto",
+    # The signature as on pages 1 to 3 with the photo of the paper it was taken
+    # from under it, and the employee's photo beside them: all smaller alike
+    # when a long record leaves less room above the footer.
+    _draw(page, [("Signature and photos" if photo or signature_photo else "Signature", True, False)],
+          LEFT, y + 10, 10.5)
+    top = y + 2
+    paper = ImageReader(io.BytesIO(signature_photo)) if signature_photo else None
+    selfie = ImageReader(io.BytesIO(photo)) if photo else None
+
+    def fitted(reader, box):
+        width, height = reader.getSize()
+        fit = min(box[0] / width, box[1] / height)
+        return width * fit, height * fit
+
+    paper_w, paper_h = fitted(paper, SIGNATURE_PHOTO_BOX) if paper else (0.0, 0.0)
+    selfie_w, selfie_h = fitted(selfie, (PHOTO_SIZE, PHOTO_SIZE)) if selfie else (0.0, 0.0)
+    tall = max(50 + (8 + paper_h if paper else 0), selfie_h)
+    scale = max(0.3, min(1.0, (RECORD_BOTTOM - top - (14 if paper or selfie else 0)) / tall))
+    page.drawImage(image, value_x, PAGE_H - (top + 50 * scale), 160 * scale, 50 * scale, mask="auto",
                    preserveAspectRatio=True, anchor="sw")
-    if photo:
-        top = y + 68
-        _draw(page, [("Photo taken", True, False)], LEFT, top + 8, 10.5)
-        page.drawImage(ImageReader(io.BytesIO(photo)), value_x, PAGE_H - (top + PHOTO_SIZE),
-                       PHOTO_SIZE, PHOTO_SIZE, preserveAspectRatio=True, anchor="nw")
+    captions = top + tall * scale + 12
+    if paper:
+        page.drawImage(paper, value_x, PAGE_H - (top + (58 + paper_h) * scale), paper_w * scale, paper_h * scale)
+        _draw(page, [("The signature on paper", False, False)], value_x, captions, 9)
+    if selfie:
+        x = value_x + 175
+        page.drawImage(selfie, x, PAGE_H - (top + selfie_h * scale), selfie_w * scale, selfie_h * scale)
+        _draw(page, [("The employee", False, False)], x, captions, 9)
     page.showPage()
     page.save()
     audit_page = PdfReader(io.BytesIO(_on_letterhead(audit.getvalue(), "Signature record"))).pages[0]

@@ -229,6 +229,9 @@ REST_FRAMEWORK = {
         # An employee opening and signing their appointment order: a handful of
         # calls each, and several may sign from the office's one address.
         "appointment_sign": "120/hour",
+        # Reading the ink from a photo of their paper signature, once per take:
+        # counted apart, so retakes never use up the signing's own tries.
+        "appointment_preview": "120/hour",
         # A candidate answering an offer mail: a page view and one answer.
         "offer_response": "60/hour",
     },

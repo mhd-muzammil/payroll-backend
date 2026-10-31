@@ -382,11 +382,12 @@ class AppointmentOrder(models.Model):
     onboarding/appointment_order), signed by the employee online.
 
     Send makes a link (sign_token) and keeps the exact PDF it points at
-    (sent_pdf). The employee reads it, draws a signature, takes a photo of
-    themselves with the page's camera and types a code emailed to them; the
-    signed copy is that same PDF with the signature laid on it and a last page
-    saying how it was signed, photo included. Changing anything after sending
-    kills the link, so nobody signs words that have since changed.
+    (sent_pdf). The employee reads it, signs on paper and photographs it with
+    the page's camera, takes a photo of themselves, shares their location and
+    types a code emailed to them; the signed copy is that same PDF with the ink
+    from the paper laid on it and a last page saying how it was signed, photos
+    and place included. Changing anything after sending kills the link, so
+    nobody signs words that have since changed.
     """
 
     SALUTATION_CHOICES = (("MR.", "MR."), ("MS.", "MS."))
@@ -436,6 +437,17 @@ class AppointmentOrder(models.Model):
     # was. Orders signed before the camera step have none.
     signer_photo = models.FileField(upload_to="hiring/appointment_orders/", blank=True)
     signer_photo_sha256 = models.CharField(max_length=64, blank=True, default="")
+    # The photo of the signature on paper, as the camera took it; the ink in
+    # `signature` was taken from it. Orders signed before the paper signature
+    # have none (their signature was drawn on screen).
+    # A default in the database too, so the code before these columns can
+    # still create orders if it is ever put back (it does not know them).
+    signature_photo = models.FileField(upload_to="hiring/appointment_orders/", blank=True, db_default="")
+    signature_photo_sha256 = models.CharField(max_length=64, blank=True, default="", db_default="")
+    # Where the phone said it was when signing. Empty on older orders.
+    signer_lat = models.FloatField(null=True, blank=True)
+    signer_lon = models.FloatField(null=True, blank=True)
+    signer_accuracy = models.FloatField(null=True, blank=True, help_text="Metres, as the phone reported")
     signed_pdf = models.FileField(upload_to="hiring/appointment_orders/", blank=True)
     signed_pdf_sha256 = models.CharField(max_length=64, blank=True, default="")
 
