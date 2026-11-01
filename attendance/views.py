@@ -976,7 +976,18 @@ class AttendanceViewSet(viewsets.ModelViewSet):
         # People who have left come off the attendance list. The rows survive —
         # they are what past payroll was calculated from — they just stop being
         # part of today's working view.
-        queryset = queryset.exclude(employee__status="relieved")
+        #
+        # The Attendance page asks for them back (with_relieved=1) and marks
+        # them Relieved: the days they worked stay on it, as on the payslip
+        # and payroll screens; a day after they left has no row, so it never
+        # shows. Only the office, and only a list that asks -- the WhatsApp
+        # poster's reads send nothing, and the 10:30 Absent rule never comes
+        # here. By its id a row of theirs opens and edits like any other.
+        wants_relieved = role != "employee" and (
+            bool(self.detail) or self.request.query_params.get("with_relieved") == "1"
+        )
+        if not wants_relieved:
+            queryset = queryset.exclude(employee__status="relieved")
 
         # Optional, non-breaking filters on `intime`. When none are supplied the
         # full list is returned exactly as before. The frontend opts in to a

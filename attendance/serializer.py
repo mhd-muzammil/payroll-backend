@@ -14,6 +14,10 @@ class AttendanceSerializer(serializers.ModelSerializer):
     # filter, built from the copies, listed names nobody uses any more and
     # split one person's days between two of them. The filter reads this.
     employee_role = serializers.SerializerMethodField()
+    # Whether the person has since been relieved, so the Attendance page can
+    # mark the days they worked "Relieved" (and leave them out of the
+    # WhatsApp picture, as the poster's text leaves them out).
+    employee_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Attendance
@@ -36,6 +40,9 @@ class AttendanceSerializer(serializers.ModelSerializer):
     def get_employee_role(self, obj):
         # A row that belongs to nobody has only its copy to go by.
         return obj.employee.role if obj.employee else obj.role
+
+    def get_employee_status(self, obj):
+        return obj.employee.status if obj.employee else None
 
     def _get_employee_for_user(self, user):
         try:
