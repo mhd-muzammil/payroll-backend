@@ -2,7 +2,7 @@
 
 They have to come out the way a payslip counts them, or the P&L charges a
 different salary from the one Payroll pays: only Absent days are unpaid,
-casual leave covers one of them a cycle after six months' service, Leave and
+casual leave covers one of them a cycle from the seventh full cycle, Leave and
 Sundays are paid, and a finished cycle's own payslip is the final word.
 """
 import datetime
@@ -79,7 +79,7 @@ class WorkingDaysTests(TestCase):
         self.assertEqual(row["unmarked_days"], 22)
         self.assertIsNone(row["payslip"])
 
-    def test_casual_leave_covers_one_absence_after_six_months(self):
+    def test_casual_leave_covers_one_absence_from_the_seventh_cycle(self):
         veteran = self._employee("Old Hand", "old@x.in", date_of_joining=datetime.date(2025, 1, 10))
         rookie = self._employee("New Hand", "new@x.in", date_of_joining=datetime.date(2026, 6, 1))
         for emp in (veteran, rookie):

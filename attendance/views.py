@@ -1041,8 +1041,8 @@ class AttendanceViewSet(viewsets.ModelViewSet):
                          (a Leave row, and every Sunday, is paid)
           half_days      distinct days marked Half Day -- half a day unpaid each
           casual_leave_days  of those absences, what casual leave covers: one a
-                         salary cycle once six months' service are done, exactly
-                         as payslip generation applies it
+                         salary cycle from the seventh full cycle of service,
+                         exactly as payslip generation applies it
           lop_days       absent_days + half_days / 2 - casual_leave_days
           unmarked_days  working days (not Sundays) with no row at all; the
                          payslip pays them, the office may want to mark them

@@ -26,8 +26,8 @@ from employees.models import Employee
 from .models import Payslip
 from .views import (
     CASUAL_LEAVE_DAYS_PER_MONTH,
-    CASUAL_LEAVE_ELIGIBILITY_MONTHS,
-    _months_of_service,
+    CASUAL_LEAVE_FROM_CYCLE,
+    _first_full_cycle,
     casual_leave_available,
     compute_payslip_fields,
 )
@@ -52,26 +52,30 @@ def make_employee(name, doj=None, **extra):
     )
 
 
-class MonthsOfServiceTests(TestCase):
-    def test_the_month_turns_on_the_day_of_the_month_they_joined(self):
-        joined = datetime.date(2025, 1, 15)
-        self.assertEqual(_months_of_service(joined, datetime.date(2025, 7, 14)), 5)
-        self.assertEqual(_months_of_service(joined, datetime.date(2025, 7, 15)), 6)
+class FirstFullCycleTests(TestCase):
+    """The first whole 25th-24th cycle worked, as the payslip it is paid on."""
 
-    def test_no_joining_date_is_no_service(self):
-        # The feature is opt-in per employee: nobody is given leave off a date
-        # nobody has entered.
-        self.assertEqual(_months_of_service(None, datetime.date(2026, 8, 24)), 0)
+    def test_joined_on_the_25th_that_cycle_is_the_first(self):
+        # 25 Jan - 24 Feb, paid on February's slip.
+        self.assertEqual(_first_full_cycle(datetime.date(2026, 1, 25)), (2026, 2))
 
-    def test_service_is_never_negative(self):
-        self.assertEqual(
-            _months_of_service(datetime.date(2026, 8, 1), datetime.date(2026, 1, 1)), 0
-        )
+    def test_joined_before_the_25th_the_cycle_opening_that_month_is_the_first(self):
+        # Joined on the last day of 25 Feb - 24 Mar: that one is not whole.
+        self.assertEqual(_first_full_cycle(datetime.date(2026, 3, 24)), (2026, 4))
+        self.assertEqual(_first_full_cycle(datetime.date(2026, 1, 10)), (2026, 2))
+
+    def test_joined_after_the_25th_the_next_months_cycle_is_the_first(self):
+        # 25 Jan - 24 Feb had started: the first whole one is 25 Feb - 24 Mar.
+        self.assertEqual(_first_full_cycle(datetime.date(2026, 1, 28)), (2026, 3))
+
+    def test_the_year_turns(self):
+        self.assertEqual(_first_full_cycle(datetime.date(2025, 12, 10)), (2026, 1))
+        self.assertEqual(_first_full_cycle(datetime.date(2025, 12, 28)), (2026, 2))
 
 
 class CasualLeaveAccrualTests(TestCase):
     def test_a_qualified_month_is_worth_exactly_one_day(self):
-        employee = make_employee("Qualified", datetime.date(2026, 2, 1))
+        employee = make_employee("Qualified", datetime.date(2026, 1, 1))
         self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(1))
 
     def test_it_is_still_one_day_after_years_of_service(self):
@@ -84,12 +88,37 @@ class CasualLeaveAccrualTests(TestCase):
         employee = make_employee("New Joiner", datetime.date(2026, 6, 1))
         self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(0))
 
-    def test_the_month_service_completes_in_is_the_first_that_counts(self):
-        # Joined 5 Jan 2026: six months are up on 5 July, so July qualifies and
-        # June does not.
-        employee = make_employee("Boundary", datetime.date(2026, 1, 5))
-        self.assertEqual(casual_leave_available(employee, 2026, 6), Decimal(0))
-        self.assertEqual(casual_leave_available(employee, 2026, 7), Decimal(1))
+    def test_the_seventh_full_cycle_is_the_first_that_counts(self):
+        # Joined 24 Mar 2026, the last day of 25 Feb - 24 Mar: the first full
+        # cycle is 25 Mar - 24 Apr, so the seventh is October's slip.
+        employee = make_employee("Boundary", datetime.date(2026, 3, 24))
+        self.assertEqual(casual_leave_available(employee, 2026, 9), Decimal(0))
+        self.assertEqual(casual_leave_available(employee, 2026, 10), Decimal(1))
+        # Joined 10 Jan 2026: 25 Jan - 24 Feb is the first, August the seventh.
+        employee = make_employee("Mid Cycle", datetime.date(2026, 1, 10))
+        self.assertEqual(casual_leave_available(employee, 2026, 7), Decimal(0))
+        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(1))
+
+    def test_a_cycle_they_joined_part_way_through_is_not_one_of_the_seven(self):
+        # Joined on the 25th: that cycle is whole, and it counts.
+        on_the_25th = make_employee("On The 25th", datetime.date(2026, 1, 25))
+        self.assertEqual(casual_leave_available(on_the_25th, 2026, 7), Decimal(0))
+        self.assertEqual(casual_leave_available(on_the_25th, 2026, 8), Decimal(1))
+        # Joined on the 28th: 25 Jan - 24 Feb had begun, so 25 Feb - 24 Mar is
+        # the first and September the seventh.
+        after_the_25th = make_employee("After The 25th", datetime.date(2026, 1, 28))
+        self.assertEqual(casual_leave_available(after_the_25th, 2026, 8), Decimal(0))
+        self.assertEqual(casual_leave_available(after_the_25th, 2026, 9), Decimal(1))
+
+    def test_the_seventh_cycle_can_fall_in_the_next_year(self):
+        # Joined 28 Dec 2025: 25 Jan - 24 Feb 2026 is the first, so August 2026.
+        employee = make_employee("Year End", datetime.date(2025, 12, 28))
+        self.assertEqual(casual_leave_available(employee, 2026, 7), Decimal(0))
+        self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(1))
+        # Joined Aug 2026: the seventh full cycle is March 2027's slip.
+        late = make_employee("Late Joiner", datetime.date(2026, 8, 10))
+        self.assertEqual(casual_leave_available(late, 2027, 2), Decimal(0))
+        self.assertEqual(casual_leave_available(late, 2027, 3), Decimal(1))
 
     def test_an_employee_with_no_joining_date_earns_nothing(self):
         employee = make_employee("No DOJ", None)
@@ -199,9 +228,9 @@ class RecalculateKeepsEarnedLeaveTests(APITestCase):
         return self.client.post(f"/api/payslips/{slip.id}/recalculate/", payload, format="json")
 
     def test_typing_the_leave_in_by_hand_pays_the_earned_casual_leave(self):
-        # Joined Feb 2026, so six months complete on 1 Aug 2026: August is the
-        # only qualifying month of the year and exactly one day is earned.
-        employee = make_employee("Eligible", datetime.date(2026, 2, 1))
+        # Joined 1 Jan 2026, so 25 Jan - 24 Feb is the first full cycle and
+        # August's slip is the seventh: it qualifies, for exactly one day.
+        employee = make_employee("Eligible", datetime.date(2026, 1, 1))
         self.assertEqual(casual_leave_available(employee, 2026, 8), Decimal(1))
 
         slip = self._slip(employee)
@@ -272,7 +301,7 @@ class RecalculateKeepsEarnedLeaveTests(APITestCase):
         self.assertEqual(slip.paid_days, Decimal(29))
 
     def test_saving_the_same_slip_twice_does_not_spend_the_balance_twice(self):
-        employee = make_employee("Resaver", datetime.date(2026, 2, 1))  # one day earned
+        employee = make_employee("Resaver", datetime.date(2026, 1, 1))  # one day earned
         slip = self._slip(employee)
         self._save_lop(slip, 3)
         self._save_lop(slip, 3)
@@ -445,8 +474,8 @@ class PolicyConstantTests(TestCase):
     A change to either changes payroll, so it should be a deliberate edit here
     and not a side effect of something else."""
 
-    def test_the_qualifying_period_is_six_months(self):
-        self.assertEqual(CASUAL_LEAVE_ELIGIBILITY_MONTHS, 6)
+    def test_leave_starts_on_the_seventh_full_cycle(self):
+        self.assertEqual(CASUAL_LEAVE_FROM_CYCLE, 7)
 
     def test_a_month_is_worth_one_day(self):
         self.assertEqual(CASUAL_LEAVE_DAYS_PER_MONTH, Decimal(1))

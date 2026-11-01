@@ -13,32 +13,38 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Casual leave: one paid day a month, once six months' service (probation) is
-# behind them. It does not accumulate — a month is worth one day, and a month
-# where none was taken carries nothing into the next. So the most any single
-# payslip can ever pay as casual leave is one day, however long the employee has
-# been here and however many days they were absent.
+# Casual leave: one paid day a salary cycle (the 25th to the 24th), from the
+# seventh FULL cycle of service. A cycle somebody joined part way through is not
+# one of the seven: joined on 24 March, the first is 25 Mar - 24 Apr and leave
+# starts on the October slip. It does not accumulate — a cycle is worth one day,
+# and a cycle where none was taken carries nothing into the next. So the most
+# any single payslip can ever pay as casual leave is one day, however long the
+# employee has been here and however many days they were absent.
 CASUAL_LEAVE_DAYS_PER_MONTH = Decimal(1)
-CASUAL_LEAVE_ELIGIBILITY_MONTHS = 6
+CASUAL_LEAVE_FROM_CYCLE = 7
 
 
-def _months_of_service(doj, as_of):
-    """Whole completed months of service from date-of-joining `doj` to `as_of`."""
-    if not doj:
-        return 0
-    months = (as_of.year - doj.year) * 12 + (as_of.month - doj.month)
-    if as_of.day < doj.day:
-        months -= 1
-    return max(0, months)
+def _first_full_cycle(doj):
+    """The payslip (year, month) of the first whole 25th-24th cycle worked.
+
+    Joined on the 25th, it is the cycle that opens that day; joined on any other
+    day, the next one to open. A cycle opening on the 25th is paid as the
+    following month's slip.
+    """
+    year, month = doj.year, doj.month
+    if doj.day > 25:
+        month += 1
+    month += 1
+    return year + (month - 1) // 12, (month - 1) % 12 + 1
 
 
 def casual_leave_available(emp, year, month):
     """The casual leave this employee can be paid on this month's payslip.
 
-    One day, if six months' service was complete by the end of the month. Not a
-    running balance: each month stands on its own, so an employee who has been
-    here two years and was absent three days is paid for one of them, the same
-    as an employee who qualified last month. Nothing is carried forward and
+    One day, if this slip's cycle is their seventh full cycle or a later one.
+    Not a running balance: each cycle stands on its own, so an employee who has
+    been here two years and was absent three days is paid for one of them, the
+    same as an employee who qualified last cycle. Nothing is carried forward and
     nothing is owed at year end.
 
     Returns 0 for employees with no real date_of_joining — the feature is opt-in
@@ -47,9 +53,10 @@ def casual_leave_available(emp, year, month):
     doj = emp.date_of_joining
     if not doj:
         return Decimal(0)
-    last_day = calendar.monthrange(year, month)[1]
-    as_of = datetime.date(year, month, last_day)
-    if _months_of_service(doj, as_of) < CASUAL_LEAVE_ELIGIBILITY_MONTHS:
+    first_year, first_month = _first_full_cycle(doj)
+    # 1 on the first full cycle's slip, 7 on the seventh's.
+    nth = (year - first_year) * 12 + (month - first_month) + 1
+    if nth < CASUAL_LEAVE_FROM_CYCLE:
         return Decimal(0)
     return CASUAL_LEAVE_DAYS_PER_MONTH
 
@@ -574,7 +581,7 @@ class PayslipViewSet(viewsets.ModelViewSet):
             ))
 
             # 2b. Offset LOP with the employee's earned casual-leave balance
-            # (6-month rule, from their real date_of_joining). CL days become
+            # (from the 7th full cycle after their real date_of_joining). CL days become
             # paid, so they are not deducted. Zero for employees without a DOJ.
             cl_available = casual_leave_available(emp, year, month)
             cl_apply = min(cl_available, lop_days)

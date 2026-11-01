@@ -130,7 +130,7 @@ class AnOldMonthKeepsItsOwnSalary(Office):
 
 class CasualLeaveDoesNotComeBack(Office):
     def _eligible(self):
-        # Joined well over six months before September 2026.
+        # Joined long before: September 2026 is well past their seventh cycle.
         return _employee(date_of_joining=datetime.date(2024, 1, 10))
 
     def test_a_tds_edit_after_a_paid_days_edit_moves_the_net_by_the_tds(self):
