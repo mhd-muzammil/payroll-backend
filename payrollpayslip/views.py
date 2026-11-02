@@ -67,6 +67,44 @@ from attendance.models import Attendance, loss_of_pay_days
 from authentication.models import get_allowed_branches
 from authentication.permissions import IsHRStaff
 
+
+# Paid from the day they joined. A 25th-24th cycle that ended before somebody's
+# date of joining is not theirs: no payslip, and not counted in that month.
+# The cycle they join in is paid from the joining day: the days of it before
+# then are loss of pay. Nothing is ever marked on a day before somebody joined,
+# so without this a cycle before joining read as a month with no absence at
+# all -- a full-pay slip -- and so did the days before joining in the first.
+# No date of joining: paid and counted as before.
+
+
+def joining_slip(doj):
+    """The payslip (year, month) of the cycle someone joined in: that month's if
+    they joined before the 25th, the next month's from the 25th on."""
+    year, month = doj.year, doj.month
+    if doj.day >= 25:
+        month += 1
+    return year + (month - 1) // 12, (month - 1) % 12 + 1
+
+
+def cycle_loss_of_pay(emp, start_date, start_datetime, end_datetime):
+    """LOP days for one employee's cycle, from their date of joining.
+
+    The days of the cycle before they joined, plus a day for each Absent row and
+    half for each Half Day row from the joining day on. A row dated before they
+    joined is not counted on top: that day is already unpaid.
+    """
+    rows = Attendance.objects.filter(employee=emp, intime__range=(start_datetime, end_datetime))
+    doj = emp.date_of_joining
+    if not doj or doj <= start_date:
+        return loss_of_pay_days(rows)
+    joined_at = timezone.make_aware(datetime.datetime.combine(doj, datetime.time.min))
+    return Decimal((doj - start_date).days) + loss_of_pay_days(rows.filter(intime__gte=joined_at))
+
+
+def _first_slip_label(doj):
+    year, month = joining_slip(doj)
+    return f"{calendar.month_name[month]} {year}"
+
 def _q(val):
     """Round a Decimal value to two decimal places (bankers-safe half-up)."""
     return Decimal(val).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
@@ -550,7 +588,21 @@ class PayslipViewSet(viewsets.ModelViewSet):
             active_employees = active_employees.filter(branch__in=branches)
             if employee_id and not active_employees.exists():
                 return Response({"error": "You do not have permission to run payroll for this employee's branch."}, status=status.HTTP_403_FORBIDDEN)
-                
+
+        # Nobody gets a slip for a cycle that ended before they joined.
+        if employee_id:
+            joined = active_employees.first().date_of_joining
+            if joined and joined > end_date:
+                return Response(
+                    {"error": (
+                        f"{active_employees.first().employee_name} joined on {joined:%d %b %Y}; "
+                        f"their first payslip is {_first_slip_label(joined)}."
+                    )},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        not_joined = active_employees.filter(date_of_joining__gt=end_date).count()
+        active_employees = active_employees.exclude(date_of_joining__gt=end_date)
+
         created_count = 0
         updated_count = 0
         skipped_paid = 0
@@ -574,11 +626,9 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 skipped_paid += 1
                 continue
             # 2. Calculate LOP days based on Attendance Table within the range
-            # (a whole day for each Absent row, half a day for each Half Day).
-            lop_days = loss_of_pay_days(Attendance.objects.filter(
-                employee=emp,
-                intime__range=(start_datetime, end_datetime),
-            ))
+            # (a whole day for each Absent row, half a day for each Half Day),
+            # and every day of the cycle before they joined.
+            lop_days = cycle_loss_of_pay(emp, start_date, start_datetime, end_datetime)
 
             # 2b. Offset LOP with the employee's earned casual-leave balance
             # (from the 7th full cycle after their real date_of_joining). CL days become
@@ -622,12 +672,18 @@ class PayslipViewSet(viewsets.ModelViewSet):
                 msg_detail += " 1 slip already marked Paid was left as it was."
             else:
                 msg_detail += f" {skipped_paid} slips already marked Paid were left as they were."
+        if not_joined:
+            if not_joined == 1:
+                msg_detail += " 1 employee who joined after this cycle was left out."
+            else:
+                msg_detail += f" {not_joined} employees who joined after this cycle were left out."
 
         return Response({
             "message": msg_detail,
             "created": created_count,
             "updated": updated_count,
             "skipped_paid": skipped_paid,
+            "skipped_not_joined": not_joined,
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'])
@@ -860,10 +916,18 @@ class PayslipViewSet(viewsets.ModelViewSet):
         start_datetime = make_aware(datetime.datetime.combine(start_date, datetime.time.min))
         end_datetime = make_aware(datetime.datetime.combine(end_date, datetime.time.max))
 
-        lop_days = loss_of_pay_days(Attendance.objects.filter(
-            employee=payslip.employee,
-            intime__range=(start_datetime, end_datetime),
-        ))
+        # A slip for a cycle that ended before they joined is not rebuilt.
+        joined = payslip.employee.date_of_joining
+        if joined and joined > end_date:
+            return Response(
+                {"error": (
+                    f"{payslip.employee.employee_name} joined on {joined:%d %b %Y}, after this "
+                    f"cycle; their first payslip is {_first_slip_label(joined)}."
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        lop_days = cycle_loss_of_pay(payslip.employee, start_date, start_datetime, end_datetime)
 
         # Same casual-leave offset bulk generation applies, so "revert to what
         # generation would produce" actually produces it. Without this, Undo
@@ -951,8 +1015,13 @@ class PayslipViewSet(viewsets.ModelViewSet):
         if scope is False:
             return Response({"error": "Not permitted."}, status=status.HTTP_403_FORBIDDEN)
 
-        # Active employees in scope
+        # Active employees in scope who had joined by this cycle's end: a month
+        # before somebody joined does not count them or their salary.
         emp_qs = Employee.objects.filter(status='active')
+        try:
+            emp_qs = emp_qs.exclude(date_of_joining__gt=datetime.date(year, month, 24))
+        except ValueError:
+            pass  # no such month: nothing to compare a joining date with
         if scope is not None:
             emp_qs = emp_qs.filter(branch__in=scope)
         if branch:
