@@ -71,6 +71,7 @@ def casual_leave_available(emp, year, month):
 from .models import Payslip, BranchFinancial
 from .serializer import PayslipSerializer, BranchFinancialSerializer
 from employees.models import Employee, Performance
+from employees.serializer import EmployeeSerializer
 from attendance.models import Attendance, loss_of_pay_days
 from authentication.models import get_allowed_branches
 from authentication.permissions import IsHRStaff
@@ -448,7 +449,14 @@ class PayslipViewSet(viewsets.ModelViewSet):
     OFFICE_ONLY_ACTIONS = {
         "create", "update", "partial_update", "destroy",
         "generate_all", "recalculate", "revert", "email_payslip", "send",
+        "relieved_worked",
     }
+
+    # A day somebody worked: AttendanceViewSet.WORKED_STATUSES, Half Day (half
+    # of it was worked), and 'overTime', how Overtime was spelled before
+    # attendance migration 0004. Absent and Leave (a Sunday or a holiday) are
+    # not worked days.
+    WORKED_DAY_STATUSES = ("Present", "Late", "Overtime", "overTime", "Half Day")
 
     def get_permissions(self):
         if self.action in self.OFFICE_ONLY_ACTIONS:
@@ -512,6 +520,59 @@ class PayslipViewSet(viewsets.ModelViewSet):
             return False
         allowed = get_allowed_branches(user, "payslips")
         return None if "All" in allowed else allowed
+
+    @action(detail=False, methods=["get"], url_path="relieved_worked")
+    def relieved_worked(self, request):
+        """Everybody relieved who worked in this month's 25th-24th cycle.
+
+        The Payroll roster and the Generate tab list the staff, and somebody
+        relieved is no longer staff. But a month they worked before they left
+        is still theirs to be paid, slip or no slip -- Samim K worked in
+        October's cycle and was relieved before October was generated, so the
+        month had nobody to generate. Both lists add these people, marked
+        Relieved. A worked day is Present, Late, Overtime or Half Day: a month
+        with only Absent and Sunday rows is not one they worked.
+
+        Generating them stays one at a time, from their own row. Bulk Generate
+        is for the staff: in somebody's last month the days after they left
+        are not marked, and the office checks that month by hand.
+
+        ?month=10&year=2026 is 25 Sep - 24 Oct. Office roles only, within the
+        branches the payslips section allows them.
+        """
+        scope = self._report_scope(request)
+        if scope is False:
+            return Response({"detail": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            month = int(request.query_params.get("month"))
+            year = int(request.query_params.get("year"))
+        except (TypeError, ValueError):
+            month = year = None
+        # The same range generate_all accepts, checked before datetime.date --
+        # which raises OverflowError, not ValueError, on a huge year.
+        if month is None or not (1 <= month <= 12) or not (2000 <= year <= 3000):
+            return Response(
+                {"error": "month (1-12) and year are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        end = datetime.date(year, month, 24)
+        start = datetime.date(year - 1, 12, 25) if month == 1 else datetime.date(year, month - 1, 25)
+        start_at = timezone.make_aware(datetime.datetime.combine(start, datetime.time.min))
+        end_at = timezone.make_aware(datetime.datetime.combine(end, datetime.time.max))
+        worked = Attendance.objects.filter(
+            intime__range=(start_at, end_at), status__in=self.WORKED_DAY_STATUSES
+        ).values("employee_id")
+        people = Employee.objects.filter(status="relieved", id__in=worked)
+        # Not a cycle that ended before they joined: that month has no payslip
+        # of theirs (see joining_slip), and Generate would refuse it.
+        people = people.exclude(date_of_joining__gt=end)
+        if scope is not None:
+            people = people.filter(branch__in=scope)
+        return Response(
+            EmployeeSerializer(
+                people.order_by("employee_name", "id"), many=True, context={"request": request}
+            ).data
+        )
 
     @action(detail=True, methods=['post'])
     def send(self, request, pk=None):
@@ -605,6 +666,28 @@ class PayslipViewSet(viewsets.ModelViewSet):
                     {"error": (
                         f"{active_employees.first().employee_name} joined on {joined:%d %b %Y}; "
                         f"their first payslip is {_first_slip_label(joined)}."
+                    )},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # Somebody relieved gets a NEW slip only for a month they worked in
+            # (relieved_worked lists exactly those). Otherwise a month after they
+            # left would be made at full pay: none of its days is marked, so none
+            # is loss of pay. A slip they already have can still be regenerated.
+            person = active_employees.first()
+            if (
+                person.status == "relieved"
+                and not Payslip.objects.filter(employee=person, month=month, year=year).exists()
+                and not Attendance.objects.filter(
+                    employee=person,
+                    intime__range=(start_datetime, end_datetime),
+                    status__in=self.WORKED_DAY_STATUSES,
+                ).exists()
+            ):
+                return Response(
+                    {"error": (
+                        f"{person.employee_name} is relieved and has no worked day between "
+                        f"{start_date:%d %b} and {end_date:%d %b %Y}, so there is no payslip "
+                        f"to make for {calendar.month_name[month]} {year}."
                     )},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
@@ -1085,7 +1168,11 @@ class PayslipViewSet(viewsets.ModelViewSet):
             "totalDeductionsRaw": float(total_deductions),
             "totalDeductionsFmt": f"₹{int(total_deductions):,}",
             "slipsCount": slips_count,
-            "notGeneratedCount": max(0, total_active_employees - slips_count),
+            # The staff still without a slip -- what "Generate All Slips (N)"
+            # makes. Not "staff minus every slip": a relieved person's slip
+            # (generated from their own row) would take one off it, and the
+            # button could vanish with a staff slip still missing.
+            "notGeneratedCount": emp_qs.exclude(id__in=slip_qs.values("employee_id")).count(),
             "paidCount": paid_count,
             "paidAmountRaw": float(paid_amount),
             "paidAmountFmt": f"₹{int(paid_amount):,}",
