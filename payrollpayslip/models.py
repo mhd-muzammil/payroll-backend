@@ -78,7 +78,7 @@ class Payslip(models.Model):
     # THIS MONTH'S AMOUNTS, as the office set them on this slip.
     #
     # Keys are the request names in views.MONTHLY_AMOUNTS (incentive,
-    # other_earnings, staff_advance, tds, insurance, other_deduction), values
+    # other_earnings, epf, staff_advance, tds, insurance, other_deduction), values
     # decimal strings. Kept so that editing a day count afterwards re-runs the
     # sums WITH them rather than over them. Empty means the slip is exactly
     # what the employee's structure produces. Undo Edits and Regenerate clear it.

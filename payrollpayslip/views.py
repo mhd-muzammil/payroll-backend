@@ -125,10 +125,13 @@ def _q(val):
 # Earnings replace what the month EARNED, not the structure's gross: an
 # incentive of 2,000 this month is 2,000 paid, whatever the days were, the
 # same way special work and casual leave are paid as their own lines.
-# Deductions replace the flat monthly figure the structure would take.
+# Deductions replace the flat monthly figure the structure would take. EPF
+# too, though the structure's EPF is cut by the days: an EPF set for the
+# month is that month's EPF, as typed.
 MONTHLY_AMOUNTS = {
     "incentive": "earned_incentive",
     "other_earnings": "earned_other_earnings",
+    "epf": "deduction_epf",
     "staff_advance": "deduction_staff_advance",
     "tds": "deduction_tds",
     "insurance": "deduction_insurance",
@@ -362,6 +365,8 @@ def compute_payslip_fields(emp, total_days, lop_days, other_deduction_override=N
         petrol_allowance = Decimal('0.00')
 
     # This month's deductions, as the office set them.
+    if "epf" in monthly:
+        deduction_epf = monthly["epf"]
     if "staff_advance" in monthly:
         deduction_staff_advance = monthly["staff_advance"]
     if "tds" in monthly:

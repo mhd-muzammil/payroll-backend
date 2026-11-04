@@ -212,3 +212,84 @@ class OnlyTheOfficeChangesASlip(APITestCase):
         self.assertEqual([row["id"] for row in listed.data], [self.slip.id])
         ticket = self.client.get(f"/api/payslips/{self.slip.id}/pdf_ticket/")
         self.assertEqual(ticket.status_code, 200, "their only way to keep a copy, in the app")
+
+
+class EpfForTheMonth(APITestCase):
+    """EPF set on one month's slip, from the Employee Pay Report.
+
+    The structure's EPF is cut by the days -- 1,800 over 24 paid days of 30
+    is 1,440. An EPF the office sets for the month is that month's EPF, as
+    typed, and stays so through a later day edit. Nothing else on the slip
+    moves but the deductions total and the net; the employer's EPF is left
+    as the structure makes it.
+    """
+
+    def setUp(self):
+        hr = User.objects.create_user(username="hr_epf", password="x", role="hr")
+        self.client.force_authenticate(hr)
+        self.emp = _employee()
+        self.client.post("/api/payslips/generate_all/",
+                         {"month": 9, "year": 2026, "employee_id": self.emp.id}, format="json")
+        self.slip = Payslip.objects.get(employee=self.emp, month=9, year=2026)
+        self.url = f"/api/payslips/{self.slip.id}/recalculate/"
+
+    def test_the_engine_takes_it_as_typed_on_a_month_with_absence(self):
+        cut = compute_payslip_fields(self.emp, 30, 6)
+        self.assertEqual(cut["deduction_epf"], Decimal("1440.00"), "1,800 cut to 24 of 30 days")
+        typed = compute_payslip_fields(self.emp, 30, 6, overrides={"epf": "1800"})
+        self.assertEqual(typed["deduction_epf"], Decimal("1800.00"))
+        self.assertEqual(_sum_deductions(typed), typed["gross_deductions"])
+        self.assertEqual(cut["net_salary"] - typed["net_salary"], Decimal("360.00"))
+        for field in ("gross_earnings", "employer_epf", "deduction_esi", "deduction_prof_tax"):
+            self.assertEqual(typed[field], cut[field], field)
+
+    def test_setting_it_lands_on_the_slip_and_the_net_follows(self):
+        net, epf = self.slip.net_salary, self.slip.deduction_epf
+        response = self.client.post(self.url, {"epf": "2000"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["deduction_epf"], "2000.00")
+        self.assertEqual(Decimal(response.data["net_salary"]), net - (Decimal("2000.00") - epf))
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.manual_overrides, {"epf": "2000.00"})
+
+    def test_a_day_edit_afterwards_keeps_it_as_typed(self):
+        self.client.post(self.url, {"epf": "2000"}, format="json")
+        response = self.client.post(
+            self.url, {"total_days": self.slip.total_days, "lop_days": "5"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["deduction_epf"], "2000.00")
+        self.assertEqual(Decimal(response.data["lop_days"]), Decimal("5"))
+
+    def test_zero_is_a_value_not_a_blank(self):
+        response = self.client.post(self.url, {"epf": "0"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["deduction_epf"], "0.00")
+
+    def test_a_negative_epf_is_refused(self):
+        response = self.client.post(self.url, {"epf": "-1"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.manual_overrides, {})
+
+    def test_undo_edits_puts_back_the_structure_s_epf(self):
+        generated = self.slip.deduction_epf
+        self.client.post(self.url, {"epf": "2000"}, format="json")
+        response = self.client.post(f"/api/payslips/{self.slip.id}/revert/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(Decimal(response.data["deduction_epf"]), generated)
+
+    def test_a_paid_slip_stays_locked(self):
+        self.client.patch(f"/api/payslips/{self.slip.id}/", {"status": "Paid"}, format="json")
+        response = self.client.post(self.url, {"epf": "2000"}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_an_employee_cannot_set_their_own(self):
+        worker = User.objects.create_user(username="worker_epf", password="x", role="employee")
+        self.emp.user = worker
+        self.emp.save()
+        self.client.post(f"/api/payslips/{self.slip.id}/send/", {}, format="json")
+        self.client.force_authenticate(worker)
+        response = self.client.post(self.url, {"epf": "0"}, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.slip.refresh_from_db()
+        self.assertEqual(self.slip.manual_overrides, {})
