@@ -2,7 +2,7 @@
 
 They have to come out the way a payslip counts them, or the P&L charges a
 different salary from the one Payroll pays: only Absent days are unpaid,
-casual leave covers one of them a cycle from the seventh full cycle, Leave and
+casual leave covers one of them a cycle from the seventh cycle, Leave and
 Sundays are paid, and a finished cycle's own payslip is the final word.
 """
 import datetime

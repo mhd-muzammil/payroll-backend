@@ -14,34 +14,42 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Casual leave: one paid day a salary cycle (the 25th to the 24th), from the
-# seventh FULL cycle of service. A cycle somebody joined part way through is not
-# one of the seven: joined on 24 March, the first is 25 Mar - 24 Apr and leave
-# starts on the October slip. It does not accumulate — a cycle is worth one day,
+# seventh cycle of service. The cycle somebody joined in is the first of the
+# seven when they were here for more than 15 of its days, from the joining day
+# to its 24th -- which is joining on the 25th to the 9th, in every month.
+# Joined on the 10th to the 24th, the next cycle is the first. So joined
+# on 1 April (24 days of 25 Mar - 24 Apr) leave starts on the October slip;
+# joined on 24 March (one day of 25 Feb - 24 Mar) it also starts in October.
+# It does not accumulate — a cycle is worth one day,
 # and a cycle where none was taken carries nothing into the next. So the most
 # any single payslip can ever pay as casual leave is one day, however long the
 # employee has been here and however many days they were absent.
 CASUAL_LEAVE_DAYS_PER_MONTH = Decimal(1)
 CASUAL_LEAVE_FROM_CYCLE = 7
+# More than this many days in the cycle they joined in, and it counts.
+JOINING_CYCLE_MORE_THAN_DAYS = 15
 
 
-def _first_full_cycle(doj):
-    """The payslip (year, month) of the first whole 25th-24th cycle worked.
+def _first_counted_cycle(doj):
+    """The payslip (year, month) of the first cycle that counts towards leave.
 
-    Joined on the 25th, it is the cycle that opens that day; joined on any other
-    day, the next one to open. A cycle opening on the 25th is paid as the
+    The cycle they joined in, when they were here for more than 15 of its days
+    (the joining day to its 24th, both included); otherwise the next cycle,
+    which they worked whole. A cycle opening on the 25th is paid as the
     following month's slip.
     """
-    year, month = doj.year, doj.month
-    if doj.day > 25:
+    year, month = joining_slip(doj)
+    days_in = (datetime.date(year, month, 24) - doj).days + 1
+    if days_in <= JOINING_CYCLE_MORE_THAN_DAYS:
         month += 1
-    month += 1
     return year + (month - 1) // 12, (month - 1) % 12 + 1
 
 
 def casual_leave_available(emp, year, month):
     """The casual leave this employee can be paid on this month's payslip.
 
-    One day, if this slip's cycle is their seventh full cycle or a later one.
+    One day, if this slip's cycle is their seventh counted cycle or a later one
+    (see _first_counted_cycle for where the count starts).
     Not a running balance: each cycle stands on its own, so an employee who has
     been here two years and was absent three days is paid for one of them, the
     same as an employee who qualified last cycle. Nothing is carried forward and
@@ -53,8 +61,8 @@ def casual_leave_available(emp, year, month):
     doj = emp.date_of_joining
     if not doj:
         return Decimal(0)
-    first_year, first_month = _first_full_cycle(doj)
-    # 1 on the first full cycle's slip, 7 on the seventh's.
+    first_year, first_month = _first_counted_cycle(doj)
+    # 1 on the first counted cycle's slip, 7 on the seventh's.
     nth = (year - first_year) * 12 + (month - first_month) + 1
     if nth < CASUAL_LEAVE_FROM_CYCLE:
         return Decimal(0)
@@ -631,7 +639,7 @@ class PayslipViewSet(viewsets.ModelViewSet):
             lop_days = cycle_loss_of_pay(emp, start_date, start_datetime, end_datetime)
 
             # 2b. Offset LOP with the employee's earned casual-leave balance
-            # (from the 7th full cycle after their real date_of_joining). CL days become
+            # (from the 7th counted cycle after their real date_of_joining). CL days become
             # paid, so they are not deducted. Zero for employees without a DOJ.
             cl_available = casual_leave_available(emp, year, month)
             cl_apply = min(cl_available, lop_days)
