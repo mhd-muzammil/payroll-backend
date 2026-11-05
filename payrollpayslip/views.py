@@ -95,6 +95,39 @@ def joining_slip(doj):
     return year + (month - 1) // 12, (month - 1) % 12 + 1
 
 
+def _add_day_counts(rows):
+    """Put absent_days and half_days on each serialized slip in `rows`: its
+    cycle's Absent and Half Day attendance rows, from the joining day on --
+    the rows cycle_loss_of_pay prices as LOP. One query for all of them."""
+    if not rows:
+        return
+    spans = []
+    for row in rows:
+        year, month = row["year"], row["month"]
+        start = datetime.date(year - 1, 12, 25) if month == 1 else datetime.date(year, month - 1, 25)
+        spans.append((start, datetime.date(year, month, 24)))
+    start_at = timezone.make_aware(datetime.datetime.combine(min(s for s, _ in spans), datetime.time.min))
+    end_at = timezone.make_aware(datetime.datetime.combine(max(e for _, e in spans), datetime.time.max))
+    found = Attendance.objects.filter(
+        employee_id__in={row["employee"] for row in rows},
+        status__in=("Absent", "Half Day"),
+        intime__range=(start_at, end_at),
+    ).values_list("employee_id", "status", "intime")
+    days = {}
+    for emp_id, kind, intime in found:
+        day = timezone.localtime(intime).date()
+        month = day.month + (1 if day.day >= 25 else 0)
+        key = (emp_id, day.year + (month - 1) // 12, (month - 1) % 12 + 1)
+        days.setdefault(key, []).append((kind, day))
+    for row in rows:
+        doj = (row.get("employee_details") or {}).get("date_of_joining")
+        joined = datetime.date.fromisoformat(doj) if doj else None
+        mine = [kind for kind, day in days.get((row["employee"], row["year"], row["month"]), [])
+                if joined is None or day >= joined]
+        row["absent_days"] = mine.count("Absent")
+        row["half_days"] = mine.count("Half Day")
+
+
 def cycle_loss_of_pay(emp, start_date, start_datetime, end_datetime):
     """LOP days for one employee's cycle, from their date of joining.
 
@@ -512,6 +545,24 @@ class PayslipViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(year=year)
 
         return queryset
+
+    # ABSENT AND HALF DAY, TO LOOK AT.
+    #
+    # The Employee Pay Report shows, beside the paid days, how many Absent and
+    # Half Day rows attendance has in each slip's cycle -- counted the way
+    # cycle_loss_of_pay counts them for LOP: the 25th to the 24th, from the
+    # joining day. Read from attendance as it stands, so a slip whose LOP was
+    # typed by hand still shows what the register says. Nothing is stored and
+    # nothing is priced from them. Only the office, only on a list that asks
+    # (with_day_counts=1); every other list is exactly as it was.
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        user = request.user
+        role = "superadmin" if user.is_superuser else getattr(user, "role", "employee")
+        if role != "employee" and request.query_params.get("with_day_counts") == "1":
+            rows = response.data if isinstance(response.data, list) else response.data.get("results", [])
+            _add_day_counts(rows)
+        return response
 
     def _report_scope(self, request):
         """Scope enterprise reports. Returns:
