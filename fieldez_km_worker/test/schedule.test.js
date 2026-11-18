@@ -42,7 +42,7 @@ test("the worker's defaults", () => {
 
 test("what the probe reads is as it was", () => {
   const dataDir = process.platform === "win32" ? "C:\\fzkm" : "/data";
-  assert.equal(config.fieldezBaseUrl, "https://prod.fsmsupport.com");
+  assert.equal(config.fieldezBaseUrl, "https://fieldez.flex.com");
   assert.equal(config.fieldezUsername, "");
   assert.equal(config.fieldezPassword, "");
   assert.equal(config.headless, false);

@@ -124,7 +124,7 @@ All optional, in `.env` or the environment:
 | `LOGIN_WAIT_MS` | `600000` | how long it waits for a person to log in (10 minutes) |
 | `DATA_DIR` | `C:\fzkm` | where the profile is kept; keep it a short path (Chrome's profile fails under a long one) |
 | `BROWSER_CHANNEL` | `chrome` | which installed browser |
-| `FIELDEZ_BASE_URL` | `https://prod.fsmsupport.com` | FieldEZ |
+| `FIELDEZ_BASE_URL` | `https://fieldez.flex.com` | FieldEZ |
 
 ## Checking the code
 

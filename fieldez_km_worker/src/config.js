@@ -35,7 +35,7 @@ const whole = (value, fallback, least = 1) => {
 };
 
 export const config = {
-  fieldezBaseUrl: (env.FIELDEZ_BASE_URL || "https://prod.fsmsupport.com").replace(/\/+$/, ""),
+  fieldezBaseUrl: (env.FIELDEZ_BASE_URL || "https://fieldez.flex.com").replace(/\/+$/, ""),
   // Optional. Left empty, the worker waits for a person to log in in the
   // browser window it opens -- the password is then typed only into FieldEZ.
   fieldezUsername: env.FIELDEZ_KM_USERNAME || "",
